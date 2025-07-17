@@ -128,50 +128,7 @@ bash scripts/download_tum.sh
 Please change the `input_folder` path in the scene specific config files to point to where the data is stored.
 
 
-### ScanNet
-Please follow the data downloading procedure on the [ScanNet](http://www.scan-net.org/) website, and extract color/depth frames from the `.sens` file using this [code](https://github.com/ScanNet/ScanNet/blob/master/SensReader/python/reader.py).
 
-<details>
-  <summary>[Directory structure of ScanNet (click to expand)]</summary>
-  
-  Please change the `input_folder` path in the scene specific config files to point to where the data is stored.
-
-```
-  DATAROOT
-  └── scannet
-        └── scene0000_00
-            └── frames
-                ├── color
-                │   ├── 0.jpg
-                │   ├── 1.jpg
-                │   ├── ...
-                │   └── ...
-                ├── depth
-                │   ├── 0.png
-                │   ├── 1.png
-                │   ├── ...
-                │   └── ...
-                ├── intrinsic
-                └── pose
-                    ├── 0.txt
-                    ├── 1.txt
-                    ├── ...
-                    └── ...
-```
-</details>
-
-
-We use the following sequences: 
-```
-scene0000_00
-scene0054_00
-scene0059_00
-scene0106_00
-scene0169_00
-scene0181_00
-scene0207_00
-scene0233_00
-```
 
 ## Run
 For running Splat-SLAM, each scene has a config folder, where the `input_folder`,`output` paths need to be specified. Below, we show some example run commands for one scene from each dataset.
