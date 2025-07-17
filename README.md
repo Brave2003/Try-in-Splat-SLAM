@@ -133,6 +133,14 @@ Download the pretained models from [Google Drive](https://drive.google.com/file/
 cd pretrained
 wget https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
 ```
+## Download flow model 
+download raft-things.pth directly from https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT
+
+
+download gma-things.pth
+```
+https://github.com/zacjiang/GMA/blob/main/checkpoints/gma-things.pth
+```
 ### TUM-RGBD
 ```bash
 bash scripts/download_tum.sh
