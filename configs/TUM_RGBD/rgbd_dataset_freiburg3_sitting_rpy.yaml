@@ -13,14 +13,20 @@
 # limitations under the License.
 
 inherit_from: ./configs/TUM_RGBD/tum.yaml
-scene: freiburg3_office
+scene: rgbd_dataset_freiburg3_sitting_rpy
 
 data:
-  input_folder: rgbd_dataset_freiburg3_long_office_household
-cam:  #intrinsic is different per scene in TUM, this cam does not have distortion
+  input_folder: rgbd_dataset_freiburg3_sitting_rpy
+cam: 
   H: 480 
   W: 640 
   fx: 535.4
   fy: 539.2
   cx: 320.1
   cy: 247.6
+tracking:
+  buffer: 1200
+  motion_filter:
+    thresh: 1.3
+mapping:
+  first_s: 2.6950998306274414
