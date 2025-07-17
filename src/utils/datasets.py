@@ -353,7 +353,7 @@ class BaseDataset(Dataset):
                         dilated_mask = torch.from_numpy(dilated_np > 0).to(device=mask.device, dtype=torch.bool)
                         combined_mask |= dilated_mask
         if self.yolo_model is not None and self.seg_chair:
-            results = self.yolo_model.track(source=color_data, classes=[56], save=False, stream=False,
+            results = self.yolo_model.track(source=color_data, persist=True,classes=[56], save=False, stream=False,
                                               show=False, verbose=False, device=self.device)
             for result in results:
                 masks = result.masks
