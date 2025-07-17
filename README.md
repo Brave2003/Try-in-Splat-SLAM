@@ -113,7 +113,10 @@ Download the pretained models from [Google Drive](https://drive.google.com/file/
 cd pretrained
 wget https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
 ```
-## Download flow model 
+### Download yolo11l-seg.pt
+cd monody
+wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.pt
+### Download flow model 
 download raft-things.pth directly from https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT
 
 
