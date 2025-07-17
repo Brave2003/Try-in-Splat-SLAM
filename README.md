@@ -1,25 +1,5 @@
 <!-- PROJECT LOGO -->
-  <h1 align="center"><img src="./media/splat.png" alt="logo" width=60>Splat-SLAM: Globally Optimized RGB-only SLAM with 3D Gaussians</h1>
-  <p align="center">
-    <a href="https://eriksandstroem.github.io/" target="_blank"><strong>Erik Sandström<sup>1,2*</sup></strong></a>
-    ·
-    <a><strong>Keisuke Tateno<sup>2</sup></strong></a>
-    ·
-    <a href="https://moechsle.github.io/" target="_blank"><strong>Michael Oechsle<sup>2</sup></strong></a>
-     ·
-    <a href="https://m-niemeyer.github.io/" target="_blank"><strong>Michael Niemeyer<sup>2</sup></strong></a>
-    <br>
-    <a href="https://vision.ee.ethz.ch/people-details.OTAyMzM=.TGlzdC8zMjg3LC0xOTcxNDY1MTc4.html" target="_blank"><strong>Luc Van Gool<sup>1,4,5</sup></strong></a>
-    ·
-    <a href="https://cvg.ethz.ch/team/Dr-Martin-R-Oswald" target="_blank"><strong>Martin R. Oswald<sup>1,6</sup></strong></a>
-    ·
-    <a href="https://federicotombari.github.io/" target="_blank"><strong>Federico Tombari<sup>2,3</sup></strong></a>
-  </p>
-  <p align="center">
-      <strong><sup>1 </sup>ETH Zurich,  <sup>2 </sup>Google, <sup>3 </sup>TUM, <sup>4 </sup>KU Leuven, <sup>5 </sup>INSAIT, <sup>6 </sup>University of Amsterdam </strong>
-      <br>(<strong>*</strong> This work was conducted during an internship at Google)
-      <strong><h4 align="center"><a href="https://arxiv.org/abs/2405.16544" target="_blank">Paper</a></h4></strong>
-  </p>
+  <h1 align="center"><img src="./media/splat.png" alt="logo" width=60>MonoDy: Monocular Gaussian Splatting SLAM in Dynamic Scenes</h1>
 
 
 <p align="center">
@@ -32,14 +12,14 @@ This is not an officially endorsed Google product.
 </p>
 
 <p align="center">
-<strong>Splat-SLAM</strong> produces more accurate dense geometry and rendering results compared to existing methods. This is thanks to our <strong> deformable 3DGS representation </strong> and <strong>DSPO layer</strong> for camera pose and depth estimation. <sup>1</sup>Zhang et al. 2024. <sup>2</sup>Matsuki et al. 2023.
+<strong>MonoDy</strong>  Monocular Gaussian Splatting SLAM in Dynamic Scenes. 
 </p>
 
 <p align="center">
     <img src="./media/framework.jpg" alt="framework" width="100%">
 </p>
 <p align="center">
-<strong>Splat-SLAM Architecture</strong>. We use a keyframe based frame to frame tracker based on dense optical flow connected to a pose graph for global consistency. For dense mapping, we resort to a 3DGS representation, suitable for extracting both dense geometry and rendering from. 
+<strong>MonoDy Architecture</strong>. We use a keyframe based frame to frame tracker based on dense optical flow connected to a pose graph for global consistency. For dense mapping, we resort to a 3DGS representation, suitable for extracting both dense geometry and rendering from. 
 </p>
 
 <!-- TABLE OF CONTENTS -->
