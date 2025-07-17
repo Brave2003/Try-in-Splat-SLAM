@@ -88,6 +88,7 @@ diff_gaussian_rasterization; print(torch.cuda.is_available())"
 python -m pip install -e .
 python -m pip install -r requirements.txt
 python -m pip install pytorch-lightning==1.9 --no-deps
+pip install "git+https://github.com/facebookresearch/pytorch3d.git"
 ```
 
 8. Download pretrained model.
@@ -105,10 +106,7 @@ Download the pretained models from [Google Drive](https://drive.google.com/file/
 
 ```
 </details>
-9.install pytorch3d.
-```bash
-pip install "git+https://github.com/facebookresearch/pytorch3d.git"
-```
+
 
 
 ## Data Download
