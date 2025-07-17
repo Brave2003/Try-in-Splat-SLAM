@@ -64,20 +64,18 @@ def vis_render_process(gaussians, pipeline_params, background, viewpoint, cur_fr
         render_pkg = render(
             viewpoint, gaussians, pipeline_params, background
         )
-        # render_pkg = render(
-        #    viewpoint, gaussians, pipeline_params, background, mask=mask, dynamic=False
-        # )
+
         viz_im = torch.clip(render_pkg["render"].permute(1, 2, 0).detach().cpu(), 0, 1)
-        # viz_depth = render_pkg['depth'][0, :, :].unsqueeze(0).detach().cpu()
+
 
         h, w, _ = viz_im.shape
         fig, ax = plt.subplots(figsize=(w / 100, h / 100), dpi=100)
         cax = ax.imshow(viz_im)
         ax.axis('off')
-        # 去除空白区域
+
         plt.subplots_adjust(left=0, right=1, top=1, bottom=0, hspace=0, wspace=0)
         plt.margins(0, 0)
-        # 保存彩色图
+
         os.makedirs(save_dir, exist_ok=True)
         process_dir = os.path.join(save_dir, out_dir)
         os.makedirs(process_dir, exist_ok=True)
@@ -162,8 +160,7 @@ class Mapper(object):
         self.static_msk = torch.from_numpy(static_msk).to(self.device)
         if self.gaussians is None:
             raise RuntimeError("高斯模型未初始化！")
-        # if self.gaussians.optimizer is None:
-        #     raise RuntimeError("高斯模型的优化器未初始化！请调用 training_setup()")
+)
         self.frame_reader = get_dataset(
             self.config, device=self.device)
         if self.config["mapping"]["model_params"]["dynamic_model"]:
@@ -288,12 +285,12 @@ class Mapper(object):
             means_cam = (w2c_old @ pts4.T).T[:, :3]
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            # 所有张量生成时指定 device
+           
             means_cam = means_cam.to(device)
             depth = depth.to(device)
-            depth_old = depth_old.to(device)  # 确保此处已移动
+            depth_old = depth_old.to(device)  
             rescale_scale = (1 + 1 / (means_cam[:, 2]) * (depth - depth_old)).unsqueeze(-1)  # shift
-            # account for 0 depth values - then just do rigid deformation
+   
             rigid_mask = torch.logical_or(depth == 0, depth_old == 0)
             rescale_scale[rigid_mask] = 1
             if (rescale_scale <= 0.0).sum() > 0:
@@ -461,7 +458,7 @@ class Mapper(object):
         # depth_dirs = glob(os.path.join(base_dir,'GeoWizardOut/depth_npy/*.npy'))
         if video_id==11 and len(self.list) == 0:
            self.list.append(depth)
-        reference_depth = self.list[0] ## 5 is the reference frame 这个必须要和 align scale的时候用的一致。
+        reference_depth = self.list[0] 
 
         reference_depth = reference_depth.cpu().numpy()
         # masked_reference_depth = reference_depth
@@ -510,12 +507,11 @@ class Mapper(object):
             new_scale_alignFrame0[video_id] = res.solution.item()
 
             previous_value = new_scale_alignFrame0[11]
-            #limit=(0.2+previous_value)/previous_value
+
             if previous_value is not None  and self.longer:
-                # 比较当前值与上一个值
+   
                 current_value = new_scale_alignFrame0[video_id]
 
-                # 如果当前值不存在或当前值大于上一个值，则更新
                 if current_value is None or current_value > previous_value*1.1 or current_value*1.1<previous_value :
                     new_scale_alignFrame0[video_id] = previous_value
                     print(f"新赋值后，video_id={video_id} 的值是: {new_scale_alignFrame0[video_id]}")
@@ -589,84 +585,59 @@ class Mapper(object):
         loss = torch.mean(torch.abs(torch.tanh(alpha * render_diff) - gt_oder))
         return loss
     def get_w2c_and_depth(self, video_idx, idx, mono_depth,motion_mask, depth_gt,normal,mono, static_mask,print_info=False, init=False):
-        """
-        获取相机位姿和融合深度图（DROID深度与单目深度融合）
 
-        参数:
-            video_idx (int): 视频序列索引
-            idx (int): 当前帧索引
-            mono_depth (Tensor): 单目深度估计结果
-            depth_gt (Tensor): 真实深度（如有）
-            print_info (bool): 是否打印调试信息
-            init (bool): 是否为初始化阶段
-
-        返回:
-            est_droid_depth (Tensor): 融合后的深度图
-            w2c (Tensor): 世界坐标系到相机坐标系的变换矩阵
-            invalid (bool): 当前帧是否有效
-        # """
 
         est_droid_depth, valid_depth_mask, c2w = self.video.get_depth_and_pose(video_idx, self.device)
-        # 计算世界坐标系到相机坐标系的变换矩阵（逆矩阵）
+
         c2w = c2w.to(self.device)
         w2c = torch.linalg.inv(c2w)
-        os.makedirs('./camera_poses', exist_ok=True)
 
-        # 2. 将w2c转换为numpy数组并保存
-        w2c_np = w2c.cpu().numpy()
-        np.save(f'./camera_poses/pose_v{video_idx}_f{idx}.npy', w2c_np)
-
-        # 3. 同时保存人类可读的文本版本用于调试
-        np.savetxt(f'./camera_poses/pose_v{video_idx}_f{idx}.txt', w2c_np, fmt='%.6f')
-        # 调试信息：打印有效深度点统计
         if print_info:
             print(f"valid depth number: {valid_depth_mask.sum().item()}, "
                   f"valid depth ratio: {(valid_depth_mask.sum() / (valid_depth_mask.shape[0] * valid_depth_mask.shape[1])).item()}")
 
-        # 有效性检查：当有效深度点不足时跳过当前帧
         if valid_depth_mask.sum() < 100:
             invalid = True
             print(
                 f"Skip mapping frame {idx} at video idx {video_idx} because of not enough valid depth ({valid_depth_mask.sum()}).")
         else:
-            # 预处理单目深度图 --------------------------------------------------------
+
             invalid = False
             est_droid_depth[~valid_depth_mask] = 0
-            # 步骤1：异常值过滤（超过均值3倍的深度置零）
+
             mono_valid_mask = mono_depth < (mono_depth.mean() * 3)
             mono_depth[mono_depth > 3 * mono_depth.mean()] = 0
 
-            # 步骤2：二值腐蚀操作（消除边缘噪声）
+
             from scipy.ndimage import binary_erosion
             mono_depth = mono_depth.cpu().numpy()
             binary_image = (mono_depth > 0).astype(int)
-            iterations = 5  # 腐蚀迭代次数，控制平滑程度
-            padded_binary_image = np.pad(binary_image, pad_width=iterations, mode='constant', constant_values=1)
-            structure = np.ones((3, 3), dtype=int)  # 3x3腐蚀核
 
-            # 执行腐蚀操作
+            padded_binary_image = np.pad(binary_image, pad_width=iterations, mode='constant', constant_values=1)
+            structure = np.ones((3, 3), dtype=int) 
+
+       
             eroded_padded_image = binary_erosion(padded_binary_image,
                                                  structure=structure,
                                                  iterations=iterations)
             eroded_image = eroded_padded_image[iterations:-iterations, iterations:-iterations]
 
-            # 步骤3：应用腐蚀掩码
+
             mono_depth[eroded_image == 0] = 0
-            # 步骤4：图像修复（填充被腐蚀的孔洞）
+      
             if (mono_depth == 0).sum() > 0:
-                # 使用Navier-Stokes算法进行修复
+       
                 mono_depth = torch.from_numpy(
                     cv2.inpaint(mono_depth,
                                 (mono_depth == 0).astype(np.uint8),
-                                inpaintRadius=3,  # 修复半径
-                                flags=cv2.INPAINT_NS)  # 算法选择
+                                inpaintRadius=3,  
+                                flags=cv2.INPAINT_NS) 
                 ).to(self.device)
             else:
                 mono_depth = torch.from_numpy(mono_depth).to(self.device)
             normal = normal.cpu().numpy()
             depth_gt = torch.from_numpy(depth_gt).to(self.device)
-            print("monodepth before min",mono_depth.min())
-            print("monodepth before max", mono_depth.max())
+
             if video_idx == 11 and len(self.first_d)  == 0:
                 self.first_d.append(motion_mask)
             refer_mask=self.first_d[0]
