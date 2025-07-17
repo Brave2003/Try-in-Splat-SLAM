@@ -243,6 +243,8 @@ class BaseDataset(Dataset):
                     edge = self.H_edge
                     mono_data = mono_data[edge:-edge, :]
             print("monodata",mono_data.shape)
+        else :
+            mono_data=None
         depth_data_fullsize = self.depthloader(index,self.depth_paths,self.png_depth_scale)
         if depth_data_fullsize is not None:
             depth_data_fullsize = torch.from_numpy(depth_data_fullsize).float()
