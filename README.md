@@ -197,26 +197,17 @@ scene0233_00
 For running Splat-SLAM, each scene has a config folder, where the `input_folder`,`output` paths need to be specified. Below, we show some example run commands for one scene from each dataset.
 
 ### TUM-RGBD
-To run Splat-SLAM on the `freiburg3_office` scene, run the following command. 
+To run Splat-SLAM on the `freiburg3_sitting_rpy` scene, run the following command. 
 ```bash
-python run.py configs/TUM_RGBD/freiburg3_office.yaml
+python run.py configs/TUM_RGBD/rgbd_dataset_freiburg3_sitting_rpy.yaml
 ```
 After reconstruction, the trajectory error will be evaluated automatically.
 
-### ScanNet
-
-To run Splat-SLAM on the `scene0000_00` scene, run the following command. 
-```bash
-python run.py configs/Scannet/scene0000.yaml
-```
-After reconstruction, the trajectory error will be evaluated automatically.
 
 ## Run tracking without mapping
 Our Splat-SLAM pipeline uses two processes, one for tracking and one for mapping, and it is possible to run tracking only without mapping/rendering. Add `--only_tracking` in each of the above commands.
 ```bash
-python run.py configs/Replica/office0.yaml --only_tracking
-python run.py configs/TUM_RGBD/freiburg3_office.yaml --only_tracking
-python run.py configs/Scannet/scene0000.yaml --only_tracking
+python run.py configs/TUM_RGBD/rgbd_dataset_freiburg3_sitting_rpy.yaml --only_tracking
 ```
 
 ## Acknowledgement
