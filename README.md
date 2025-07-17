@@ -124,7 +124,6 @@ Download the pretained models from [Google Drive](https://drive.google.com/file/
         └── omnidata_dpt_depth_v2.ckpt
 
 ```
-[//]: # (```)
 ## Download depth_anything_v2_vitl.pth
 ```bash
 cd pretrained
