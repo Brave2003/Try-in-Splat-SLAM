@@ -134,10 +134,13 @@ https://github.com/zacjiang/GMA/blob/main/checkpoints/gma-things.pth
 bash scripts/download_tum.sh
 ```
 Please change the `input_folder` path in the scene specific config files to point to where the data is stored.
+### preprocessing
 
+Enter this task and use it to generate normal vectors, then place the generated normal vectors into the corresponding datasets folder https://github.com/fuxiao0719/GeoWizard then run bash rename picture name
+```bash
+python new.py   source_dir  target_dir
 
-
-
+```
 ## Run
 For running Splat-SLAM, each scene has a config folder, where the `input_folder`,`output` paths need to be specified. Below, we show some example run commands for one scene from each dataset.
 
