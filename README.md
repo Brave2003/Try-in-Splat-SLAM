@@ -124,16 +124,15 @@ Download the pretained models from [Google Drive](https://drive.google.com/file/
         └── omnidata_dpt_depth_v2.ckpt
 
 ```
-## Download depth_anything_v2_vitl.pth
-```bash
-cd pretrained
-wget https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
-```
 </details>
 
 
 ## Data Download
-
+### Download depth_anything_v2_vitl.pth
+```bash
+cd pretrained
+wget https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
+```
 ### TUM-RGBD
 ```bash
 bash scripts/download_tum.sh
