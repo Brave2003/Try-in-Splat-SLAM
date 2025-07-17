@@ -338,8 +338,6 @@ class BaseDataset(Dataset):
 
         combined_mask = torch.zeros((self.H_out, self.W_out), device=self.device, dtype=torch.bool)
         if self.yolo_model is not None:
-            #results = self.yolo_model.predict(source=color_data, classes=[0], save=False, stream=False,
-              #                                show=False, verbose=False, device=self.device)
             results = self.yolo_model.track(source=color_data, persist=True,classes=[0], save=False, stream=False,
                                               show=False, verbose=False, device=self.device)
             for result in results:
@@ -355,22 +353,7 @@ class BaseDataset(Dataset):
                         dilated_mask = torch.from_numpy(dilated_np > 0).to(device=mask.device, dtype=torch.bool)
                         combined_mask |= dilated_mask
         if self.yolo_model is not None and self.seg_chair:
-            results = self.yolo_model.predict(source=color_data, classes=[56], save=False, stream=False,
-                                              show=False, verbose=False, device=self.device)
-            for result in results:
-                masks = result.masks
-                if masks is not None:
-                    for mask in masks.data:
-                        mask = mask.to(torch.bool)
-                        mask_np = mask.cpu().numpy().astype(np.uint8) * 255
-                        kernel_size = 7#16
-                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-                        dilated_np = cv2.dilate(mask_np, kernel, iterations=1)
-                        # 转回张量
-                        dilated_mask = torch.from_numpy(dilated_np > 0).to(device=mask.device, dtype=torch.bool)
-                        combined_mask |= dilated_mask
-        if self.yolo_model is not None and self.seg_ballon:
-            results = self.yolo_model.predict(source=color_data, classes=[1], save=False, stream=False,
+            results = self.yolo_model.track(source=color_data, classes=[56], save=False, stream=False,
                                               show=False, verbose=False, device=self.device)
             for result in results:
                 masks = result.masks
