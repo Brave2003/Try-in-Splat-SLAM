@@ -53,7 +53,17 @@ torch::Tensor iproj_cuda(
   torch::Tensor poses,
   torch::Tensor disps,
   torch::Tensor intrinsics);
-
+std::vector<torch::Tensor> bi_inter_cuda(
+  torch::Tensor scales,
+  torch::Tensor grids);
+std::vector<torch::Tensor> proj_trans_cuda(
+    torch::Tensor poses,
+    torch::Tensor disps,
+    torch::Tensor intrinsics,
+    torch::Tensor targets,
+    torch::Tensor weights,
+    torch::Tensor ii,
+    torch::Tensor jj);
 std::vector<torch::Tensor> ba_cuda(
     torch::Tensor poses,
     torch::Tensor disps,
@@ -99,7 +109,25 @@ std::vector<torch::Tensor> altcorr_cuda_backward(
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CONTIGUOUS(x)
+std::vector<torch::Tensor> proj_trans(
+    torch::Tensor poses,
+    torch::Tensor disps,
+    torch::Tensor intrinsics,
+    torch::Tensor targets,
+    torch::Tensor weights,
+    torch::Tensor ii,
+    torch::Tensor jj) {
 
+  CHECK_INPUT(targets);
+  CHECK_INPUT(weights);
+  CHECK_INPUT(poses);
+  CHECK_INPUT(disps);
+  CHECK_INPUT(intrinsics);
+  CHECK_INPUT(ii);
+  CHECK_INPUT(jj);
+
+  return proj_trans_cuda(poses, disps, intrinsics, targets, weights, ii, jj);
+}
 
 std::vector<torch::Tensor> ba(
     torch::Tensor poses,
@@ -181,7 +209,14 @@ torch::Tensor iproj(
 
   return iproj_cuda(poses, disps, intrinsics);
 }
+std::vector<torch::Tensor> bi_inter(
+    torch::Tensor scales,
+    torch::Tensor grids) {
+  CHECK_INPUT(scales);
+  CHECK_INPUT(grids);
 
+  return bi_inter_cuda(scales, grids);
+}
 
 // c++ python binding
 std::vector<torch::Tensor> corr_index_forward(
@@ -254,10 +289,12 @@ torch::Tensor depth_filter(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // bundle adjustment kernels
   m.def("ba", &ba, "bundle adjustment");
+  m.def("proj_trans", &proj_trans, "projective transform");
   m.def("frame_distance", &frame_distance, "frame_distance");
   m.def("projmap", &projmap, "projmap");
   m.def("depth_filter", &depth_filter, "depth_filter");
   m.def("iproj", &iproj, "back projection");
+  m.def("bi_inter", &bi_inter, "bilinear interpolation");
 
   // correlation volume kernels
   m.def("altcorr_forward", &altcorr_forward, "ALTCORR forward");

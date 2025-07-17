@@ -17,7 +17,7 @@ import torch
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
-
+#from models.sequence import GaussianSequence
 from thirdparty.gaussian_splatting.utils.general_utils import (
     build_rotation,
     build_scaling_rotation,
@@ -26,33 +26,36 @@ from thirdparty.gaussian_splatting.utils.general_utils import (
     inverse_sigmoid,
     strip_symmetric,
 )
-from thirdparty.gaussian_splatting.utils.graphics_utils import BasicPointCloud, getWorld2View2
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from thirdparty.gaussian_splatting.utils.graphics_utils import PHASE_NAMES
+from thirdparty.gaussian_splatting.utils.graphics_utils import BasicPointCloud, getWorld2View2,get_linear_noise_func
 from thirdparty.gaussian_splatting.utils.sh_utils import RGB2SH
 from thirdparty.gaussian_splatting.utils.system_utils import mkdir_p
-
-
+from thirdparty.gaussian_splatting.scene.deform_model import DeformModel
+from utils.deformation import deform_network
 class GaussianModel:
-    def __init__(self, sh_degree: int, config=None):
+    def __init__(self, sh_degree: int, config=None,args=None, fea_dim=0, init_deform=False):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
-
+        self._segmentation = torch.empty(0, device="cuda")
         self._xyz = torch.empty(0, device="cuda")
         self._features_dc = torch.empty(0, device="cuda")
         self._features_rest = torch.empty(0, device="cuda")
+        self._delta_xyz = torch.empty(0,device="cuda")
         self._scaling = torch.empty(0, device="cuda")
         self._rotation = torch.empty(0, device="cuda")
         self._opacity = torch.empty(0, device="cuda")
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
-
+        self.dygs = torch.empty(0, device="cuda").bool()
         self.unique_kfIDs = torch.empty(0).int()
         self.n_obs = torch.empty(0).int()
-
+        self.depth_remove_outliers=True
         self.optimizer = None
-
+        self.pcs=[]
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-
+        self.outlier_std_ratio=1.5
         self.covariance_activation = self.build_covariance_from_scaling_rotation
 
         self.opacity_activation = torch.sigmoid
@@ -64,7 +67,34 @@ class GaussianModel:
         self.ply_input = None
 
         self.isotropic = False
+        self.with_motion_mask = False
+        self.time_interval = 0
 
+        self.deform_init = False
+        # 4D gaussian
+        # self._deformation = deform_network(args, device=self._xyz.device)
+        # SC-GS
+        if init_deform:
+           print("args.deform  type",args.deform_type)
+           self.deform = DeformModel(K=args.K, deform_type=args.deform_type, is_blender=args.is_blender,
+                                      skinning=args.skinning, hyper_dim=args.hyper_dim, node_num=args.node_num,
+                                      pred_opacity=args.pred_opacity, pred_color=args.pred_color,
+                                      use_hash=args.use_hash,
+                                      hash_time=args.hash_time,
+                                      d_rot_as_res=args.d_rot_as_res and not args.d_rot_as_rotmat,
+                                      local_frame=args.local_frame, progressive_brand_time=args.progressive_brand_time,
+                                      with_arap_loss=not args.no_arap_loss, max_d_scale=args.max_d_scale,
+                                      enable_densify_prune=args.node_enable_densify_prune,
+                                      is_scene_static=args.is_scene_static)
+        # # self.deform.train_setting(args)
+        self.smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
+        # ==== 新增动态属性 ====
+        # self.phase = torch.tensor(0)  # 0-bundle adjust,1-motion estimation,2-motion expansion
+        # self.frameidx2gaussianidx = torch.empty(0).int()  # 帧到高斯集合的映射
+        # self.frameidx2gaussianidxexpanded = torch.empty(0).int()  # 扩展帧映射
+        # self.gaussians = nn.ModuleList()  # 多高斯集合容器
+        # self._gaussian_idxs = []  # 当前激活的高斯索引
+        #self.config = config  # 配置参数
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
     ):
@@ -86,6 +116,21 @@ class GaussianModel:
         return self._xyz
 
     @property
+    def motion_dy_mask(self):
+        return torch.ones_like(self._xyz[self.dygs].unsqueeze(1))
+    @property
+    def motion_mask(self):
+        #print("mask",self.dygs, self._xyz[..., :1].shape)
+        return torch.ones_like(self.get_dygs_xyz[..., :1])
+        return self.dygs.unsqueeze(1)
+        if self.with_motion_mask:
+            return torch.sigmoid(self.feature[..., -1:])
+        else:
+            return torch.ones_like(self._xyz[..., :1])
+    @property
+    def get_dygs_xyz(self):
+        return self._xyz[self.dygs]
+    @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
@@ -104,13 +149,13 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None):
+    def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None, add_dygs=False):
         cam = cam_info
 
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
         rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-
+        print("depth",depthmap.max())
         if depthmap is not None:
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depthmap.astype(np.float32))
@@ -128,9 +173,31 @@ class GaussianModel:
 
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
-
+        if add_dygs:
+            depth = np.copy(cam_info.depth)
+            depth[cam.motion_mask.cpu().numpy()] = 0
+            depth = o3d.geometry.Image(depth.astype(np.float32))
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
-
+    # def populate_modules(self):
+    #     """Set the fields and modules."""
+    #     # Set up Gaussian Field
+    #     self.field = GaussianField(
+    #         num_images=self.num_train_data,
+    #         config=self.config,
+    #         point_clouds=self.config.point_cloud_sequence,
+    #         background=self.config.background,
+    #         background_cls=torch.tensor([0]),  # hard code for now
+    #         pretrained_background=self.config.pretrained_background,
+    #         scene_scale=self.scene_scale
+    #     )
+    #     self.nframes = len(self.config.point_cloud_sequence)
+    #
+    #     # losses
+    #     self.l1_loss = L1Loss()
+    #     self.lpips = get_compute_lpips()
+    #     self.lpips_diff = LearnedPerceptualImagePatchSimilarity()
+    # def step_stage(self, stage, fgbg, scope_increase=None):
+    #     self.field.step_stage(stage, fgbg, scope_increase)
     def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
         if init:
             downsample_factor = self.config["mapping"]["pcd_downsample_init"]
@@ -143,7 +210,9 @@ class GaussianModel:
                 # cause problems in the RGB-only case since 0.05 does not 
                 # really mean much then. Well as long as we initialize to 
                 # reasonable scale it should be ok.
-                point_size = min(0.05, point_size * np.median(depth))
+                #point_size = min(0.05, point_size * np.median(depth))
+                point_size = min(0.05, point_size * np.median(cam.depth[cam.depth > 0.1]))
+                #point_size = min(0.05, point_size * np.median(depth[depth>0.1]))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             rgb,
             depth,
@@ -151,7 +220,62 @@ class GaussianModel:
             depth_trunc=100.0,
             convert_rgb_to_intensity=False,
         )
-
+        depth_np = np.asarray(depth)
+        print("min",depth_np.min())
+        print("mmax",depth_np.max())
+        # depth_img=depth
+        # height = int(cam.height)  # 图像高度
+        # width = int(cam.width)  # 图像宽度
+        # image=cam.original_image
+        # foreground_mask = depth_img > 0
+        # if cam.motion_mask is not None:
+        #     foreground_mask&= cam.motion_mask
+        # segmentation = torch.from_numpy(
+        #     np.load(str(self.segmentation_filenames[i]))   # 加载.npy分割文件
+        # )
+        # fx, fy = cam.fx, cam.fy # 焦距(像素单位)
+        # cx, cy = cam.cx, cam.cy # 光心坐标
+        # extrinsics = cam.world_view_transform  # 相机到世界坐标的变换矩阵[4x4]
+        # depth_img[depth_img > 5.0] = 5.0
+        # pc, pix, segmentation, rgb, depth = self.depth2pc(
+        #     depth_img,  # 预处理后的深度图
+        #     height, width,  # 图像尺寸
+        #     fx, fy, cx, cy,  # 内参
+        #     extrinsics,  # 外参矩阵
+        #     foreground_mask,  # 有效区域掩码
+        #     5.0,  # 远平面阈值
+        #     segmentation,  # 原始分割标签
+        #     image  # RGB图像数据
+        # )
+        # if self.depth_remove_outliers:
+        #     # 创建Open3D点云对象
+        #     pcd = o3d.geometry.PointCloud()
+        #     pcd.points = o3d.utility.Vector3dVector(pc.cpu().numpy())
+        #
+        #     # 统计离群点去除 (基于邻域标准差)
+        #     pcd, inlier_indices = pcd.remove_statistical_outlier(
+        #         nb_neighbors=20,  # 邻域点数阈值
+        #         std_ratio=self.outlier_std_ratio  # 标准差倍数阈值(例如2.0)
+        #     )
+        #
+        #     # 更新相关数据
+        #     segmentation = segmentation[inlier_indices]
+        #     rgb = rgb[inlier_indices]
+        #     depth = depth[inlier_indices]
+        #     pc = torch.from_numpy(np.array(pcd.points)).float()  # 转换回Tensor
+        #
+        #     # ==== 数据合并 ====
+        #     # 拼接最终点云特征：XYZ坐标 + 分割标签 + RGB颜色 + 深度值
+        # pc = torch.cat((
+        #     pc,  # 点坐标 [N,3]
+        #     segmentation.unsqueeze(-1),  # 分割标签 [N,1]
+        #     rgb,  # RGB颜色 [N,3]
+        #     depth.view(-1, 1)  # 深度值 [N,1]
+        # ), dim=-1)  # 最终形状[N,8]
+        #
+        # # ==== 按时间戳存储 ====
+        # frameid = int(cam.time)  # 获取时间戳(帧ID)
+        # self.pcs[frameid] = pc
         W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
         pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd,
@@ -169,6 +293,8 @@ class GaussianModel:
         # Downsample the Gaussian means randomly by downsample_factor = 64
         # So only 1.5 % of all pixels in the image are used for anchoring
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+        print("[DEBUG] Downsampled point cloud size:", len(pcd_tmp.points))  # 添加调试输出
+
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
 
@@ -189,7 +315,18 @@ class GaussianModel:
         )
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
-
+        # rgb_np = np.asarray(rgb)
+        # depth_np = np.asarray(depth)
+        # valid_depth_mask = depth_np > 0.1  # 过滤掉0和极小值
+        # print("有效深度像素占比:", np.mean(valid_depth_mask) * 100, "%")
+        # print(" last depth", depth_np)
+        # print("RGB shape:", rgb_np.shape)
+        # print("Depth shape:", depth_np.shape)
+        # print("Depth min/max:", depth_np.min(), depth_np.max())
+        # points = torch.from_numpy(np.asarray(pcd.points)).float()
+        # print("Points shape:", points.shape)
+        # print("Points device:", points.device)
+        # points = points.cuda()  # 单独执行这一步看是否出错
         # Compute point distances with knn
         dist2 = (
             torch.clamp_min(
@@ -217,12 +354,201 @@ class GaussianModel:
         )
 
         return fused_point_cloud, features, scales, rots, opacities
+    # def get_full_depth_pc_sequence(self,i,depth,cam):
+    #     """
+    #     生成完整深度点云序列的主函数
+    #     返回:
+    #         pcs (list): 包含各帧点云数据的列表，每个元素形状为[N, 8]，
+    #                     包含XYZ坐标、分割标签、RGB颜色和深度值
+    #     """
+    #     # 初始化点云容器，按帧数创建空列表
+    #     pcs = [None for _ in range(self.nframes)]  # 创建与帧数等长的空列表
+    #
+    #     # 遍历所有深度图像文件
+    #     print(f"正在处理第 {i + 1}个点云")
+    #
+    #     # ==== 数据准备阶段 ====
+    #     # 获取当前帧图像参数
+    #     height = int(cam.height[i])  # 图像高度
+    #     width = int(cam.width[i])  # 图像宽度
+    #     image = self.get_image(i)  # 获取RGB图像，形状[H,W,3]
+    #
+    #     # 加载深度图并进行预处理
+    #     depth_img = get_depth_image_from_path(
+    #         filepath=depth_fname,  # 深度图文件路径
+    #         height=height,  # 保持与RGB同分辨率
+    #         width=width,
+    #         scale_factor=self.depth_unit_scale_factor  # 深度单位换算系数
+    #     ).squeeze(-1)  # 去除多余维度 [H,W,1] -> [H,W]
+    #
+    #     # 创建有效深度掩码
+    #     foreground_mask = depth_img > 0  # 基础掩码：深度值有效区域
+    #     if self.mask_filenames is not None:
+    #         # 加载额外前景掩码（如运动物体分割）
+    #         additional_mask = self.get_foreground_mask(self.mask_filenames[i])
+    #         foreground_mask &= additional_mask  # 逻辑与合并掩码
+    #
+    #     # 加载语义分割标签
+    #     segmentation = torch.from_numpy(
+    #         np.load(str(self.segmentation_filenames[i]))  # 加载.npy分割文件
+    #     )
+    #
+    #     # ==== 相机参数获取 ====
+    #     fx, fy = self.cameras.fx[i].item(), self.cameras.fy[i].item()  # 焦距(像素单位)
+    #     cx, cy = self.cameras.cx[i].item(), self.cameras.cy[i].item()  # 光心坐标
+    #     extrinsics = self.cameras.camera_to_worlds[i]  # 相机到世界坐标的变换矩阵[4x4]
+    #
+    #     # 深度图截断处理
+    #     depth_img[depth_img > self.far_plane] = self.far_plane  # 远平面截断
+    #
+    #     # ==== 深度图转点云 ====
+    #     pc, pix, segmentation, rgb, depth = self.depth2pc(
+    #         depth_img,  # 预处理后的深度图
+    #         height, width,  # 图像尺寸
+    #         fx, fy, cx, cy,  # 内参
+    #         extrinsics,  # 外参矩阵
+    #         foreground_mask,  # 有效区域掩码
+    #         self.far_plane,  # 远平面阈值
+    #         segmentation,  # 原始分割标签
+    #         image  # RGB图像数据
+    #     )
+    #
+    #     # ==== 离群点去除 ====
+    #     if self.depth_remove_outliers:
+    #         # 创建Open3D点云对象
+    #         pcd = o3d.geometry.PointCloud()
+    #         pcd.points = o3d.utility.Vector3dVector(pc.cpu().numpy())
+    #
+    #         # 统计离群点去除 (基于邻域标准差)
+    #         pcd, inlier_indices = pcd.remove_statistical_outlier(
+    #             nb_neighbors=20,  # 邻域点数阈值
+    #             std_ratio=self.outlier_std_ratio  # 标准差倍数阈值(例如2.0)
+    #         )
+    #
+    #         # 更新相关数据
+    #         segmentation = segmentation[inlier_indices]
+    #         rgb = rgb[inlier_indices]
+    #         depth = depth[inlier_indices]
+    #         pc = torch.from_numpy(np.array(pcd.points)).float()  # 转换回Tensor
+    #
+    #     # ==== 数据合并 ====
+    #     # 拼接最终点云特征：XYZ坐标 + 分割标签 + RGB颜色 + 深度值
+    #     pc = torch.cat((
+    #         pc,  # 点坐标 [N,3]
+    #         segmentation.unsqueeze(-1),  # 分割标签 [N,1]
+    #         rgb,  # RGB颜色 [N,3]
+    #         depth.view(-1, 1)  # 深度值 [N,1]
+    #     ), dim=-1)  # 最终形状[N,8]
+    #
+    #     # ==== 按时间戳存储 ====
+    #     frameid = int(self.cameras.times[i])  # 获取时间戳(帧ID)
+    #     pcs[frameid] = pc  # 存入对应位置
+    #
+    #     return pcs
+    # def depth2pc(self,depth_img: np.array, height: int, width: int, fx: float, fy: float,
+    #              cx: float, cy: float, extrinsics: np.array, foreground_mask: np.array, far: float,
+    #              segmentation: np.array, image: np.array) -> np.array:
+    #
+    #     # start with coordinate frame x-right, y-down
+    #     xs, ys = np.meshgrid(np.arange(width), np.arange(height))
+    #     xs, ys = torch.from_numpy(xs), torch.from_numpy(ys)
+    #
+    #     # compute depth mask and filter
+    #     distance_mask = (depth_img <= far).numpy()
+    #     if foreground_mask is not None:
+    #         mask = foreground_mask & distance_mask
+    #     else:
+    #         mask = distance_mask
+    #     depth_map = -depth_img[mask]  # z is reflected in blender / nerfstudio!
+    #     xs = xs[mask]
+    #     ys = ys[mask]
+    #     segmentation = segmentation[mask]
+    #     image = image[mask]
+    #     xs_orig, ys_orig = xs.clone(), ys.clone()
+    #     xys_orig = torch.stack((xs_orig, ys_orig), dim=-1)
+    #
+    #     # opengl uses x-right, y-down, and z-backward for its camera coordinate frame
+    #     xs = depth_map * (xs - cx) / fx
+    #     ys = - depth_map * (
+    #                 ys - cy) / fy  # TODO: this is a left-handed coordinate system! But we immediately undo this in the couple lines
+    #     xyz_cam = torch.stack((xs, ys, depth_map), dim=-1)
+    #
+    #     # -------------------------------------------------------------------------------------
+    #     # change basis of camera coords to match that of our extrinsics C2W (this is 180 degree rotation about z-axis)
+    #     # our extrinsics matrix actually takes in OpenCV coordinates! All of OUR properties are in opencv; but nerfstudio needs opengl!
+    #     xyz_cam[:, [0, 1]] *= -1  # now that's interesting... this is x and y, not y and z!!!
+    #     # -------------------------------------------------------------------------------------
+    #
+    #     # convert from camera to world coordinates
+    #     xyz_world = xyz_cam.float() @ extrinsics[:3, :3].T + extrinsics[:3, 3:4].reshape((1, 3))
+    #     return xyz_world, xys_orig, segmentation, image, depth_img[mask]
+    def create_node_from_depth(self, cam, opt_params, sc_params, remove_outlier=False):
+        if cam.motion_mask is not None and torch.all(cam.motion_mask):
+            print("no dynamic object")
+            return False
+        elif torch.sum(~cam.motion_mask) < self.config["mapping"]["pcd_downsample"]*2:
+            print("False count is too low.")
+            return False
+        if not self.deform_init:
+            downsample_factor = self.config["mapping"]["pcd_downsample_init"]*2
+        else:
+            downsample_factor = self.config["mapping"]["pcd_downsample_init"]
+        depth_raw = np.copy(cam.depth)
+        depth_raw[cam.motion_mask.cpu().numpy()] = 0
+        if remove_outlier:
+            depth_raw[~cam.get_mask_outlier()] = 0
 
+        image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
+        image_ab = torch.clamp(image_ab, 0.0, 1.0)
+        rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+
+        rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+        depth = o3d.geometry.Image(depth_raw.astype(np.float32))
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            rgb,
+            depth,
+            depth_scale=1.0,
+            depth_trunc=100.0,
+            convert_rgb_to_intensity=False,
+        )
+        W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
+        pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
+            rgbd,
+            o3d.camera.PinholeCameraIntrinsic(
+                cam.image_width,
+                cam.image_height,
+                cam.fx,
+                cam.fy,
+                cam.cx,
+                cam.cy,
+            ),
+            extrinsic=W2C,
+            project_valid_depth_only=True,
+        )
+        pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+        new_xyz = np.asarray(pcd_tmp.points)
+        fused_point_cloud = torch.from_numpy(new_xyz).float().cuda()
+        if self.deform_init:
+            print(len(fused_point_cloud))
+            self.deform.extend_node_from_point(init_pcl=fused_point_cloud, keep_all=True,force_init=True, reset_bbox=False)
+        else:
+            self.deform.deform.init(opt=opt_params, init_pcl=fused_point_cloud, keep_all=True,
+                                    force_init=True, reset_bbox=False)
+
+            fused_point_cloud[:, 2] += 0.2
+            self.deform.train_setting(sc_params)
+            self.deform.extend_node_from_point(init_pcl=fused_point_cloud, keep_all=True,force_init=True, reset_bbox=False)
+            self.deform_init = True
+            #print("deform_init: ", self.deform_init)
+            return True
+        #print("deform_init: ", self.deform_init)
+        return False
     def init_lr(self, spatial_lr_scale):
+        print("初始化")
         self.spatial_lr_scale = spatial_lr_scale
 
     def extend_from_pcd(
-        self, fused_point_cloud, features, scales, rots, opacities, kf_id
+        self, fused_point_cloud, features, scales, rots, opacities, kf_id, add_dygs
     ):
         new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         # the non-directional dependent component of the SH denoted "dc"
@@ -240,6 +566,10 @@ class GaussianModel:
         # since I need this for the deformation.
         new_unique_kfIDs = torch.ones((new_xyz.shape[0])).int() * kf_id
         new_n_obs = torch.zeros((new_xyz.shape[0])).int()
+        if add_dygs:
+            new_dygs = torch.ones(new_xyz.shape[0], device="cuda").bool()
+        else:
+            new_dygs = torch.zeros(new_xyz.shape[0], device="cuda").bool()
         self.densification_postfix(
             new_xyz,
             new_features_dc,
@@ -247,20 +577,55 @@ class GaussianModel:
             new_opacity,
             new_scaling,
             new_rotation,
+            new_dygs,
             new_kf_ids=new_unique_kfIDs,
             new_n_obs=new_n_obs,
         )
 
     def extend_from_pcd_seq(
-        self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None
+        self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None, add_dygs=False
     ):
         fused_point_cloud, features, scales, rots, opacities = (
-            self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap)
+            self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap,add_dygs=add_dygs)
         )
         self.extend_from_pcd(
-            fused_point_cloud, features, scales, rots, opacities, kf_id
+            fused_point_cloud, features, scales, rots, opacities, kf_id, add_dygs
         )
+    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float=5., print_info=True, max_point_num=150_000):
+        self.spatial_lr_scale = 5
+        if type(pcd.points) == np.ndarray:
+            fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        else:
+            fused_point_cloud = pcd.points
+        if type(pcd.colors) == np.ndarray:
+            fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        else:
+            fused_color = pcd.colors
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
 
+        if print_info:
+            print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        #self.feature = nn.Parameter(-1e-2 * torch.ones([self._xyz.shape[0], self.fea_dim], dtype=torch.float32).to("cuda:0"), requires_grad=True)
+        if self.with_motion_mask:
+            self.feature.data[..., -1] = torch.zeros_like(self.feature[..., -1])
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -326,7 +691,7 @@ class GaussianModel:
                 )
 
                 param_group["lr"] = lr
-                return lr
+        return lr
 
     def construct_list_of_attributes(self):
         l = ["x", "y", "z", "nx", "ny", "nz"]
@@ -554,6 +919,7 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
+        self.dygs = self.dygs[valid_points_mask.cpu()]
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
@@ -600,6 +966,7 @@ class GaussianModel:
         new_opacities,
         new_scaling,
         new_rotation,
+        new_dygs,
         new_kf_ids=None,
         new_n_obs=None,
     ):
@@ -628,6 +995,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.dygs = torch.cat((self.dygs, new_dygs))
         if new_kf_ids is not None:
             self.unique_kfIDs = torch.cat((self.unique_kfIDs, new_kf_ids)).int()
         # self.n_obs describes how many times the Gaussian has been observed
@@ -665,7 +1033,7 @@ class GaussianModel:
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()].repeat(N)
         new_n_obs = self.n_obs[selected_pts_mask.cpu()].repeat(N)
-
+        new_dygs = self.dygs[selected_pts_mask].repeat(N)
         # Concatenate the new features to the global Gaussian parameters
         self.densification_postfix(
             new_xyz,
@@ -674,6 +1042,7 @@ class GaussianModel:
             new_opacity,
             new_scaling,
             new_rotation,
+            new_dygs,
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
         )
@@ -707,6 +1076,7 @@ class GaussianModel:
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()]
         new_n_obs = self.n_obs[selected_pts_mask.cpu()]
+        new_dygs = self.dygs[selected_pts_mask]
         self.densification_postfix(
             new_xyz,
             new_features_dc,
@@ -714,6 +1084,7 @@ class GaussianModel:
             new_opacities,
             new_scaling,
             new_rotation,
+            new_dygs,
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
         )
@@ -740,3 +1111,215 @@ class GaussianModel:
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
         )
         self.denom[update_filter] += 1
+
+    def compute_plane_smoothness(self, t):
+        batch_size, c, h, w = t.shape
+        # Convolve with a second derivative filter, in the time dimension which is dimension 2
+        first_difference = t[..., 1:, :] - t[..., :h - 1, :]  # [batch, c, h-1, w]
+        second_difference = first_difference[..., 1:, :] - first_difference[..., :h - 2, :]  # [batch, c, h-2, w]
+        # Take the L2 norm of the result
+        return torch.square(second_difference).mean()
+
+    def _plane_regulation(self):
+        multi_res_grids = self._deformation.deformation_net.grid.grids
+        total = 0
+        # model.grids is 6 x [1, rank * F_dim, reso, reso]
+        for grids in multi_res_grids:
+            if len(grids) == 3:
+                time_grids = []
+            else:
+                time_grids = [0, 1, 3]
+            for grid_id in time_grids:
+                total += self.compute_plane_smoothness(grids[grid_id])
+        return total
+
+    def _time_regulation(self):
+        multi_res_grids = self._deformation.deformation_net.grid.grids
+        total = 0
+        # model.grids is 6 x [1, rank * F_dim, reso, reso]
+        for grids in multi_res_grids:
+            if len(grids) == 3:
+                time_grids = []
+            else:
+                time_grids = [2, 4, 5]
+            for grid_id in time_grids:
+                total += self.compute_plane_smoothness(grids[grid_id])
+        return total
+
+    def _l1_regulation(self):
+        # model.grids is 6 x [1, rank * F_dim, reso, reso]
+        multi_res_grids = self._deformation.deformation_net.grid.grids
+
+        total = 0.0
+        for grids in multi_res_grids:
+            if len(grids) == 3:
+                continue
+            else:
+                # These are the spatiotemporal grids
+                spatiotemporal_grids = [2, 4, 5]
+            for grid_id in spatiotemporal_grids:
+                total += torch.abs(1 - grids[grid_id]).mean()
+        return total
+
+    def compute_regulation(self, time_smoothness_weight=0.01, l1_time_planes_weight=0.0001, plane_tv_weight=0.0001):
+        return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
+
+    # ==== 动态训练阶段管理 ====
+    def step_stage(self, new_phase, scope_increase=None):
+        """阶段转换核心逻辑"""
+        phase = PHASE_NAMES[self.phase.item()]
+
+        if phase == new_phase:
+            return
+
+        # 捆绑调整 → 运动估计
+        if phase == 'bundle-adjust' and new_phase == 'motion-estimation':
+            if len(self.gaussians) == 1: return
+            self.apply_merge()
+            self.enter_motion_est_phase()
+            self.phase += 1
+
+        # 运动阶段 → 捆绑调整
+        elif phase in ['motion-estimation', 'motion-expansion'] and new_phase == 'bundle-adjust':
+            self.enter_bundle_adjust(reduce_scale=phase == 'motion-estimation')
+            self.phase *= 0
+
+        # 捆绑调整 → 运动扩展
+        elif phase == 'bundle-adjust' and new_phase == 'motion-expansion':
+            if len(self.gaussians) == 1: return
+            self.enter_motion_expansion_phase(scope_increase)
+            self.phase += 2
+
+        # 显存清理
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # ==== 优化器管理 ====
+    def optimizer_step(self, step):
+        """参数更新与梯度管理"""
+        idx = self._gaussian_idxs[0]
+
+        # 梯度异常检测
+        delta_grad = self.gaussians[idx].get_delta_xyz[self._time].grad
+        if torch.any(torch.isnan(delta_grad)):
+            print("检测到梯度NaN，跳过更新")
+            self.gaussians[idx].optimizer.zero_grad()
+            return
+
+        # 主集合参数更新
+        self.gaussians[idx].optimizer.step()
+        self.gaussians[idx].optimizer.zero_grad()
+
+        # 运动估计阶段重置历史参数
+        phase = PHASE_NAMES[self.phase.item()]
+        if phase == 'motion-estimation' and self.config.freeze_previous_in_motion_estimation:
+            self.gaussians[idx].reset_previously_learned_motions(self._time)
+
+        # 清空备用集合梯度
+        if len(self._gaussian_idxs) > 1:
+            for idx in self._gaussian_idxs[1:]:
+                self.gaussians[idx].optimizer.zero_grad()
+
+    # ==== 模型合并逻辑 ====
+    def apply_merge(self):
+        """合并相邻高斯集合"""
+        self.frameidx2gaussianidx = self.frameidx2gaussianidx // 2
+
+        new_gaussians = nn.ModuleList()
+        for i in range(0, len(self.gaussians), 2):
+            g1, g2 = self.gaussians[i], self.gaussians[i + 1] if i + 1 < len(self.gaussians) else None
+
+            if g2 is None:
+                new_gaussians.append(g1)
+            else:
+                # 创建合并模型
+                merged = GaussianModel(self.config)
+                merged.merge_two_gaussian_sets(g1, g2)
+
+                # 模型精简
+                if self.config.prune_points:
+                    merged.prune_points(0.02, 0.002)
+                merged.downsample(self.maxpoints)
+                new_gaussians.append(merged)
+
+        self.gaussians = new_gaussians
+
+    # ==== 运动阶段配置 ====
+    def enter_motion_est_phase(self):
+        """运动估计阶段优化设置"""
+        for g in self.gaussians:
+            g.only_optimize_motion()  # 仅优化运动参数
+
+    def enter_bundle_adjust(self, reduce_scale=True):
+        """捆绑调整阶段配置"""
+        for g in self.gaussians:
+            g.optimize_all_except_motion()
+            if reduce_scale:
+                g.reduce_scale(self.config.downsample_reducescale)
+
+    # # ==== 原有方法增强 ====
+    # def training_setup(self, training_args):
+    #     """增强训练配置支持多阶段"""
+    #     # ... 保持原有优化器配置 ...
+    #
+    #     # 增加运动相关参数
+    #     if hasattr(training_args, 'motion_lr'):
+    #         self.optimizer.add_param_group({
+    #             'params': [self._delta_xyz],
+    #             'lr': training_args.motion_lr,
+    #             'name': 'motion'
+    #         })
+
+class StandardGaussianModel(GaussianModel):
+    def __init__(self, sh_degree: int, fea_dim=0, with_motion_mask=True, all_the_same=False):
+        super().__init__(sh_degree, fea_dim)
+        self.all_the_same = all_the_same
+        self.with_motion_mask = with_motion_mask
+# class GaussianField(nn.Module):
+#
+#     def __init__(
+#             self,
+#             num_images: int,
+#             config,
+#             point_clouds: list[TensorType],
+#             background: Tensor = torch.tensor([1.0, 1.0, 1.0]),
+#             background_cls: Tensor = torch.tensor([0]),
+#             pretrained_background: str = '',
+#             scene_scale=1.0
+#     ) -> None:
+#         super().__init__()
+#
+#         # if not config.no_background:
+#         foreground_cls = torch.tensor(list({i for i in range(16)} - set(background_cls.cpu().numpy().tolist())))
+#         # else:
+#         #     foreground_cls = torch.tensor(list({i for i in range(16)}))
+#         self.foreground_field = GaussianSequence(num_images, config, point_clouds, config.number_of_gaussians, foreground_cls)
+#         if config.no_background:
+#             self.background_field = None
+#         elif config.static_background:
+#             num_background_pts = config.number_of_gaussians - self.foreground_field.maxpoints
+#             self.background_field = GaussianStaticScene(config, point_clouds, num_background_pts, background_cls,
+#                                                         pretrained_ckpt=pretrained_background, scene_scale=scene_scale)
+#         else:
+#             self.background_field = GaussianSequence(num_images, config, point_clouds, config.number_of_gaussians, background_cls)
+#
+#         self.register_buffer("background_clr", background)  # registering as buffer will send it to("cuda") when called
+#         self.num_images = num_images
+#         self.config = config
+#         self.register_buffer("phase", torch.tensor(0, dtype=torch.long))
+#         self.register_buffer("learning_foreground", torch.tensor(True, dtype=torch.bool))
+#         self.register_buffer("learning_background", torch.tensor(True, dtype=torch.bool))
+#
+#         # set up gaussians
+#         self.nframes = len(point_clouds)
+#
+#         # temporary state -- keeps track of training params at each forward iteration
+#         self._render_background = True
+#         self._tmp_background_clr = torch.tensor([1.0, 1.0, 1.0])
+#         self._time = 0
+#         self._viewpoint_camera = None
+#
+#         # initialize tracking loss module
+#         self.tracking_loss = TrackingLoss(self.config.tracking_knn, self.config.tracking_radius,
+#                                           self.config.tracking_loss_per_segment)

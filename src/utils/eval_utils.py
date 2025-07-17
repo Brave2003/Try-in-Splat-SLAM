@@ -74,22 +74,53 @@ def eval_rendering(
 
 
     for k, (kf_idx, video_idx) in enumerate(zip(keyframe_idxs, video_idxs)):
-
+        print("kf",kf_idx)
+        print("video_idx",video_idx)
         saved_frame_idx.append(video_idx)
         frame = frames[video_idx]
        
-        _, gt_image, gt_depth, _= dataset[kf_idx]
+        _, gt_image, gt_depth,_, motion_mask,normal,mono,static_msk= dataset[kf_idx]
         gt_depth = gt_depth.cpu().numpy()
         gt_image = gt_image.squeeze().to("cuda:0")
         # retrieve mono depth
         mono_depth = load_mono_depth(kf_idx, save_dir).to("cuda:0")
-        # retrieve sensor 
-        sensor_depth, _, invalid = mapper.get_w2c_and_depth(video_idx, kf_idx, mono_depth, gt_depth, init=False)
+        # retrieve sensor
+        #gt_depth= gt_depth.to(mono_depth.device)
+        #depth = mono_depth * motion_mask + gt_depth * (~motion_mask)
+        sensor_depth, _, invalid = mapper.get_w2c_and_depth(video_idx, kf_idx,  mono_depth ,motion_mask, gt_depth,normal, mono,static_msk,init=False)
         sensor_depth = sensor_depth.cpu()
-
-        rendering_pkg = render(frame, gaussians, pipe, background)
+        # rendering = render(frame, gaussians, pipe, background)["render"]
+        if gaussians.deform_init:
+            time_input = gaussians.deform.deform.expand_time(frame.fid)
+            d_values = gaussians.deform.step(gaussians.get_dygs_xyz.detach(), time_input,
+                                             iteration=0, feature=None,
+                                             motion_mask=gaussians.motion_mask,
+                                             camera_center=frame.camera_center,
+                                             time_interval=gaussians.time_interval)
+            dxyz = d_values['d_xyz']
+            d_rot, d_scale = d_values['d_rotation'], d_values['d_scaling']
+            # print("eval using deform network")
+        else:
+            dxyz, d_rot, d_scale = 0, 0, 0
+        rendering_pkg = render(frame, gaussians, pipe, background,dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot)
         rendering = rendering_pkg["render"].detach()
+        output_dir = os.path.join("output", "render_image")
+        os.makedirs(output_dir, exist_ok=True)
+        image1 = rendering .permute(1, 2, 0).cpu().numpy()
+        image1_normalized = (image1 - image1.min()) / (
+                image1.max() - image1.min()) * 255
+        depth_normalized = image1_normalized.astype(np.uint8)
+        cv2_image = cv2.cvtColor(depth_normalized, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join(output_dir, f"image_{kf_idx:04d}.png"), cv2_image)
         depth = rendering_pkg["depth"].detach()
+        output_dir = os.path.join("output", "sitting2_xyz_depth")
+        os.makedirs(output_dir, exist_ok=True)
+
+        depth1 = depth.permute(1, 2, 0).cpu().numpy()
+        depth_normalized = (depth1 - depth1.min()) / (
+                depth1.max() - depth1.min()) * 255
+        depth_normalized = depth_normalized.astype(np.uint8)
+        cv2.imwrite(os.path.join(output_dir, f"depth_{kf_idx:04d}.png"), depth_normalized)
 
         gt = (gt_image.squeeze().cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
         # include optimized exposure compensation
@@ -108,13 +139,22 @@ def eval_rendering(
 
         mask = gt_image > 0 
 
-        gt_depth = torch.tensor(gt_depth)
+        #gt_depth = torch.tensor(gt_depth)
         depth = depth.detach().cpu()
         
 
         # compute depth errors
-        depth_mask = (depth > 0) * (gt_depth > 0)
-        depth = global_scale*depth
+        #depth_mask = (depth > 0) * (gt_depth > 0)
+        depth_mask= gt_depth>0
+        print("gaussians.deform_init",gaussians.deform_init)
+        if not gaussians.deform_init:
+            #print("eval remove motion region")
+            mask = mask * motion_mask.view(*depth_mask.shape) * torch.from_numpy(depth_mask).to(device=motion_mask.device)
+            depth_mask = depth_mask * motion_mask.view(*depth_mask.shape).cpu().numpy()
+        else:
+            mask = mask * torch.from_numpy(depth_mask).to(device=motion_mask.device)
+        #depth = global_scale*depth
+        gt_depth = torch.tensor(gt_depth)
         diff_depth_l1 = torch.abs(depth - gt_depth)
         diff_depth_l1_gt = diff_depth_l1 * depth_mask
         depth_l1_gt = diff_depth_l1_gt.sum() / depth_mask.sum()

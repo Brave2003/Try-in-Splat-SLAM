@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/thirdparty/diff-gaussian-rasterization-w-pose" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/thirdparty/diff-gaussian-rasterization-w-pose/third_party/glm" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/thirdparty/evaluate_3d_reconstruction_lib" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/thirdparty/lietorch" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/thirdparty/lietorch/eigen" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/thirdparty/simple-knn" vcs="Git" />
+  </component>
+</project>

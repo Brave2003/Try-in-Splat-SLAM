@@ -16,13 +16,13 @@ import numpy as np
 import torch
 import argparse
 import os
-
+from torch.cuda import memory_reserved, empty_cache
 from thirdparty.glorie_slam import config
 from src.slam import SLAM
 from src.utils.datasets import get_dataset
 from time import gmtime, strftime
 from colorama import Fore,Style
-
+from ultralytics import YOLO
 import random
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -31,6 +31,9 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('config', type=str, help='Path to config file.')
@@ -38,7 +41,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     torch.multiprocessing.set_start_method('spawn')
-
+    # try:
+    #     device = auto_select_device()
+    # except RuntimeError as e:
+    #     print(f"Warning: {e}, falling back to CPU")
+    #     device = torch.device('cpu')
     cfg = config.load_config(
         args.config, './configs/splat_slam.yaml'
     )
@@ -66,10 +73,12 @@ if __name__ == '__main__':
     config.save_config(cfg, f'{output_dir}/cfg.yaml')
 
     dataset = get_dataset(cfg)
-
+    #dataset.yolo_model = YOLO('yolov9e-seg.pt')
     slam = SLAM(cfg,dataset)
+    # 将模型移动到选定的设备
     slam.run()
 
     end_time = strftime("%Y-%m-%d %H:%M:%S", gmtime())
-    print("-"*30+Fore.LIGHTRED_EX+f"\nSplat-SLAM finishes!\n"+Style.RESET_ALL+f"{end_time}\n"+"-"*30)
+    print("-" * 30 + Fore.LIGHTRED_EX + f"\nSplat-SLAM finishes!\n" + Style.RESET_ALL + f"{end_time}\n" + "-" * 30)
+
 

@@ -82,9 +82,13 @@ def align_scale_and_shift(prediction, target, weights):
     if weights is None:
         weights = torch.ones_like(prediction).to(prediction.device)
     if len(prediction.shape)<3:
+        target = torch.tensor(target).to(prediction.device)
+        weights=torch.tensor(weights).to(prediction.device)
         prediction = prediction.unsqueeze(0)
         target = target.unsqueeze(0)
-        weights = weights.unsqueeze(0)  
+        weights = weights.unsqueeze(0)
+    print("w",weights.shape)
+    print("p",prediction.shape)
     a_00 = torch.sum(weights * prediction * prediction, dim=[1,2])
     a_01 = torch.sum(weights * prediction, dim=[1,2])
     a_11 = torch.sum(weights, dim=[1,2])
@@ -93,8 +97,9 @@ def align_scale_and_shift(prediction, target, weights):
     b_1 = torch.sum(weights * target, dim=[1,2])
     # solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b            
     det = a_00 * a_11 - a_01 * a_01
-    scale = (a_11 * b_0 - a_01 * b_1) / det
-    shift = (-a_01 * b_0 + a_00 * b_1) / det
+    scale = (a_11 * b_0 - a_01 * b_1)/ det
+    #scale = torch.tensor(5.4, device=prediction.device).expand(prediction.shape[0])
+    shift = (-a_01 * b_0 + a_00 * b_1)/ det
     error = (scale[:,None,None]*prediction+shift[:,None,None]-target).abs()
     masked_error = error*weights
     error_sum = masked_error.sum(dim=[1,2])

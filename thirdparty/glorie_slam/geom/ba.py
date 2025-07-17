@@ -15,9 +15,9 @@
 import lietorch
 import torch
 import torch.nn.functional as F
-from .chol import block_solve, schur_solve
+from .chol import block_solve, schur_solve, schur_solve_mono_prior
 import thirdparty.glorie_slam.geom.projective_ops as pops
-
+import droid_backends
 from torch_scatter import scatter_sum
 
 
@@ -284,3 +284,58 @@ def MoBA(target, weight, eta, poses, disps, intrinsics, ii, jj, fixedp=1, rig=1)
     poses = pose_retr(poses, dx, torch.arange(P) + fixedp)
     return poses
 
+def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii, jj, alpha):
+    B, P, ht, wd = disps.shape
+    N = ii.shape[0]
+
+    ### 1: commpute jacobians and residuals ###
+    C, w = droid_backends.proj_trans(poses.data.squeeze(), disps[0], intrinsics[0], target, weight, ii, jj)
+
+    kx, kk = torch.unique(ii, return_inverse=True)
+    M = kx.shape[0]
+
+    disps_prior = disps_prior[kx]
+    m = (disps_prior > 0).to(torch.float).view(-1, ht*wd)
+
+    hs, ws = dscales.shape[-2:]
+    disps_bi, Jbi = get_prior_depth_aligned(disps_prior, dscales[kx])
+    rd = (disps[0,kx] - disps_bi).view(-1, ht*wd)
+    Jd = torch.ones_like(rd).view(1, -1, 1, ht*wd)
+    # Jd = (-1. / (disps[0,kx] ** 2)).view(1, -1, 1, ht*wd)
+    Jso = -m.unsqueeze(-1) * disps_prior.view(-1, ht*wd).unsqueeze(-1) * Jbi.view(M, ht*wd, -1)[None]
+
+    alpha = torch.ones(M,ht*wd,1).float().cuda() * alpha
+
+    D = hs*ws
+    fixedp = kx[0]
+    kx = kx - fixedp
+    wJsoT = (alpha * Jso).transpose(2,3)
+    Hs = safe_scatter_add_mat(wJsoT @ Jso, kx, kx, M, M).view(B, M, M, D, D)
+    Es = safe_scatter_add_mat(wJsoT * Jd, kx, kx, M, M).view(B, M, M, D, ht*wd)
+    vs = safe_scatter_add_vec(-wJsoT @ rd[None].unsqueeze(-1), kx, M)
+    kx += fixedp
+
+    alpha = alpha.squeeze()
+    C = C[None] + m * alpha * (Jd * Jd).squeeze() + (1-m) * eta.view(*C.shape)
+    w = w[None] - m * alpha * rd * Jd.squeeze()
+
+    ### 3: solve the system ###
+    dso, dz, dzcov = schur_solve_mono_prior(C, w, Hs, Es, vs, dzcov=True)
+
+    ### 4: apply retraction ###
+    disps = disp_retr(disps, dz.view(B,-1,ht,wd), kx)
+    dscales[kx] += dso.view(-1, hs, ws)
+
+    disps = torch.where(disps > 10, torch.zeros_like(disps), disps)
+    disps = disps.clamp(min=0.001)
+
+    return disps, dscales, dzcov
+def get_prior_depth_aligned(depth_prior, scales):
+    M, ht, wd = depth_prior.shape
+    hs, ws = scales.shape[-2:]
+    meshx, meshy = torch.meshgrid(torch.linspace(0, hs-1-1e-6, ht), torch.linspace(0, ws-1-1e-6, wd), indexing='ij')
+    grid = torch.stack((meshy, meshx), -1).cuda()
+    grid = grid.unsqueeze(0).expand(M, -1, -1, -1).contiguous()
+    mscales_bi, Jbi = droid_backends.bi_inter(scales, grid)
+    depth_prior_aligned = depth_prior * mscales_bi
+    return depth_prior_aligned, Jbi

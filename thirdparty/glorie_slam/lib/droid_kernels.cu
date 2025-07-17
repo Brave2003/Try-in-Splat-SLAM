@@ -24,7 +24,7 @@ typedef std::vector<torch::Tensor> tensor_list_t;
 
 
 #define MIN_DEPTH 0.25
-
+#define CV_PI 3.1415926
 #define THREADS 256
 #define NUM_BLOCKS(batch_size) ((batch_size + THREADS - 1) / THREADS)
 
@@ -54,6 +54,35 @@ __device__ void blockReduce(volatile float *sdata) {
   __syncthreads();
 }
 
+__device__ float2 proj(const float *Xj, const float *intrinsics)
+
+{
+
+  float2 xnyn;
+
+  xnyn.x = intrinsics[0] * (Xj[0] / Xj[2]) + intrinsics[2];
+
+  xnyn.y = intrinsics[1] * (Xj[1] / Xj[2]) + intrinsics[3];
+
+  return xnyn;
+
+}
+
+
+
+__device__ void iproj(float u, float v, const float *intrinsics, float * X, float di)
+
+{
+
+  X[0] = (u - intrinsics[2]) / intrinsics[0];
+
+  X[1] = (v - intrinsics[3]) / intrinsics[1];
+
+  X[2] = 1;
+
+  X[3] = di;
+
+}
 
 __device__ void
 actSO3(const float *q, const float *X, float *Y) {
@@ -173,6 +202,241 @@ expSE3(const float *xi, float* t, float* q) {
     t[2] += b * tau[2];
   }
 }
+
+__global__ void projective_transform2_kernel(
+
+    const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> target,
+
+    const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> weight,
+
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> poses,
+
+    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> disps,
+
+    const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> intrinsics,
+
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> ii,
+
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> jj,
+
+    torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> Cii,
+
+    torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> bz)
+
+{
+
+  const int block_id = blockIdx.x;
+
+  const int thread_id = threadIdx.x;
+
+
+
+  const int ht = disps.size(1);
+
+  const int wd = disps.size(2);
+
+
+
+  int ix = static_cast<int>(ii[block_id]);
+
+  int jx = static_cast<int>(jj[block_id]);
+  __shared__ float intrinsics_[4];
+
+  __shared__ float fx;
+
+  __shared__ float fy;
+  __shared__ float cx;
+
+  __shared__ float cy;
+
+
+  __shared__ float ti[3], tj[3], tij[3];
+
+  __shared__ float qi[4], qj[4], qij[4];
+
+
+
+  // load intrinsics from global memory
+
+  if (thread_id == 0) {
+
+    intrinsics_[0] = intrinsics[0][0];
+
+    intrinsics_[1] = intrinsics[0][1];
+
+    intrinsics_[2] = intrinsics[0][2];
+
+    intrinsics_[3] = intrinsics[0][3];
+
+    fx = intrinsics[0][0];
+
+    fy = intrinsics[0][1];
+    cx=intrinsics[0][2];
+    cy = intrinsics[0][3];
+
+  }
+
+
+
+  __syncthreads();
+
+
+
+  // load poses from global memory
+
+  if (thread_id < 3) {
+
+    ti[thread_id] = poses[ix][thread_id];
+
+    tj[thread_id] = poses[jx][thread_id];
+
+  }
+
+
+
+  if (thread_id < 4) {
+
+    qi[thread_id] = poses[ix][thread_id+3];
+
+    qj[thread_id] = poses[jx][thread_id+3];
+
+  }
+
+
+
+  __syncthreads();
+
+
+
+  if (thread_id == 0) {
+
+    relSE3(ti, qi, tj, qj, tij, qij);
+
+  }
+
+
+
+  __syncthreads();
+
+
+
+  //points
+
+  float Xi[4];
+
+  float Xj[4];
+
+  float2 xnyn;
+
+
+
+  // jacobians
+
+  float Jp[6];
+
+  float Jz;
+
+
+
+  __syncthreads();
+
+
+
+  GPU_1D_KERNEL_LOOP(k, ht*wd) {
+
+
+
+    const int i = k / wd;
+
+    const int j = k % wd;
+
+
+
+    const float u = static_cast<float>(j);
+
+    const float v = static_cast<float>(i);
+
+
+
+    // homogenous coordinates
+
+    iproj(u, v, intrinsics_, Xi, disps[ix][i][j]);
+
+
+
+    // transform homogenous point
+
+    actSE3(tij, qij, Xi, Xj);
+
+
+
+    xnyn = proj(Xj, intrinsics_);
+
+
+
+    const float x = Xj[0];
+
+    const float y = Xj[1];
+
+    const float z = (Xj[2] < MIN_DEPTH) ? 0.0 : Xj[2];
+
+    const float h = Xj[3];
+
+
+
+    const float d = (Xj[2] < MIN_DEPTH) ? 0.0 : 1.0 / Xj[2];
+
+    const float d2 = d * d;
+
+
+
+    float wu = (Xj[2] < MIN_DEPTH) ? 0.0 : .001 * weight[block_id][0][i][j];
+
+    float wv = (Xj[2] < MIN_DEPTH) ? 0.0 : .001 * weight[block_id][1][i][j];
+
+    const float ru = target[block_id][0][i][j] - xnyn.x;
+
+    const float rv = target[block_id][1][i][j] - xnyn.y;
+
+
+
+    // assume pinhole
+
+    Jp[0] = fx * d;
+
+    Jp[1] = 0;
+
+    Jp[2] = fx * (-x * d2);
+
+    Jp[3] = 0;
+
+    Jp[4] = fy * d;
+
+    Jp[5] = fy * (-y * d2);
+
+
+
+    // x - coordinate
+
+    Jz = Jp[0] * tij[0] + Jp[1] * tij[1] + Jp[2] * tij[2];
+
+    Cii[block_id][k] = wu * Jz * Jz;
+
+    bz[block_id][k] = wu * ru * Jz;
+
+
+
+    // y - coordinate
+
+    Jz = Jp[3] * tij[0] + Jp[4] * tij[1] + Jp[5] * tij[2];
+
+    Cii[block_id][k] += wv * Jz * Jz;
+
+    bz[block_id][k] += wv * rv * Jz;
+
+  }
+
+}
 __global__ void projective_transform_kernel(
     const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> target,
     const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> weight,
@@ -196,7 +460,7 @@ __global__ void projective_transform_kernel(
 
   int ix = static_cast<int>(ii[block_id]);
   int jx = static_cast<int>(jj[block_id]);
-
+  __shared__ float intrinsics_[4];
   __shared__ float fx;
   __shared__ float fy;
   __shared__ float cx;
@@ -207,6 +471,13 @@ __global__ void projective_transform_kernel(
 
   // load intrinsics from global memory
   if (thread_id == 0) {
+    intrinsics_[0] = intrinsics[0];
+
+    intrinsics_[1] = intrinsics[1];
+
+    intrinsics_[2] = intrinsics[2];
+
+    intrinsics_[3] = intrinsics[3];
     fx = intrinsics[0];
     fy = intrinsics[1];
     cx = intrinsics[2];
@@ -253,8 +524,9 @@ __global__ void projective_transform_kernel(
   //points 
   float Xi[4];
   float Xj[4];
-
+  float2 xnyn;
   // jacobians
+  float Jp[6];
   float Jx[12];
   float Jz;
 
@@ -285,7 +557,7 @@ __global__ void projective_transform_kernel(
 
     const float u = static_cast<float>(j);
     const float v = static_cast<float>(i);
-    
+
     // homogenous coordinates
     Xi[0] = (u - cx) / fx;
     Xi[1] = (v - cy) / fy;
@@ -294,9 +566,10 @@ __global__ void projective_transform_kernel(
 
     // transform homogenous point
     actSE3(tij, qij, Xi, Xj);
-
+    xnyn = proj(Xj, intrinsics_);
     const float x = Xj[0];
     const float y = Xj[1];
+    const float z = (Xj[2] < MIN_DEPTH) ? 0.0 : Xj[2];
     const float h = Xj[3];
 
     const float d = (Xj[2] < MIN_DEPTH) ? 0.0 : 1.0 / Xj[2];
@@ -309,14 +582,25 @@ __global__ void projective_transform_kernel(
 
     // x - coordinate
 
-    Jj[0] = fx * (h*d);
-    Jj[1] = fx * 0;
-    Jj[2] = fx * (-x*h*d2);
-    Jj[3] = fx * (-x*y*d2);
-    Jj[4] = fx * (1 + x*x*d2);
-    Jj[5] = fx * (-y*d);
+     // assume pinhole
 
-    Jz = fx * (tij[0] * d - tij[2] * (x * d2));
+    Jp[0] = fx * d;
+    Jp[1] = 0;
+    Jp[2] = fx * (-x * d2);
+    Jp[3] = 0;
+    Jp[4] = fy * d;
+    Jp[5] = fy * (-y * d2);
+
+
+    // x - coordinate
+
+    Jj[0] = Jp[0] * h;
+    Jj[1] = Jp[1] * h;
+    Jj[2] = Jp[2] * h;
+    Jj[3] = -Jp[1] * z + Jp[2] * y;
+    Jj[4] =  Jp[0] * z - Jp[2] * x;
+    Jj[5] = -Jp[0] * y + Jp[1] * x;
+    Jz = Jp[0] * tij[0] + Jp[1] * tij[1] + Jp[2] * tij[2];
     Cii[block_id][k] = wu * Jz * Jz;
     bz[block_id][k] = wu * ru * Jz;
 
@@ -342,14 +626,16 @@ __global__ void projective_transform_kernel(
     }
 
 
-    Jj[0] = fy * 0;
-    Jj[1] = fy * (h*d);
-    Jj[2] = fy * (-y*h*d2);
-    Jj[3] = fy * (-1 - y*y*d2);
-    Jj[4] = fy * (x*y*d2);
-    Jj[5] = fy * (x*d);
+    // y - coordinate
 
-    Jz = fy * (tij[1] * d - tij[2] * (y * d2));
+    Jj[0] = Jp[3] * h;
+    Jj[1] = Jp[4] * h;
+    Jj[2] = Jp[5] * h;
+    Jj[3] = -Jp[4] * z + Jp[5] * y;
+    Jj[4] =  Jp[3] * z - Jp[5] * x;
+    Jj[5] = -Jp[3] * y + Jp[4] * x;
+
+    Jz = Jp[3] * tij[0] + Jp[4] * tij[1] + Jp[5] * tij[2];
     Cii[block_id][k] += wv * Jz * Jz;
     bz[block_id][k] += wv * rv * Jz;
 
@@ -529,7 +815,7 @@ __global__ void frame_distance_kernel(
 
   const int ht = disps.size(1);
   const int wd = disps.size(2);
-
+  __shared__ float intrinsics_[4];
   __shared__ int ix;
   __shared__ int jx;
 
@@ -545,6 +831,10 @@ __global__ void frame_distance_kernel(
   if (thread_id == 0) {
     ix = static_cast<int>(ii[block_id]);
     jx = static_cast<int>(jj[block_id]);
+    intrinsics_[0] = intrinsics[0];
+    intrinsics_[1] = intrinsics[1];
+    intrinsics_[2] = intrinsics[2];
+    intrinsics_[3] = intrinsics[3];
     fx = intrinsics[0];
     fy = intrinsics[1];
     cx = intrinsics[2];
@@ -681,7 +971,7 @@ __global__ void depth_filter_kernel(
 
   __shared__ int ix;
   __shared__ int jx;
-
+  __shared__ float intrinsics_[4];
   __shared__ float fx;
   __shared__ float fy;
   __shared__ float cx;
@@ -693,6 +983,10 @@ __global__ void depth_filter_kernel(
   if (threadIdx.x == 0) {
     ix = static_cast<int>(inds[block_id]);
     jx = (neigh_id < 3) ? ix - neigh_id - 1 : ix + neigh_id;
+    intrinsics_[0] = intrinsics[0];
+    intrinsics_[1] = intrinsics[1];
+    intrinsics_[2] = intrinsics[2];
+    intrinsics_[3] = intrinsics[3];
     fx = intrinsics[0];
     fy = intrinsics[1];
     cx = intrinsics[2];
@@ -791,7 +1085,7 @@ __global__ void iproj_kernel(
   const int num = disps.size(0);
   const int ht = disps.size(1);
   const int wd = disps.size(2);
-
+  __shared__ float intrinsics_[4];
   __shared__ float fx;
   __shared__ float fy;
   __shared__ float cx;
@@ -801,6 +1095,10 @@ __global__ void iproj_kernel(
   __shared__ float q[4];
 
   if (threadIdx.x == 0) {
+    intrinsics_[0] = intrinsics[0];
+    intrinsics_[1] = intrinsics[1];
+    intrinsics_[2] = intrinsics[2];
+    intrinsics_[3] = intrinsics[3];
     fx = intrinsics[0];
     fy = intrinsics[1];
     cx = intrinsics[2];
@@ -849,7 +1147,87 @@ __global__ void iproj_kernel(
   }
 }
 
+__global__ void bi_inter_kernel(
 
+    const torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> scales,
+
+    const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> grids,
+
+    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> outputs,
+
+    torch::PackedTensorAccessor32<float,5,torch::RestrictPtrTraits> Jacobis)
+
+
+
+{
+
+
+
+  const int block_id = blockIdx.x;
+
+  const int index = blockIdx.y * blockDim.x + threadIdx.x;
+
+
+
+  const int num = grids.size(0);
+
+  const int ht = grids.size(1);
+
+  const int wd = grids.size(2);
+
+
+
+  __syncthreads();
+
+
+
+  if (index < ht*wd) {
+
+    const int i = index / wd;
+
+    const int j = index % wd;
+
+
+
+    const float xind = grids[block_id][i][j][0];
+
+    const float yind = grids[block_id][i][j][1];
+
+
+
+    int x0 = floor(xind);
+
+    int y0 = floor(yind);
+
+    int x1 = x0 + 1;
+
+    int y1 = y0 + 1;
+
+
+
+    float wa = (x1 - xind) * (y1 - yind);
+
+    float wb = (x1 - xind) * (yind - y0);
+
+    float wc = (xind - x0) * (y1 - yind);
+
+    float wd = (xind - x0) * (yind - y0);
+
+
+
+    outputs[block_id][i][j] = wa * scales[block_id][y0][x0] + wb * scales[block_id][y1][x0] + wc * scales[block_id][y0][x1] + wd * scales[block_id][y1][x1];
+
+    Jacobis[block_id][i][j][y0][x0] = wa;
+
+    Jacobis[block_id][i][j][y1][x0] = wb;
+
+    Jacobis[block_id][i][j][y0][x1] = wc;
+
+    Jacobis[block_id][i][j][y1][x1] = wd;
+
+  }
+
+}
 
 __global__ void accum_kernel(
     const torch::PackedTensorAccessor32<float,2,torch::RestrictPtrTraits> inps,
@@ -1309,7 +1687,79 @@ SparseBlock schur_block(torch::Tensor E,
 
   return A;
 }
+std::vector<torch::Tensor> proj_trans_cuda(
 
+    torch::Tensor poses,
+
+    torch::Tensor disps,
+
+    torch::Tensor intrinsics,
+
+    torch::Tensor targets,
+
+    torch::Tensor weights,
+
+    torch::Tensor ii,
+
+    torch::Tensor jj)
+
+{
+
+  auto opts = poses.options();
+
+  const int num = ii.size(0);
+
+  const int ht = disps.size(1);
+
+  const int wd = disps.size(2);
+
+
+
+  std::tuple<torch::Tensor, torch::Tensor> kuniq = torch::_unique(ii, true, true);
+
+  torch::Tensor kx = std::get<0>(kuniq);
+
+
+
+  // initialize buffers
+
+  torch::Tensor Cii = torch::zeros({num, ht*wd}, opts);
+
+  torch::Tensor wi = torch::zeros({num, ht*wd}, opts);
+
+
+
+  projective_transform2_kernel<<<num, THREADS>>>(
+
+    targets.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+
+    weights.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+
+    poses.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+
+    disps.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+
+    intrinsics.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+
+    ii.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+
+    jj.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+
+    Cii.packed_accessor32<float,2,torch::RestrictPtrTraits>(),
+
+    wi.packed_accessor32<float,2,torch::RestrictPtrTraits>());
+
+
+
+  torch::Tensor C = accum_cuda(Cii, ii, kx);
+
+  torch::Tensor w = accum_cuda(wi, ii, kx);
+
+
+
+  return {C, w};
+
+}
 
 std::vector<torch::Tensor> ba_cuda(
     torch::Tensor poses,
@@ -1540,5 +1990,56 @@ torch::Tensor iproj_cuda(
     points.packed_accessor32<float,4,torch::RestrictPtrTraits>());
 
   return points;
+
+}
+std::vector<torch::Tensor> bi_inter_cuda(
+
+    torch::Tensor scales,
+
+    torch::Tensor grids)
+
+{
+
+
+
+  const int nm = grids.size(0);
+
+  const int ht = grids.size(1);
+
+  const int wd = grids.size(2);
+
+  const int hs = scales.size(1);
+
+  const int ws = scales.size(2);
+
+
+
+  auto opts = grids.options();
+
+  torch::Tensor outputs = torch::zeros({nm, ht, wd}, opts);
+
+  torch::Tensor Jacobis = torch::zeros({nm, ht, wd, hs, ws}, opts);
+
+
+
+  dim3 blocks(nm, NUM_BLOCKS(ht * wd));
+
+
+
+  bi_inter_kernel<<<blocks, THREADS>>>(
+
+    scales.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+
+    grids.packed_accessor32<float,4,torch::RestrictPtrTraits>(),
+
+    outputs.packed_accessor32<float,3,torch::RestrictPtrTraits>(),
+
+    Jacobis.packed_accessor32<float,5,torch::RestrictPtrTraits>());
+
+
+
+  return {outputs, Jacobis};
+
+
 
 }

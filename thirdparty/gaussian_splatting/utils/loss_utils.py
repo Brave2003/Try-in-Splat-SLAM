@@ -58,9 +58,12 @@ def create_window(window_size, channel):
     return window
 
 
-def ssim(img1, img2, window_size=11, size_average=True):
+def ssim(img1, img2, window_size=11, size_average=True, mask=None):
     channel = img1.size(-3)
     window = create_window(window_size, channel)
+    if mask is not None:
+        img1 = torch.where(mask.unsqueeze(0), img1, 0.)
+        img2 = torch.where(mask.unsqueeze(0), img2, 0.)
 
     if img1.is_cuda:
         window = window.cuda(img1.get_device())

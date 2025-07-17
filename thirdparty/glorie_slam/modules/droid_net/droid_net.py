@@ -25,6 +25,9 @@ def cvx_upsample(data, mask):
     batch, ht, wd, dim = data.shape
     data = data.permute(0, 3, 1, 2).contiguous()
     mask = mask.view(batch, 1, 9, 8, 8, ht, wd)
+    # Set all borders to 0, so we do cvx combination of valid pixels only, otw you'll do cvx combinations of 0-valued pixels, which neither for depth nor covariance is valid...
+    mask[:, :, [[0, 1, 2], [6, 7, 8]], :, :, [[0], [-1]], :] = -torch.inf  # for the top of img (first row, all cols)
+    mask[:, :, [[0, 3, 6], [2, 5, 8]], :, :, :, [[0], [-1]]] = -torch.inf  # for the top of img (first row, all cols)
     mask = torch.softmax(mask, dim=2)
 
     up_data = F.unfold(data, kernel_size=(3, 3), padding=(1, 1))

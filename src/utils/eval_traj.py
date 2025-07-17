@@ -77,35 +77,33 @@ def align_full_traj(traj_est_full,stream,printer):
 
     traj_ref, traj_est = sync.associate_trajectories(traj_ref, traj_est)
     r_a, t_a, s = traj_est.align(traj_ref, correct_scale=True)
-    return r_a, t_a, s, traj_est, traj_ref    
+    return r_a, t_a, s, traj_est, traj_ref
 
 
-def traj_eval_and_plot(traj_est, traj_ref, plot_parent_dir, plot_name,printer):
+def traj_eval_and_plot(traj_est, traj_ref, plot_parent_dir, plot_name, printer):
+
     import os
+
     from evo.core import metrics
-    from evo.tools import plot
-    import matplotlib.pyplot as plt
+
+    import matplotlib
+
+    matplotlib.use('Agg')
+
     if not os.path.exists(plot_parent_dir):
+
         os.makedirs(plot_parent_dir)
-    printer.print("Calculating APE ...",FontColor.EVAL)
+
+    printer.print("Calculating APE ...", FontColor.EVAL)
+
     data = (traj_ref, traj_est)
+
     ape_metric = metrics.APE(metrics.PoseRelation.translation_part)
+
     ape_metric.process_data(data)
+
     ape_statistics = ape_metric.get_all_statistics()
 
-    printer.print("Plotting ...",FontColor.EVAL)
-
-    plot_collection = plot.PlotCollection("kf factor graph")
-    # metric values
-    fig_1 = plt.figure(figsize=(8, 8))
-    plot_mode = plot.PlotMode.xy
-    ax = plot.prepare_axis(fig_1, plot_mode)
-    plot.traj(ax, plot_mode, traj_ref, '--', 'gray', 'reference')
-    plot.traj_colormap(
-    ax, traj_est, ape_metric.error, plot_mode, min_map=ape_statistics["min"],
-    max_map=ape_statistics["max"], title="APE mapped onto trajectory")
-    plot_collection.add_figure("2d", fig_1)
-    plot_collection.export(f"{plot_parent_dir}/{plot_name}.png", False)
 
     return ape_statistics
 

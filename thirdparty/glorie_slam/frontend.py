@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import torch
+#from numpy.random.tests.test_smoke import warmup
+
 from thirdparty.glorie_slam.factor_graph import FactorGraph
 from thirdparty.glorie_slam.backend import Backend as LoopClosing
 
@@ -35,12 +37,14 @@ class Frontend:
         self.warmup = cfg['tracking']['warmup']
         self.beta = cfg['tracking']['beta']
         self.frontend_nms = cfg['tracking']['frontend']['nms']
-        self.keyframe_thresh = cfg['tracking']['frontend']['keyframe_thresh']
+        self.keyframe_thresh =0.01#cfg['tracking']['frontend']['keyframe_thresh']#1.3  0.3tracking
         self.frontend_window = cfg['tracking']['frontend']['window']
         self.frontend_thresh = cfg['tracking']['frontend']['thresh']
         self.frontend_radius = cfg['tracking']['frontend']['radius']
         self.frontend_max_factors = cfg['tracking']['frontend']['max_factors']
-
+        self.video.mono_depth_alpha = cfg['tracking']['frontend']["mono_depth_alpha"]
+        self.dynamic_model = cfg["mapping"]["model_params"]["dynamic_model"]
+        self.dynamic_objects = 0
         self.enable_loop = cfg['tracking']['frontend']['enable_loop']
         self.loop_closing = LoopClosing(net, video, cfg)
 
@@ -58,42 +62,47 @@ class Frontend:
         if self.graph.corr is not None:
             self.graph.rm_factors(self.graph.age > self.max_age, store=True)
 
-        self.graph.add_proximity_factors(self.t1-5, max(self.t1-self.frontend_window, 0), 
-            rad=self.frontend_radius, nms=self.frontend_nms, thresh=self.frontend_thresh, beta=self.beta, remove=True)
-
+        self.graph.add_proximity_factors(self.t1 - 5, max(self.t1 - self.frontend_window, 0),
+                                         rad=self.frontend_radius, nms=self.frontend_nms, thresh=self.frontend_thresh,
+                                         beta=self.beta, remove=True)
+        #self.video.dscales[self.t1 - 1] = self.video.disps[self.t1 - 1].median() / self.video.mono_disps[
+           # self.t1 - 1].median()
         for itr in range(self.iters1):
             # run DSPO for optimization
-            opt_type = "pose_depth" if itr%2==0 else "depth_scale"
-            self.graph.update(None, None, use_inactive=True, opt_type=opt_type)
+            opt_type = "pose_depth" if itr % 2 == 0 else "depth_scale"
+            self.graph.update(None, None, use_inactive=True, opt_type=opt_type, use_mono=itr>1)
 
         # set initial pose for next frame
-        d = self.video.distance([self.t1-2], [self.t1-1], beta=self.beta, bidirectional=True)
+        d = self.video.distance([self.t1 - 2], [self.t1 - 1], beta=self.beta, bidirectional=True)
 
-
+        print("keyframe", self.keyframe_thresh)
+        print("d.item", d.item())
         if d.item() < self.keyframe_thresh:
-            self.graph.rm_keyframe(self.t1 - 1)            
+            self.graph.rm_keyframe(self.t1 - 1)
             with self.video.get_lock():
+                print("key", self.video.counter.value)
                 self.video.counter.value -= 1
+                print("key_out", self.video.counter.value)
                 self.t1 -= 1
         else:
             cur_t = self.video.counter.value
             if self.enable_loop and cur_t > self.frontend_window:
-                n_kf, n_edge = self.loop_closing.loop_ba(t_start=0, t_end=cur_t, steps=self.iters2, 
+                n_kf, n_edge = self.loop_closing.loop_ba(t_start=0, t_end=cur_t, steps=self.iters2,
                                                          motion_only=False, local_graph=self.graph,
                                                          enable_wq=True)
                 if n_edge == 0:
                     for itr in range(self.iters2):
-                        opt_type = "pose_depth" if itr%2==0 else "depth_scale"
-                        self.graph.update(t0=None, t1=None, use_inactive=True,opt_type=opt_type)
+                        opt_type = "pose_depth" if itr % 2 == 0 else "depth_scale"
+                        self.graph.update(t0=None, t1=None, use_inactive=True, opt_type=opt_type)
                 self.last_loop_t = cur_t
             else:
                 for itr in range(self.iters2):
-                    opt_type = "pose_depth" if itr%2==0 else "depth_scale"
-                    self.graph.update(t0=None, t1=None, use_inactive=True,opt_type=opt_type)
+                    opt_type = "pose_depth" if itr % 2 == 0 else "depth_scale"
+                    self.graph.update(t0=None, t1=None, use_inactive=True, opt_type=opt_type)
 
         # set pose for next itration
-        self.video.poses[self.t1] = self.video.poses[self.t1-1]
-        self.video.disps[self.t1] = self.video.disps[self.t1-1].mean()
+        self.video.poses[self.t1] = self.video.poses[self.t1 - 1]
+        self.video.disps[self.t1] = self.video.disps[self.t1 - 1].mean()
 
         # update visualization
         self.video.set_dirty(self.graph.ii.min(), self.t1)
@@ -107,28 +116,28 @@ class Frontend:
         self.graph.add_neighborhood_factors(0, self.t1, r=3)
 
         for itr in range(8):
-            self.graph.update(1, use_inactive=True,opt_type="pose_depth")
+            self.graph.update(1, use_inactive=True, opt_type="pose_depth", use_mono=False)
 
         self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
-
+        #for i in range(self.t1):
+        #    self.video.dscales[i] = self.video.disps[i].median() / self.video.mono_disps[i].median()
         for itr in range(8):
-            self.graph.update(1, use_inactive=True,opt_type="pose_depth")
-
+            self.graph.update(1, use_inactive=True, opt_type="pose_depth", use_mono=itr>2)
 
         # self.video.normalize()
-        self.video.poses[self.t1] = self.video.poses[self.t1-1].clone()
-        self.video.disps[self.t1] = self.video.disps[self.t1-4:self.t1].mean()
+        self.video.poses[self.t1] = self.video.poses[self.t1 - 1].clone()
+        self.video.disps[self.t1] = self.video.disps[self.t1 - 4:self.t1].mean()
 
         # initialization complete
         self.is_initialized = True
-        self.last_pose = self.video.poses[self.t1-1].clone()
-        self.last_disp = self.video.disps[self.t1-1].clone()
-        self.last_time = self.video.timestamp[self.t1-1].clone()
+        self.last_pose = self.video.poses[self.t1 - 1].clone()
+        self.last_disp = self.video.disps[self.t1 - 1].clone()
+        self.last_time = self.video.timestamp[self.t1 - 1].clone()
 
         with self.video.get_lock():
             self.video.set_dirty(0, self.t1)
 
-        self.graph.rm_factors(self.graph.ii < self.warmup-4, store=True)
+        self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
 
     def __call__(self):
         """ main update """
@@ -137,9 +146,10 @@ class Frontend:
         if not self.is_initialized and self.video.counter.value == self.warmup:
             self.__initialize()
             self.video.update_valid_depth_mask()
-            
+
         # do update
         elif self.is_initialized and self.t1 < self.video.counter.value:
             self.__update()
             self.video.update_valid_depth_mask()
+
         

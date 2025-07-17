@@ -11,62 +11,114 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
+import cv2
+from datetime import datetime
 import numpy as np
 import torch
 import lietorch
 import droid_backends
 import thirdparty.glorie_slam.geom.ba
+import torch.nn.functional as F
+from  thirdparty.glorie_slam.geom.ba import JDSA
 from torch.multiprocessing import Value
-
+from lietorch import SE3
 from thirdparty.glorie_slam.modules.droid_net import cvx_upsample
 import thirdparty.glorie_slam.geom.projective_ops as pops
 from src.utils.common import align_scale_and_shift
 from src.utils.Printer import FontColor
-
+from thirdparty.glorie_slam.warp.depth_warp import depth_warp_to_mask
+from thirdparty.glorie_slam.pose_transform import quaternion_to_transform_noBatch
+from thirdparty.glorie_slam.pgo_buffer import global_relative_posesim3_constraints
 class DepthVideo:
-    ''' store the estimated poses and depth maps, 
-        shared between tracker and mapper '''
+    ''' 存储估计的位姿和深度图，
+        在跟踪器和映射器之间共享数据 '''
+
     def __init__(self, cfg, printer):
-        self.cfg =cfg
+        # 从配置中获取数据和场景路径，初始化输出路径
+        self.cfg = cfg
         self.output = f"{cfg['data']['output']}/{cfg['scene']}"
+        # 从配置中获取输出图像的高度和宽度
         ht = cfg['cam']['H_out']
         self.ht = ht
         wd = cfg['cam']['W_out']
         self.wd = wd
-        self.counter = Value('i', 0) # current keyframe count
+        # 初始化关键帧计数器（使用共享内存）
+        self.counter = Value('i', 0)  # 当前关键帧的计数器
+        # 从配置中获取缓冲区大小、BA类型、单目阈值、设备等参数
         buffer = cfg['tracking']['buffer']
         self.BA_type = cfg['tracking']['backend']['BA_type']
         self.mono_thres = cfg['tracking']['mono_thres']
         self.device = cfg['device']
-        self.down_scale = 8
-        ### state attributes ###
+        self.down_scale = 8  # 图像下采样倍数
+        self.ht_8 = self.ht // 8
+        self.wd_8 = self.wd // 8
+        ### 状态属性 ###
+        # 初始化时间戳张量，记录缓存中的时间戳（使用共享内存）
         self.timestamp = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
+        # 初始化图像张量，记录缓存中的图像数据（使用共享内存）
         self.images = torch.zeros(buffer, 3, ht, wd, device=self.device, dtype=torch.uint8)
-
-        # whether the valid_depth_mask is calculated/updated, if dirty, not updated, otherwise, updated
-        self.dirty = torch.zeros(buffer, device=self.device, dtype=torch.bool).share_memory_() 
-        # whether the corresponding part of pointcloud is deformed w.r.t. the poses and depths 
+        # 初始化dirty标志，用于指示valid_depth_mask是否被计算/更新过
+        self.dirty = torch.zeros(buffer, device=self.device, dtype=torch.bool).share_memory_()
+        # 初始化npc_dirty标志，用于指示点云是否根据位姿和深度图发生了变形
         self.npc_dirty = torch.zeros(buffer, device=self.device, dtype=torch.bool).share_memory_()
-
+        # 初始化位姿张量，存储每个帧的位姿（7个参数：x, y, z, 四元数）
         self.poses = torch.zeros(buffer, 7, device=self.device, dtype=torch.float).share_memory_()
-        self.disps = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-        self.zeros = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+        # 初始化深度图张量，存储每个帧的深度图（下采样后）
+        self.disps = torch.ones(buffer, ht // self.down_scale, wd // self.down_scale, device=self.device,
+                                dtype=torch.float).share_memory_()
+        # 初始化零值张量，用于深度图的后处理
+        self.zeros = torch.zeros(buffer, ht // self.down_scale, wd // self.down_scale, device=self.device,
+                                 dtype=torch.float).share_memory_()
+        self.poses_sim3 = torch.zeros(buffer, 8, device="cuda", dtype=torch.float).share_memory_()
+        # 初始化上采样后的深度图张量
         self.disps_up = torch.zeros(buffer, ht, wd, device=self.device, dtype=torch.float).share_memory_()
+
+        # 初始化相机内参张量，存储每帧的相机内参（如焦距、主点等）
         self.intrinsics = torch.zeros(buffer, 4, device=self.device, dtype=torch.float).share_memory_()
-        self.mono_disps = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-        self.depth_scale = torch.zeros(buffer,device=self.device, dtype=torch.float).share_memory_()
-        self.depth_shift = torch.zeros(buffer,device=self.device, dtype=torch.float).share_memory_()
+        self.normals = torch.zeros(buffer, 3, ht, wd, device="cpu", dtype=torch.float)
+        self.poses_gt = torch.zeros(buffer, 4, 4, device=self.device, dtype=torch.float).share_memory_()
+        self.depths = torch.zeros(buffer, ht, wd, device="cuda", dtype=torch.float).share_memory_()
+        self.disps_mono_up = torch.zeros(buffer, ht, wd, device="cpu", dtype=torch.float).share_memory_()
+        # 初始化单目深度图（下采样后的深度图）
+        self.mono_disps = torch.zeros(buffer, ht // self.down_scale, wd // self.down_scale, device=self.device,
+                                      dtype=torch.float).share_memory_()
+
+        # 初始化深度尺度和偏移量
+        self.depth_scale = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
+        self.depth_shift = torch.zeros(buffer, device=self.device, dtype=torch.float).share_memory_()
+        self.mask = torch.zeros(buffer, ht // 8, wd // 8, device="cuda", dtype=torch.bool).share_memory_()
+        self.mask_ori = torch.zeros(buffer, ht, wd, device="cuda", dtype=torch.bool).share_memory_()
+        # 初始化有效深度掩码，标记每个像素是否有有效深度信息
         self.valid_depth_mask = torch.zeros(buffer, ht, wd, device=self.device, dtype=torch.bool).share_memory_()
-        self.valid_depth_mask_small = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.bool).share_memory_()        
 
-        ### feature attributes ###
-        self.fmaps = torch.zeros(buffer, 1, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
-        self.nets = torch.zeros(buffer, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
-        self.inps = torch.zeros(buffer, 128, ht//self.down_scale, wd//self.down_scale, dtype=torch.half, device=self.device).share_memory_()
+        # 初始化下采样后的有效深度掩码
+        self.valid_depth_mask_small = torch.zeros(buffer, ht // self.down_scale, wd // self.down_scale,
+                                                  device=self.device, dtype=torch.bool).share_memory_()
+        #self.poses_gt = torch.zeros(buffer, 7, device="cuda", dtype=torch.float32).share_memory_()
+        self.motion_masks = torch.zeros(buffer, 1, ht, wd, device="cuda", dtype=torch.bool).share_memory_()
+        ### 特征属性 ###
+        # 初始化特征图，存储缓存中的每个图像的特征
+        self.fmaps = torch.zeros(buffer, 1, 128, ht // self.down_scale, wd // self.down_scale, dtype=torch.half,
+                                 device=self.device).share_memory_()
 
-        # initialize poses to identity transformation
+        # 初始化网络输出，存储每个图像的网络输出特征
+        self.nets = torch.zeros(buffer, 128, ht // self.down_scale, wd // self.down_scale, dtype=torch.half,
+                                device=self.device).share_memory_()
+
+        # 初始化输入数据，存储输入给网络的数据
+        self.inps = torch.zeros(buffer, 128, ht // self.down_scale, wd // self.down_scale, dtype=torch.half,
+                                device=self.device).share_memory_()
+        self.all_motion_masks = torch.zeros(5000, 1, ht, wd, device="cuda", dtype=torch.bool).share_memory_()
+        # 初始化位姿为单位变换（即零平移和单位四元数）
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.device)
+        #self.poses_sim3[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1, 1], dtype=torch.float, device="cuda")
+        #self.dscales = torch.ones(buffer, 2, 2, device='cuda', dtype=torch.float).share_memory_()
+       # self.doffset = torch.zeros(buffer, 1, 1, device='cuda', dtype=torch.float).share_memory_()
+        self.use_segmask = True
+        self.use_depth_warp = True
+        self.use_depth_mask = True
+        # 初始化打印器，用于处理和打印信息
         self.printer = printer
 
     def get_lock(self):
@@ -75,10 +127,12 @@ class DepthVideo:
     def __item_setter(self, index, item):
         if isinstance(index, int) and index >= self.counter.value:
             self.counter.value = index + 1
-        
+
         elif isinstance(index, torch.Tensor) and index.max().item() > self.counter.value:
             self.counter.value = index.max().item() + 1
-
+        # #self.counter.value = index + 1
+        # index=self.counter.value
+        # self.counter.value = index + 1
         self.timestamp[index] = item[0]
         self.images[index] = item[1]
 
@@ -90,10 +144,31 @@ class DepthVideo:
 
 
         if item[4] is not None:
-            
+            save_dir = os.path.join("output", "depth_out")
+            os.makedirs(save_dir, exist_ok=True)
+            file_name = f"depth_{index:04d}.png"
+            file_path = os.path.join(save_dir, file_name)
             mono_depth = item[4][self.down_scale//2-1::self.down_scale,
                                  self.down_scale//2-1::self.down_scale]
             self.mono_disps[index] = torch.where(mono_depth>0, 1.0/mono_depth, 0)
+            self.depths[index] = item[4]
+            self.disps_mono_up[index]=1/item[4]
+            depth_image = self.depths[index].cpu().numpy()
+            # print("depth shape",depth_image.shape)
+            min_depth = depth_image.min()
+            max_depth = depth_image.max()
+            #
+            # # 归一化到 0-255 范围内（8位图像）
+            depth_normalized_8bit = (( depth_image- min_depth) / (max_depth - min_depth) * 255).astype(np.uint8)
+            #
+            # # 或者，归一化到 0-65535 范围内（16位图像）
+            # # depth_normalized_16bit = ((depth_image - min_depth) / (max_depth - min_depth) * 65535).astype(np.uint16)
+            #
+            # # 将深度图保存为文件
+            cv2.imwrite(file_path, depth_normalized_8bit)  # 保存为 8 位图像
+            # # cv2.imwrite(file_path, depth_normalized_16bit)  # 保存为 16 位图像
+            #
+            print(f"深度图已保存为: {file_path}")
 
         if item[5] is not None:
             self.intrinsics[index] = item[5]
@@ -106,7 +181,26 @@ class DepthVideo:
 
         if len(item) > 8:
             self.inps[index] = item[8]
+        if len(item) > 9:
+            if item[9] is not None:
+                if len(item[9].shape) > 2:
+                    seg_mask = item[9][:, 3::8,3::8]
+                else:
+                    seg_mask = item[9][3::8,3::8]
+                #print("seg_mask",seg_mask.shape)
+                #output_dir = os.path.join("output", "ori masks", datetime.now().strftime("%Y%m%d-%H%M%S"))
+                #os.makedirs(output_dir, exist_ok=True)
+                #mask_np = seg_mask.cpu().numpy().astype(np.uint8) * 255
+                #output_path = os.path.join(output_dir, f"mask_{index:04d}.png")
+                #cv2.imwrite(output_path, mask_np)
 
+                #print(f"warp掩码已保存至 {output_path}")
+                self.mask[index] = seg_mask
+                self.mask_ori[index] = item[9]
+        if len(item) > 10:
+            self.poses_gt[index] = item[10]
+        if len(item) > 11:
+            self.motion_masks[index] = item[11]
     def __setitem__(self, index, item):
         with self.get_lock():
             self.__item_setter(index, item)
@@ -125,7 +219,8 @@ class DepthVideo:
                 self.intrinsics[index],
                 self.fmaps[index],
                 self.nets[index],
-                self.inps[index])
+                self.inps[index],
+                self.motion_masks[index])
 
         return item
 
@@ -133,7 +228,12 @@ class DepthVideo:
         with self.get_lock():
             self.__item_setter(self.counter.value, item)
 
-
+    # def to_dict(self):
+    #     return {
+    #         "frames": self.frames,  # 假设 frames 是列表或可序列化对象
+    #         "intrinsics": self.intrinsics,  # 内参矩阵
+    #         "depth_scale": self.depth_scale
+    #     }
     ### geometric operations ###
 
     @staticmethod
@@ -161,17 +261,18 @@ class DepthVideo:
         """ normalize depth and poses """
 
         with self.get_lock():
-            s = self.disps[:self.counter.value].mean()
+            s = self.disps[:self.counter.value].mean().item() * self.cfg['tracking']['scale_multiplier']
             self.disps[:self.counter.value] /= s
             self.poses[:self.counter.value,:3] *= s
+            self.disps_up[:self.counter.value] /= s
+            #self.dscales[:self.counter.value] /= s
             self.set_dirty(0,self.counter.value)
 
 
-    def reproject(self, ii, jj):
+    def reproject(self, ii, jj,sim3=False):
         """ project points from ii -> jj """
         ii, jj = DepthVideo.format_indicies(ii, jj)
-        Gs = lietorch.SE3(self.poses[None])
-
+        Gs = lietorch.Sim3(self.poses_sim3[None]) if sim3 else lietorch.SE3(self.poses[None])
         coords, valid_mask = \
             pops.projective_transform(Gs, self.disps[None], self.intrinsics[None], ii, jj)
 
@@ -208,90 +309,146 @@ class DepthVideo:
             return d.reshape(N, N)
 
         return d
+    # def shift(self, ix, n=1):
+    #     with self.get_lock():
+    #         self.timestamp[ix+n:self.counter.value+n] = self.timestamp[ix:self.counter.value].clone()
+    #         self.images[ix+n:self.counter.value+n] = self.images[ix:self.counter.value].clone()
+    #         self.dirty[ix+n:self.counter.value+n] = self.dirty[ix:self.counter.value].clone()
+    #         self.poses[ix+n:self.counter.value+n] = self.poses[ix:self.counter.value].clone()
+    #         self.poses_sim3[ix+n:self.counter.value+n] = self.poses_sim3[ix:self.counter.value].clone()
+    #         self.disps[ix+n:self.counter.value+n] = self.disps[ix:self.counter.value].clone()
+    #         self.mono_disps[ix+n:self.counter.value+n] = self.mono_disps[ix:self.counter.value].clone()
+    #         self.disps_up[ix+n:self.counter.value+n] = self.disps_up[ix:self.counter.value].clone()
+    #         self.disps_mono_up[ix+n:self.counter.value+n] = self.disps_mono_up[ix:self.counter.value].clone()
+    #         self.intrinsics[ix+n:self.counter.value+n] = self.intrinsics[ix:self.counter.value].clone()
+    #         #self.normals[ix+n:self.counter.value+n] = self.normals[ix:self.counter.value].clone()
+    #         self.fmaps[ix+n:self.counter.value+n] = self.fmaps[ix:self.counter.value].clone()
+    #         self.nets[ix+n:self.counter.value+n] = self.nets[ix:self.counter.value].clone()
+    #         self.inps[ix+n:self.counter.value+n] = self.inps[ix:self.counter.value].clone()
+    #         self.mask[ix + n:self.counter.value + n] = self.mask[ix:self.counter.value].clone()
+    #         self.mask_ori[ix + n:self.counter.value + n] = self.mask_ori[ix:self.counter.value].clone()
+    #         self.counter.value += n
+    def distance_covis(self, ii=None):
+        """ frame distance metric based on covisibility """
+        ii = torch.as_tensor(ii)
+        ii = ii.to(device="cuda", dtype=torch.long).reshape(-1)
+        poses = self.poses[:self.counter.value].clone()
+        d = droid_backends.covis_distance(poses, self.disps, self.intrinsics[0], ii)
+        d = d * (1. / self.disps[ii].median())
+        return d
+    def dspo(self, target, weight, eta, ii, jj, t0=1, t1=None, itrs=2, lm=1e-4, ep=0.1, motion_only=False,
+             opt_type="pose_depth",use_mono=False):
+        """ 视差、尺度与姿态联合优化层（DSPO），详见论文公式推导
+            Disparity, Scale and Pose Optimization (DSPO) layer,
+            checked the paper (and supplementary) for detailed explanation
 
-    def dspo(self, target, weight, eta, ii, jj, t0=1, t1=None, itrs=2, lm=1e-4, ep=0.1, motion_only=False, opt_type="pose_depth"):
-        """ Disparity, Scale and Pose Optimization (DSPO) layer, 
-            checked the paper (and supplementary) for detailed explanation 
-
-            opt_type: "pose_depth",  stage 1, optimize camera poses and disparity maps together, eq.16 in the paper,
-                                              same as DBA
-                      "depth_scale", stage 2, optimize disparity maps, scales and shifts together, eq.17 in the paper
-            stage 1 and stage 2 are run alternatingly
+            参数说明：
+            opt_type: "pose_depth" - 阶段1，联合优化相机姿态与视差图（对应论文公式16，类似DBA方法）
+                      "depth_scale" - 阶段2，联合优化视差图、深度尺度和位移（对应论文公式17）
+            两个阶段交替执行
         """
 
-        with self.get_lock():
+        with self.get_lock():  # 线程安全锁
 
-            # [t0, t1] window of bundle adjustment optimization
+
             if t1 is None:
-                t1 = max(ii.max().item(), jj.max().item()) + 1
+                t1 = max(ii.max().item(), jj.max().item()) + 1  # 自动计算最大时间窗口
 
             if opt_type == "pose_depth":
-                target = target.view(-1, self.ht//self.down_scale, self.wd//self.down_scale, 2).permute(0,3,1,2).contiguous()
-                weight = weight.view(-1, self.ht//self.down_scale, self.wd//self.down_scale, 2).permute(0,3,1,2).contiguous()
+
+                seg_masks= None
+                if self.use_segmask:
+                    seg_masks = self.mask[ii]
+                    seg_masks = ~seg_masks
+                    final_mask = seg_masks
+                target = target.view(-1, self.ht // self.down_scale, self.wd // self.down_scale, 2).permute(0, 3, 1,
+                                                                                                            2).contiguous()
+                weight = weight.view(-1, self.ht // self.down_scale, self.wd // self.down_scale, 2).permute(0, 3, 1,
+                                                                                                            2).contiguous()
+
+                weight =  weight *  (~final_mask).unsqueeze(1)
+
                 droid_backends.ba(self.poses, self.disps, self.intrinsics[0], self.zeros,
-                    target, weight, eta, ii, jj, t0, t1, itrs, lm, ep, motion_only, False)
+                                  target, weight, eta, ii, jj, t0, t1, itrs, lm, ep, motion_only, False)
+
                 self.disps.clamp_(min=1e-5)
                 return True
 
             elif opt_type == "depth_scale":
+
+                seg_masks = self.mask[ii]
                 poses = lietorch.SE3(self.poses[None])
                 disps = self.disps[None]
                 scales = self.depth_scale
                 shifts = self.depth_shift
                 ignore_frames = 0
+
+                seg_masks = seg_masks.unsqueeze(0).unsqueeze(-1)
+
+                seg_masks = seg_masks.expand(-1, -1, -1, -1, 2)
+                weight=weight*seg_masks
+
                 self.update_valid_depth_mask(up=False)
-                curr_idx = self.counter.value-1
-                mono_d = self.mono_disps[:curr_idx+1]
-                est_d = self.disps[:curr_idx+1]
-                valid_d = self.valid_depth_mask_small[:curr_idx+1]
+
+                curr_idx = self.counter.value - 1
+                mono_d = self.mono_disps[:curr_idx + 1]
+                est_d = self.disps[:curr_idx + 1]
+                valid_d = self.valid_depth_mask_small[:curr_idx + 1]
+
+
                 scale_t, shift_t, error_t = align_scale_and_shift(mono_d, est_d, valid_d)
-                avg_disps = est_d.mean(dim=[1,2])
+                avg_disps = est_d.mean(dim=[1, 2])
 
-                scales[:curr_idx+1]=scale_t
-                shifts[:curr_idx+1]=shift_t
 
-                target_t,weight_t,eta_t,ii_t,jj_t = target,weight,eta,ii,jj
+                scales[:curr_idx + 1] = scale_t
+                shifts[:curr_idx + 1] = shift_t
 
-                ################################################################
+
+                target_t, weight_t, eta_t, ii_t, jj_t = target, weight, eta, ii, jj
+
                 if self.mono_thres:
-                    # remove the edges which contains poses with bad mono depth
-                    invalid_mono_mask = (error_t/avg_disps > self.mono_thres)| \
-                                        (error_t.isnan())|\
-                                        (scale_t < 0)|\
-                                        (valid_d.sum(dim=[1,2]) < 
-                                        valid_d.shape[1]*valid_d.shape[2]*0.5)
+
+                    invalid_mono_mask = (error_t / avg_disps > self.mono_thres) | \
+                                        (error_t.isnan()) | \
+                                        (scale_t < 0) | \
+                                        (valid_d.sum(dim=[1, 2]) < valid_d.shape[1] * valid_d.shape[2] * 0.5)
+
+
                     invalid_mono_index, = torch.where(invalid_mono_mask.clone())
-                    invalid_ii_mask = (ii<0)
+
+
+                    invalid_ii_mask = (ii < 0)
                     idx_in_ii = torch.unique(ii)
-                    valid_eta_mask = (idx_in_ii >= 0)
                     for idx in invalid_mono_index:
-                        invalid_ii_mask =  invalid_ii_mask | (ii == idx) | (jj == idx) 
-                    target_t = target[:,~invalid_ii_mask]
-                    weight_t = weight[:,~invalid_ii_mask]
+                        invalid_ii_mask = invalid_ii_mask | (ii == idx) | (jj == idx)
+
+                    target_t = target[:, ~invalid_ii_mask]
+                    weight_t = weight[:, ~invalid_ii_mask]
                     ii_t = ii[~invalid_ii_mask]
                     jj_t = jj[~invalid_ii_mask]
-                    idx_in_ii_t = torch.unique(ii_t)
-                    valid_eta_mask = torch.tensor([idx in idx_in_ii_t for idx in idx_in_ii]).to(self.device)
+
+                    valid_eta_mask = torch.tensor([idx in torch.unique(ii_t) for idx in idx_in_ii]).to(self.device)
                     eta_t = eta[valid_eta_mask]
-                ################################################################
+
                 success = False
                 for _ in range(itrs):
-                    if self.counter.value > ignore_frames and ii_t.shape[0]>0:
+                    if self.counter.value > ignore_frames and ii_t.shape[0] > 0:
+
                         poses, disps, wqs = thirdparty.glorie_slam.geom.ba.BA_with_scale_shift(
-                            target_t,weight_t,eta_t,poses,disps,
-                            self.intrinsics[None],ii_t,jj_t,
+                            target_t, weight_t, eta_t, poses, disps,
+                            self.intrinsics[None], ii_t, jj_t,
                             self.mono_disps[None],
-                            scales[None],shifts[None],
+                            scales[None], shifts[None],
                             self.valid_depth_mask_small[None], ignore_frames,
-                            lm,ep,alpha=0.01
+                            lm, ep, alpha=0.01
                         )
-                        scales = wqs[0,:,0]
-                        shifts = wqs[0,:,1]
-                        success = True                    
+
+                        scales = wqs[0, :, 0]
+                        shifts = wqs[0, :, 1]
+                        success = True
 
                 self.depth_scale = scales
                 self.depth_shift = shifts
-
                 self.disps = disps.squeeze(0)
                 self.poses = poses.vec().squeeze(0)
 
@@ -299,15 +456,15 @@ class DepthVideo:
                 return success
 
             else:
-                raise NotImplementedError
+                raise NotImplementedError  # 未知优化类型异常
 
-    def ba(self, target, weight, eta, ii, jj, t0=1, t1=None, iters=2, lm=1e-4, ep=0.1, motion_only=False, opt_type="pose_depth"):
+    def ba(self, target, weight, eta, ii, jj, t0=1, t1=None, iters=2, lm=1e-4, ep=0.1, motion_only=False, opt_type="pose_depth",use_mono=False):
         if self.BA_type == "DSPO":
-            success = self.dspo(target, weight, eta, ii, jj, t0, t1, iters, lm, ep, motion_only,opt_type)
+            success = self.dspo(target, weight, eta, ii, jj, t0, t1, iters, lm, ep, motion_only,opt_type,use_mono)
             if not success:
-                self.dspo(target, weight, eta, ii, jj, t0, t1, iters, lm, ep, motion_only,"pose_depth")
+                self.dspo(target, weight, eta, ii, jj, t0, t1, iters, lm, ep, motion_only,opt_type,use_mono)
         elif self.BA_type == "DBA":
-            self.dspo(target, weight, eta, ii, jj, t0, t1, iters, lm, ep, motion_only,"pose_depth")
+            self.dspo(target, weight, eta, ii, jj, t0, t1, iters, lm, ep, motion_only,"pose_depth",use_mono)
         else:
             raise NotImplementedError
 

@@ -15,7 +15,8 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-
+PHASE_NAMES = {0: 'bundle-adjust', 1: 'motion-estimation', 2: 'motion-expansion'}
+PHASE_IDS = {'bundle-adjust': 0, 'motion-estimation': 1, 'motion-expansion': 2}
 class BasicPointCloud(NamedTuple):
     points: np.array
     colors: np.array
@@ -99,3 +100,122 @@ def fov2focal(fov, pixels):
 
 def focal2fov(focal, pixels):
     return 2 * math.atan(pixels / (2 * focal))
+def get_linear_noise_func(
+        lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
+):
+    """
+    Copied from Plenoxels
+
+    Continuous learning rate decay function. Adapted from JaxNeRF
+    The returned rate is lr_init when step=0 and lr_final when step=max_steps, and
+    is log-linearly interpolated elsewhere (equivalent to exponential decay).
+    If lr_delay_steps>0 then the learning rate will be scaled by some smooth
+    function of lr_delay_mult, such that the initial learning rate is
+    lr_init*lr_delay_mult at the beginning of optimization but will be eased back
+    to the normal learning rate when steps>lr_delay_steps.
+    :param conf: config subtree 'lr' or similar
+    :param max_steps: int, the number of steps during optimization.
+    :return HoF which takes step as input
+    """
+
+
+    return noise_helper
+
+def noise_helper(step):
+    if step < 0:
+        # Disable this parameter
+        return 0.0
+    else:
+        delay_rate = 1.0
+    t = np.clip(step / 20000, 0, 1)
+    log_lerp = 0.1 * (1 - t) + 1e-15 * t
+    return delay_rate * log_lerp
+
+# def get_linear_noise_func(
+#         lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
+# ):
+#     """
+#     Copied from Plenoxels
+#
+#     Continuous learning rate decay function. Adapted from JaxNeRF
+#     The returned rate is lr_init when step=0 and lr_final when step=max_steps, and
+#     is log-linearly interpolated elsewhere (equivalent to exponential decay).
+#     If lr_delay_steps>0 then the learning rate will be scaled by some smooth
+#     function of lr_delay_mult, such that the initial learning rate is
+#     lr_init*lr_delay_mult at the beginning of optimization but will be eased back
+#     to the normal learning rate when steps>lr_delay_steps.
+#     :param conf: config subtree 'lr' or similar
+#     :param max_steps: int, the number of steps during optimization.
+#     :return HoF which takes step as input
+#     """
+#
+#     def helper(step):
+#         if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
+#             # Disable this parameter
+#             return 0.0
+#         if lr_delay_steps > 0:
+#             # A kind of reverse cosine decay.
+#             delay_rate = lr_delay_mult + (1 - lr_delay_mult) * np.sin(
+#                 0.5 * np.pi * np.clip(step / lr_delay_steps, 0, 1)
+#             )
+#         else:
+#             delay_rate = 1.0
+#         t = np.clip(step / max_steps, 0, 1)
+#         log_lerp = lr_init * (1 - t) + lr_final * t
+#         return delay_rate * log_lerp
+#
+#     return helper
+def apply_rotation(q1, q2):
+    """
+    Applies a rotation to a quaternion.
+
+    Parameters:
+    q1 (Tensor): The original quaternion.
+    q2 (Tensor): The rotation quaternion to be applied.
+
+    Returns:
+    Tensor: The resulting quaternion after applying the rotation.
+    """
+    # Extract components for readability
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+
+    # Compute the product of the two quaternions
+    w3 = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x3 = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y3 = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z3 = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+    # Combine the components into a new quaternion tensor
+    q3 = torch.tensor([w3, x3, y3, z3])
+
+    # Normalize the resulting quaternion
+    q3_normalized = q3 / torch.norm(q3)
+
+    return q3_normalized
+
+
+def batch_quaternion_multiply(q1, q2):
+    """
+    Multiply batches of quaternions.
+
+    Args:
+    - q1 (torch.Tensor): A tensor of shape [N, 4] representing the first batch of quaternions.
+    - q2 (torch.Tensor): A tensor of shape [N, 4] representing the second batch of quaternions.
+
+    Returns:
+    - torch.Tensor: The resulting batch of quaternions after applying the rotation.
+    """
+    # Calculate the product of each quaternion in the batch
+    w = q1[:, 0] * q2[:, 0] - q1[:, 1] * q2[:, 1] - q1[:, 2] * q2[:, 2] - q1[:, 3] * q2[:, 3]
+    x = q1[:, 0] * q2[:, 1] + q1[:, 1] * q2[:, 0] + q1[:, 2] * q2[:, 3] - q1[:, 3] * q2[:, 2]
+    y = q1[:, 0] * q2[:, 2] - q1[:, 1] * q2[:, 3] + q1[:, 2] * q2[:, 0] + q1[:, 3] * q2[:, 1]
+    z = q1[:, 0] * q2[:, 3] + q1[:, 1] * q2[:, 2] - q1[:, 2] * q2[:, 1] + q1[:, 3] * q2[:, 0]
+
+    # Combine into new quaternions
+    q3 = torch.stack((w, x, y, z), dim=1)
+
+    # Normalize the quaternions
+    norm_q3 = q3 / torch.norm(q3, dim=1, keepdim=True)
+
+    return norm_q3

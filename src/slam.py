@@ -31,44 +31,58 @@ from src.tracker import Tracker
 from src.mapper import Mapper
 from thirdparty.glorie_slam.backend import Backend
 
+
+
 class SLAM:
-    def __init__(self, cfg, stream:BaseDataset):
+    def __init__(self, cfg, stream: BaseDataset):
+
         super(SLAM, self).__init__()
+
         self.cfg = cfg
+        self.disable_vis = cfg["disable_vis"]
         self.device = cfg['device']
-        self.verbose:bool = cfg['verbose']
-        self.only_tracking:bool = cfg['only_tracking']
+
+        self.verbose: bool = cfg['verbose']
+
+        self.only_tracking: bool = cfg['only_tracking']
+
         self.logger = None
+
         self.save_dir = cfg["data"]["output"] + '/' + cfg['scene']
 
         os.makedirs(self.save_dir, exist_ok=True)
 
         self.H, self.W, \
-        self.fx, self.fy, \
-        self.cx, self.cy = update_cam(cfg)
+            self.fx, self.fy, \
+            self.cx, self.cy = update_cam(cfg)
 
-        self.droid_net:DroidNet = DroidNet()
+        self.droid_net: DroidNet = DroidNet()
 
-        self.printer = Printer(len(stream))    # use an additional process for printing all the info
+        self.printer = Printer(len(stream))
 
         self.load_pretrained(cfg)
+
         self.droid_net.to(self.device).eval()
+
         self.droid_net.share_memory()
 
         self.num_running_thread = torch.zeros((1)).int()
         self.num_running_thread.share_memory_()
+
         self.all_trigered = torch.zeros((1)).int()
         self.all_trigered.share_memory_()
 
-        self.video = DepthVideo(cfg,self.printer)
-        self.ba = Backend(self.droid_net,self.video,self.cfg)
+        self.video = DepthVideo(cfg, self.printer)
 
-        # post processor - fill in poses for non-keyframes
+        self.ba = Backend(self.droid_net, self.video, self.cfg)
+
         self.traj_filler = PoseTrajectoryFiller(net=self.droid_net, video=self.video,
-                                                printer=self.printer, device=self.device)
-        
-        self.tracker:Tracker = None
-        self.mapper:Mapper = None
+                                            printer=self.printer, device=self.device)
+
+
+        self.tracker: Tracker = None
+        self.mapper: Mapper = None
+
         self.stream = stream
 
     def load_pretrained(self, cfg):
@@ -103,16 +117,16 @@ class SLAM:
         if self.only_tracking:
             self.all_trigered += 1
             return
-        self.mapper =  Mapper(self, pipe)
-        self.printer.print('Mapping Triggered!',FontColor.MAPPER)
+
+        self.mapper = Mapper(self, pipe)
+        self.printer.print('Mapping Triggered!', FontColor.MAPPER)
 
         self.all_trigered += 1
-        setup_seed(self.cfg["setup_seed"])
-        
-        while(self.all_trigered < self.num_running_thread):
+        while self.all_trigered < self.num_running_thread:
             pass
-        self.mapper.run()
-        self.printer.print('Mapping Done!',FontColor.MAPPER)
+
+        self.mapper.run(self.stream)
+        self.printer.print('Mapping Done!', FontColor.MAPPER)
 
         self.terminate()
         
@@ -129,8 +143,10 @@ class SLAM:
 
     def terminate(self):
         """ fill poses for non-keyframe images and evaluate """
-        
+        print("final",self.cfg['mapping']['eval_before_final_ba'])
+        print("before",self.cfg['mapping']['eval_before_final_ba'])
         if self.cfg['tracking']['backend']['final_ba'] and self.cfg['mapping']['eval_before_final_ba']:
+            print("enter")
             self.video.save_video(f"{self.save_dir}/video.npz")
             try:
                 ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
@@ -162,6 +178,7 @@ class SLAM:
                     eval_mesh=True if self.cfg['dataset'] == 'replica' else False,
                     gt_mesh_path=self.cfg['meshing']['gt_mesh_path']
                 )
+                print("out")
 
         if self.cfg['tracking']['backend']['final_ba']:
             self.backend()
@@ -244,12 +261,13 @@ class SLAM:
         self.printer.print("Metrics Evaluation Done!",FontColor.EVAL)
 
     def run(self):
-
         m_pipe, t_pipe = mp.Pipe()
+
         processes = [
             mp.Process(target=self.tracking, args=(t_pipe,)),
             mp.Process(target=self.mapping, args=(m_pipe,)),
         ]
+
 
         self.num_running_thread[0] += len(processes)
         for p in processes:
