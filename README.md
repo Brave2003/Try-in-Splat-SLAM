@@ -104,11 +104,11 @@ Download the pretained models from [Google Drive](https://drive.google.com/file/
         └── omnidata_dpt_depth_v2.ckpt
 
 ```
+</details>
 9.install pytorch3d.
 ```bash
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
 ```
-</details>
 
 
 ## Data Download
