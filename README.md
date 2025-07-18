@@ -120,7 +120,10 @@ wget https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/
 cd monody
 wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.pt
 ```
-
+If it is not in the class segmented by the YOLO model, then optical flow can be cloned below to generate a mask.
+```bash
+git clone https://github.com/zhengqili/Neural-Scene-Flow-Fields.git
+```
 ### Download flow model 
 download raft-things.pth directly from https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT
 
