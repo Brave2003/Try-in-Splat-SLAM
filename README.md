@@ -19,7 +19,7 @@ This is not an officially endorsed Google product.
     <img src="./media/framework.jpg" alt="framework" width="100%">
 </p>
 <p align="center">
-<strong>MonoDy Architecture</strong>. We use a keyframe based frame to frame tracker based on dense optical flow connected to a pose graph for global consistency. For dense mapping, we resort to a 3DGS representation, suitable for extracting both dense geometry and rendering from. 
+<strong>Anonymous Architecture</strong>.
 </p>
 
 <!-- TABLE OF CONTENTS -->
@@ -145,10 +145,10 @@ python new.py   source_dir  target_dir
 
 ```
 ## Run
-For running Splat-SLAM, each scene has a config folder, where the `input_folder`,`output` paths need to be specified. Below, we show some example run commands for one scene from each dataset.
+For running Anonymous, each scene has a config folder, where the `input_folder`,`output` paths need to be specified. Below, we show some example run commands for one scene from each dataset.
 
 ### TUM-RGBD
-To run Splat-SLAM on the `freiburg3_sitting_rpy` scene, run the following command. 
+To run Anonymous on the `freiburg3_sitting_rpy` scene, run the following command. 
 ```bash
 python run.py configs/TUM_RGBD/rgbd_dataset_freiburg3_sitting_rpy.yaml
 ```
@@ -156,7 +156,7 @@ After reconstruction, the trajectory error will be evaluated automatically.
 
 
 ## Run tracking without mapping
-Our Splat-SLAM pipeline uses two processes, one for tracking and one for mapping, and it is possible to run tracking only without mapping/rendering. Add `--only_tracking` in each of the above commands.
+Our Anonymous pipeline uses two processes, one for tracking and one for mapping, and it is possible to run tracking only without mapping/rendering. Add `--only_tracking` in each of the above commands.
 ```bash
 python run.py configs/TUM_RGBD/rgbd_dataset_freiburg3_sitting_rpy.yaml --only_tracking
 ```
@@ -167,18 +167,6 @@ Our codebase is partially based on [splat-SLAM](https://github.com/google-resear
 ## Reproducibility
 There may be minor differences between the released codebase and the results reported in the paper. Further, we note that the GPU hardware has an influence, despite running the same seed and conda environment.
 
-## Citation
 
-If you find our code or paper useful, please cite
-```bibtex
-@article{sandstrom2024splat,
-  title={Splat-SLAM: Globally Optimized RGB-only SLAM with 3D Gaussians},
-  author={Sandstr{\"o}m, Erik and Tateno, Keisuke and Oechsle, Michael and Niemeyer, Michael and Van Gool, Luc and Oswald, Martin R and Tombari, Federico},
-  journal={arXiv preprint arXiv:2405.16544},
-  year={2024}
-}
-```
-## Contact
-Contact [Erik Sandström](mailto:erik.sandstrm@gmail.com) for questions, comments and reporting bugs.
 
 
