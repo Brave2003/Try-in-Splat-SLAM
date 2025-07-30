@@ -88,6 +88,7 @@ diff_gaussian_rasterization; print(torch.cuda.is_available())"
 python -m pip install -e .
 python -m pip install -r requirements.txt
 python -m pip install pytorch-lightning==1.9 --no-deps
+pip install lightning-utilities==0.4.2 
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
 ```
 
