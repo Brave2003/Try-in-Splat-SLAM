@@ -559,7 +559,6 @@ class Mapper(object):
             gt_depth = torch.from_numpy(gt_depth).to(render_depth.device)
         gt_depth=gt_depth.to(render_depth.device)
         # alpha = 100
-        ### 用 Tanh 来近似这个符号函数。
         gt_depth = gt_depth[mask > 0]  ## N,1
         depthmax = gt_depth.max()
         depthmin = gt_depth.min()
@@ -1527,7 +1526,6 @@ class Mapper(object):
         rgb_boundary_threshold = self.config["mapping"]["Training"]["rgb_boundary_threshold"]
         self.mapped_video_idxs.append(cur_frame_idx)
         self.mapped_kf_idxs.append(idx)
-        print("mono",self.monocular)
         #monodepth=load_mono_depth(idx, self.save_dir).to(self.device)
         viewpoint = self.cameras[cur_frame_idx]
         gt_img = viewpoint.original_image.cuda()
