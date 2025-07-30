@@ -536,8 +536,6 @@ class Mapper(object):
                 t = st_predicted[video_id]["shift"]
             #t = max(st_predicted[video_id]["shift"], 0)
         depth = depth * s+t
-        #depth[~static_msk] = depth[~static_msk]+t
-        #depth[~static_msk]=depth[~static_msk]*3*s+6*t
         if video_id in new_scale_alignFrame0:
             depth = depth * new_scale_alignFrame0[video_id]
         return depth
