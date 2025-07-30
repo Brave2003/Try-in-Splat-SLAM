@@ -155,6 +155,7 @@ class Mapper(object):
         self.longer=self.config["mapping"]["long"]
         self.cameras_extent = 6.0
         self.dyratio=0
+        self.shift=self.config["mapping"]["shift"]
         self.set_hyperparams()
         self.device = torch.device(self.config['device'])
         self.static_msk = torch.from_numpy(static_msk).to(self.device)
@@ -531,7 +532,7 @@ class Mapper(object):
             s = st_predicted[video_id]["scale"]
 
             if st_predicted[video_id]["shift"] < 0:
-                t = -st_predicted[video_id]["shift"]#0.6
+                t = -self.shift*st_predicted[video_id]["shift"]#0.6
             else:
                 t = st_predicted[video_id]["shift"]
             #t = max(st_predicted[video_id]["shift"], 0)
