@@ -43,3 +43,4 @@ mapping:
       flow_loss_fine: 2
 mapping:
   first_s: 2.916740894317627
+  s: 1.1
