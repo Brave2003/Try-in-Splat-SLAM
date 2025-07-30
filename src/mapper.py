@@ -510,7 +510,7 @@ class Mapper(object):
    
                 current_value = new_scale_alignFrame0[video_id]
 
-                if current_value is None or current_value > previous_value*1.135 or current_value*1.135<previous_value :
+                if current_value is None or current_value > previous_value*1.1 or current_value*1.1<previous_value :
                     new_scale_alignFrame0[video_id] = previous_value
                     print(f"new，video_id={video_id} is: {new_scale_alignFrame0[video_id]}")
                 else:
