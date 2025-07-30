@@ -71,7 +71,7 @@ class DepthVideo:
         self.poses_sim3 = torch.zeros(buffer, 8, device="cuda", dtype=torch.float).share_memory_()
 
         self.disps_up = torch.zeros(buffer, ht, wd, device=self.device, dtype=torch.float).share_memory_()
-）
+
         self.intrinsics = torch.zeros(buffer, 4, device=self.device, dtype=torch.float).share_memory_()
         self.normals = torch.zeros(buffer, 3, ht, wd, device="cpu", dtype=torch.float)
         self.poses_gt = torch.zeros(buffer, 4, 4, device=self.device, dtype=torch.float).share_memory_()
