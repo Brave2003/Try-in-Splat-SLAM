@@ -271,19 +271,8 @@ class Camera(nn.Module):
         selected_keyframe_list = [keyframe_dict['id']
                                   for keyframe_dict in list_keyframe if keyframe_dict['percent_inside'] > 0.0]
         win = 8 - pose_window
-        if len(selected_keyframe_list) >= win:
-            selected_keyframe_list = list(np.random.permutation(
+        selected_keyframe_list = list(np.random.permutation(
                 np.array(selected_keyframe_list))[:win])
-        elif len(selected_keyframe_list) < win:
-        # Need to add extra frames to make it 5
-            remaining_needed = win - len(selected_keyframe_list)
-        # Get all available frames (including those with percent_inside <= 0)
-            all_frames = [keyframe_dict['id'] for keyframe_dict in list_keyframe]
-        # Exclude already selected frames
-            available_frames = [f for f in all_frames if f not in selected_keyframe_list]
-        # Take the top remaining frames (since list_keyframe is already sorted)
-            extra_frames = available_frames[:remaining_needed]
-            selected_keyframe_list.extend(extra_frames)
 
         return selected_keyframe_list
 
