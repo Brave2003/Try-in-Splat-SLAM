@@ -148,7 +148,6 @@ class GaussianModel:
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
         rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-        print("depth",depthmap.max())
         if depthmap is not None:
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depthmap.astype(np.float32))
@@ -210,7 +209,6 @@ class GaussianModel:
         )
   
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
-        print("[DEBUG] Downsampled point cloud size:", len(pcd_tmp.points))  # 添加调试输出
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
 
