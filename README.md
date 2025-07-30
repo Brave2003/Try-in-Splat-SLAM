@@ -48,13 +48,13 @@ This is not an officially endorsed Google product.
 ## Installation
 1. Clone the repo using the `--recursive` flag 
 ```bash
-git clone --recursive https://github.com/enterfutures/monody.git
-cd monody
+git clone --recursive https://github.com/enterfutures/Anonymous.git
+cd Anonymous
 ```
 2. Creating a new conda environment. 
 ```bash
-conda create --name monody python=3.10
-conda activate monody
+conda create --name Anonymous python=3.10
+conda activate Anonymous
 ```
 3. Install CUDA 11.7 using conda and torch 1.13.1
 ```bash
