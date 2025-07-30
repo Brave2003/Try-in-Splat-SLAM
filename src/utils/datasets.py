@@ -76,54 +76,43 @@ class BaseDataset(Dataset):
 
         super(BaseDataset, self).__init__()
 
-        # 设置数据集名称和设备（默认为cuda:0）
         self.name = cfg['dataset']
         self.device = device
 
-        # 获取深度图像缩放比例
         self.png_depth_scale = cfg['cam']['png_depth_scale']
 
-        # 初始化一些未定义的参数
-        self.n_img = -1  # 图片数量，默认为-1
-        self.depth_paths = None  # 深度图像路径
-        self.color_paths = None  # 彩色图像路径
-        self.poses = None  # 相机姿态
+        self.n_img = -1  
+        self.depth_paths = None  
+        self.color_paths = None  
+        self.poses = None  
         self.normal_paths=None
         self.mask_paths=None
         self.mono_paths = None
         self.static_paths=None
-        self.image_timestamps = None  # 图片时间戳
+        self.image_timestamps = None  
 
-        # 从配置文件中获取相机内参的高度、宽度、焦距、光心位置
         self.H, self.W, self.fx, self.fy, self.cx, self.cy = cfg['cam']['H'], cfg['cam'][
             'W'], cfg['cam']['fx'], cfg['cam']['fy'], cfg['cam']['cx'], cfg['cam']['cy']
 
-        # 保存原始的内参
         self.fx_orig, self.fy_orig, self.cx_orig, self.cy_orig = self.fx, self.fy, self.cx, self.cy
 
-        # 获取输出图像的尺寸
         self.H_out, self.W_out = cfg['cam']['H_out'], cfg['cam']['W_out']
 
-        # 获取图像边缘的尺寸（可能用于后处理或者填充）
         self.H_edge, self.W_edge = cfg['cam']['H_edge'], cfg['cam']['W_edge']
 
-        # 计算加上边缘后输出图像的尺寸
         self.H_out_with_edge, self.W_out_with_edge = self.H_out + self.H_edge * 2, self.W_out + self.W_edge * 2
 
-        # 将相机内参转为torch张量
         self.intrinsic = torch.as_tensor([self.fx, self.fy, self.cx, self.cy]).float()
 
-        # 根据输出图像的尺寸调整相机内参
         self.intrinsic[0] *= self.W_out_with_edge / self.W
         self.intrinsic[1] *= self.H_out_with_edge / self.H
         self.intrinsic[2] *= self.W_out_with_edge / self.W
         self.intrinsic[3] *= self.H_out_with_edge / self.H
 
-        # 调整光心位置，使其适应边缘
         self.intrinsic[2] -= self.W_edge
         self.intrinsic[3] -= self.H_edge
         self.yolo_model=None
-        # 更新相机内参的值
+
         self.fx = self.intrinsic[0].item()
         self.fy = self.intrinsic[1].item()
         self.cx = self.intrinsic[2].item()
@@ -144,14 +133,13 @@ class BaseDataset(Dataset):
 
 
     def load_yolo(self, model_path='yolo11l-seg.pt'):
-        """ 正确的模型加载方法（移除@property装饰器） """
-        # 检查设备可用性
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA不可用，无法加载YOLO模型")
 
-        # 加载并分配设备
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA false，not load YOLO")
+
         self.yolo_model = YOLO(model_path).to(self.device)
-        print(f"YOLO已加载至设备：{self.yolo_model.device}")
+        print(f"YOLO load：{self.yolo_model.device}")
     def __len__(self):
         return self.n_img
 
@@ -224,7 +212,6 @@ class BaseDataset(Dataset):
         # color_data = torch.from_numpy(color_data).float().permute(2, 0, 1)
         if self.yolo_model is  None:
             self.load_yolo()
-            print("yolo true")
         color_data = color_data.unsqueeze(dim=0)  # [1, 3, h, w]
         if self.mono_paths:
             mono_data=self.mono_paths[index]
@@ -241,7 +228,6 @@ class BaseDataset(Dataset):
                 if self.H_edge > 0:
                     edge = self.H_edge
                     mono_data = mono_data[edge:-edge, :]
-            print("monodata",mono_data.shape)
         else :
             mono_data=None
         depth_data_fullsize = self.depthloader(index,self.depth_paths,self.png_depth_scale)
@@ -257,7 +243,6 @@ class BaseDataset(Dataset):
             dist_flow = np.linalg.norm(static_data["flow"], ord=2, axis=-1)
             dist_flow = cv2.resize(dist_flow, (self.W_out_with_edge, self.H_out_with_edge))
             if static_msk is None:
-                print("init msk")
                 static_msk = np.ones_like(dist_flow)
 
             static_msk = np.logical_and(static_msk, dist_flow < 0.8)
@@ -267,7 +252,6 @@ class BaseDataset(Dataset):
             if self.H_edge > 0:
                 edge = self.H_edge
                 static_msk = static_msk[edge:-edge, :]
-            print("sta",static_msk.shape)
         else :
             static_msk=None
         # crop image edge, there are invalid value on the edge of the color image
@@ -287,9 +271,8 @@ class BaseDataset(Dataset):
                 mask_tensor = transforms.ToTensor()(mask_img)  # [1, H_orig, W_orig]
                 mask = (mask_tensor > 0.01).to(torch.bool).squeeze(0)  # [H_orig, W_orig]
 
-                # 调整掩码大小以匹配调整后的图像尺寸
                 mask_resized = F.interpolate(
-                    mask.unsqueeze(0).unsqueeze(0).float(),  # 添加批次和通道维度
+                    mask.unsqueeze(0).unsqueeze(0).float(), 
                     size=outsize,
                     mode='nearest'
                 ).squeeze().to(torch.bool)  # [H_out, W_out]
@@ -299,19 +282,17 @@ class BaseDataset(Dataset):
                 if self.H_edge > 0:
                     edge = self.H_edge
                     mask_resized = mask_resized[edge:-edge, :]
-                # 添加膨胀操作
+
                 mask_np = mask_resized.cpu().numpy().astype(np.uint8) * 255
-                kernel_size = 7  # 与第二段代码相同的核大小
+                kernel_size = 7  
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
                 dilated_np = cv2.dilate(mask_np, kernel, iterations=1)
 
-                # 转回张量
                 dilated_mask = torch.from_numpy(dilated_np > 0).to(device=self.device, dtype=torch.bool)
                 mask_input = dilated_mask
 
             except Exception as e:
-                print(f"预生成掩码加载失败: {e}")
-        # --- 3. 使用YOLO生成动态掩码 ---
+                print(f"false: {e}")
         if self.normal_paths:
             try:
                 normal_path = self.normal_paths[index]
@@ -329,9 +310,7 @@ class BaseDataset(Dataset):
                     normal_data = normal_data[:,  :,edge:-edge, :]
                 #normal_input  = torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
 
-                # 将normal值从[0,1]映射到[-1,1]
                 normal_input  = normal_data * 2.0 - 1.0
-                print("norm",normal_input.shape)
             except Exception as e:
                 print(f"Failed to load normal map: {e}")
 
@@ -348,7 +327,7 @@ class BaseDataset(Dataset):
                         kernel_size = 7#16
                         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
                         dilated_np = cv2.dilate(mask_np, kernel, iterations=1)
-                        # 转回张量
+    
                         dilated_mask = torch.from_numpy(dilated_np > 0).to(device=mask.device, dtype=torch.bool)
                         combined_mask |= dilated_mask
         if self.yolo_model is not None and self.seg_chair:
@@ -363,11 +342,11 @@ class BaseDataset(Dataset):
                         kernel_size = 7#16
                         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
                         dilated_np = cv2.dilate(mask_np, kernel, iterations=1)
-                        # 转回张量
+        
                         dilated_mask = torch.from_numpy(dilated_np > 0).to(device=mask.device, dtype=torch.bool)
                         combined_mask |= dilated_mask
-        # --- 4. 合并掩码 ---
-        final_mask = torch.logical_not(combined_mask | mask_input)  # True表示有效区域
+
+        final_mask = torch.logical_not(combined_mask | mask_input)  
         if self.poses is not None:
             pose = torch.from_numpy(self.poses[index]).float() #torch.from_numpy(np.linalg.inv(self.poses[0]) @ self.poses[index]).float()
         else:
@@ -376,18 +355,7 @@ class BaseDataset(Dataset):
         color_data_fullsize = cv2.cvtColor(color_data_fullsize,cv2.COLOR_BGR2RGB)
         color_data_fullsize = color_data_fullsize / 255.
         color_data_fullsize = torch.from_numpy(color_data_fullsize)
-        # 创建保存目录（如果不存在）
-        output_dir = "try mask_output"
-        os.makedirs(output_dir, exist_ok=True)
 
-        # 转换张量为二值图像
-        mask_np = final_mask.cpu().numpy().astype(np.uint8) * 255  # True->255, False->0
-
-        # 保存图像（文件名按索引命名）
-        output_path = os.path.join(output_dir, f"mask_{index:04d}.png")
-        cv2.imwrite(output_path, mask_np)
-        del mask_np
-        #print(f"已保存二值掩码到 {output_path}")
         return index, color_data, depth_data, pose,final_mask,normal_input,mono_data,static_msk
 
 
