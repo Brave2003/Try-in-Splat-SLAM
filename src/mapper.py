@@ -488,7 +488,7 @@ class Mapper(object):
               cur_t = st_predicted[video_id]["shift"]
         cur_masked_depth = depth[static_msk]
         if not np.isnan(cur_s) or not np.isnan(cur_t):
-            pass  ## 都不是nan
+            pass  
         else:
             cur_s = st_predicted["mean_s"]
             cur_t = st_predicted["mean_t"]
