@@ -117,7 +117,7 @@ wget https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/
 ```
 ### Download yolo11l-seg.pt
 ```bash
-cd monody
+cd Anonymous
 wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.pt
 ```
 If it is not in the class segmented by the YOLO model, then optical flow can be cloned below to generate a mask.
