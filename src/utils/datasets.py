@@ -73,7 +73,7 @@ def get_dataset(cfg, device='cuda:0'):
 
 class BaseDataset(Dataset):
     def __init__(self, cfg, device='cuda:0'):
-        # 调用父类构造函数
+
         super(BaseDataset, self).__init__()
 
         # 设置数据集名称和设备（默认为cuda:0）
