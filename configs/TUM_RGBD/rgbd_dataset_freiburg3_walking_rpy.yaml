@@ -34,3 +34,4 @@ tracking:
     keyframe_thresh: 0.2
 mapping:
   first_s:  3.0668022632598877
+  shift: 1
