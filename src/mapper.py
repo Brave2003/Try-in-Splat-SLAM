@@ -854,7 +854,6 @@ class Mapper(object):
                     dxyz = 0
                     d_rot, d_scale, d_opac, d_color = None, 0, None, None
                 dygs_scaling += d_scale
-                # 执行场景渲染
                 render_pkg = render(
                     viewpoint,
                     self.gaussians,
@@ -1024,7 +1023,6 @@ class Mapper(object):
 
                 dygs_scaling += d_scale
 
-                # 渲染随机视角
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background,
                     dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot, do=d_opac, dc=d_color,
@@ -1067,7 +1065,6 @@ class Mapper(object):
                             )
                             d_xyz2 = d_value2["d_xyz"]
 
-                            # 反向光流损失
                             render_pkg2 = render_flow(
                                 pc=self.gaussians,
                                 viewpoint_camera1=viewpoint,
@@ -1797,7 +1794,7 @@ class Mapper(object):
             self.cameras[video_idx] = viewpoint
 
             if self.dynamic_model:
-                self.gaussians.deform.deform.reg_loss = 0.  # 重置正则化损失
+                self.gaussians.deform.deform.reg_loss = 0.
 
             if init:
                 self.initialize(video_idx, viewpoint)
@@ -1975,7 +1972,6 @@ class Mapper(object):
             self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
             dynamic_enabled = self.config["mapping"]["model_params"].get("dynamic_model", False)
-            print("dynamic",dynamic_enabled)
 
             self.map(stream=stream,
                      idx1=idx,
