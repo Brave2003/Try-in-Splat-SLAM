@@ -25,6 +25,7 @@ cam:
   cx: 320.1
   cy: 247.6
 mapping:
+  shift: 1
   opt_params:
     grid_lr_init: 0.0009 #0.0016
     deformation_lr_init: 0.00022
