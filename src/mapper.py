@@ -609,7 +609,7 @@ class Mapper(object):
             from scipy.ndimage import binary_erosion
             mono_depth = mono_depth.cpu().numpy()
             binary_image = (mono_depth > 0).astype(int)
-
+            iterations=5
             padded_binary_image = np.pad(binary_image, pad_width=iterations, mode='constant', constant_values=1)
             structure = np.ones((3, 3), dtype=int) 
 
