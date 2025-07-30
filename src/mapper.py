@@ -511,11 +511,11 @@ class Mapper(object):
 
                 if current_value is None or current_value > previous_value*1.1 or current_value*1.1<previous_value :
                     new_scale_alignFrame0[video_id] = previous_value
-                    print(f"新赋值后，video_id={video_id} 的值是: {new_scale_alignFrame0[video_id]}")
+                    print(f"new，video_id={video_id} is: {new_scale_alignFrame0[video_id]}")
                 else:
-                    print(f"保持当前值，video_id={video_id} 的值是: {current_value}")
+                    print(f"old，video_id={video_id} is: {current_value}")
             else:
-                print("没有找到上一个键的值")
+                print("no last key")
         print("S,T,align_scale:", cur_s, cur_t, new_scale_alignFrame0[video_id])
         del cur_s,cur_t,res
         return new_scale_alignFrame0
@@ -770,19 +770,15 @@ class Mapper(object):
                 stream, self.viewpoints, self.viewpoints[current_window[2]].uid)
         key_opt = current_window[:3] + key_opt
         viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in key_opt]
-        print(f"[Debug] current_window长度={len(current_window)}, viewpoint_stack长度={len(viewpoint_stack)}")
-        random_viewpoint_stack = []  # 随机采样视角集合
+        random_viewpoint_stack = []  
         frames_to_optimize = self.config["mapping"]["Training"]["pose_window"]
         current_window_set = set(key_opt)
-        print(f"[Debug] 初始窗口: {current_window}")
-        print(f"[Debug] 重叠度筛选结果: {key_opt}")
-        print(f"[Debug] 最终 viewpoint_stack: {[v.uid for v in viewpoint_stack]}")
         for cam_idx, viewpoint in self.viewpoints.items():
             if cam_idx in current_window_set:
                 continue
             random_viewpoint_stack.append(viewpoint)
 
-        # 动态参数初始化
+
         flow_weights = self.config["mapping"]["Training"]["flow_loss"]
         delta = self.config["mapping"]["Training"].get("delta", 5)
 
@@ -994,7 +990,7 @@ class Mapper(object):
                     d_values = self.gaussians.deform.step(
                         self.gaussians.get_dygs_xyz.detach(),
                         time_input,
-                        iteration=0,  # 当前迭代次数
+                        iteration=0,  
                         feature=None,
                         motion_mask=self.gaussians.motion_mask,
                         camera_center=viewpoint.camera_center,
@@ -1052,9 +1048,8 @@ class Mapper(object):
                 else:
                     mask = None
 
-                # 动态网络损失计算(与主循环相同逻辑)
                 if dynamic_network and self.gaussians.deform_init:
-                    if dynamic or True:  # 调试用强制启用
+                    if dynamic or True:  
                         closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
                         if closest_keyframe is not None:
                             flow, flow_back, mask_fwd, mask_bwd,_ = viewpoint.generate_flow(
@@ -1116,7 +1111,7 @@ class Mapper(object):
                             dynamic=dynamic,
                         )+0.1*loss_order_depth
                         loss_mapping += 0.1 * self.get_loss_normal(depth, viewpoint) / 10.
-                    else:  # 静态优化分支(当前未启用)
+                    else:  
                         image = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
                         gt_image = viewpoint.original_image.cuda()
                         gt_depth = torch.from_numpy(viewpoint.depth).to(device=image.device)[None]
@@ -1126,7 +1121,7 @@ class Mapper(object):
                         loss_mapping += (1.0 - self.opt_params.lambda_dssim) * Ll1 + \
                                         self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
                         loss_mapping += 0.1 * l1_depth.mean()
-                else:  # 非动态网络损失
+                else:  
                     loss_mapping += get_loss_mapping(
                         self.config["mapping"], image, depth, viewpoint, opacity,
                         rm_dynamic=not (dynamic_network or dynamic_render),
@@ -1134,10 +1129,10 @@ class Mapper(object):
                     )
 
                 if dynamic_network and self.gaussians.deform_init:
-                    # 弹性形变约束（抑制过度拉伸）
+                    
                     loss_network += 1e-4 * self.gaussians.deform.deform.elastic_loss(
-                        t=viewpoint.fid,  # 当前时间戳
-                        delta_t= 5*self.gaussians.time_interval,  # 时间差分范围
+                        t=viewpoint.fid,  
+                        delta_t= 5*self.gaussians.time_interval, 
                     )
 
                     loss_network+=1e-6* self.gaussians.deform.deform.acc_loss(
@@ -1150,7 +1145,7 @@ class Mapper(object):
                     )
 
 
-                # 累积渲染数据
+                
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -1182,19 +1177,19 @@ class Mapper(object):
                         if prune_mode == "odometry":
                             to_prune = self.gaussians.n_obs < 3
                             # make sure we don't split the gaussians, break here.
-                        if prune_mode == "slam":  # SLAM模式剪枝
-                            sorted_window = sorted(current_window, reverse=True)  # 时间倒序排列
-                            mask = self.gaussians.unique_kfIDs >= sorted_window[2]  # 选择最近三个关键帧创建的高斯
-                            if not self.initialized:  # 初始化阶段放宽条件
+                        if prune_mode == "slam":  
+                            sorted_window = sorted(current_window, reverse=True) 
+                            mask = self.gaussians.unique_kfIDs >= sorted_window[2]  
+                            if not self.initialized:  
                                 mask = self.gaussians.unique_kfIDs >= 0
-                            to_prune = torch.logical_and(  # 联合可见性和时间条件
+                            to_prune = torch.logical_and(  
                                 self.gaussians.n_obs <= prune_coviz,
                                 mask,
                             )
                             # to_prune = torch.logical_or(torch.logical_and(self.gaussians.dygs==True, (self.gaussians.n_obs >= 1).cuda()), to_prune.cuda())  ##
                         if to_prune is not None and self.monocular:
-                            self.gaussians.prune_points(to_prune.cuda())  # 调用剪枝函数
-                            # 更新可见性统计
+                            self.gaussians.prune_points(to_prune.cuda())  
+                            
                             for idx in range((len(current_window))):
                                 current_idx = current_window[idx]
                                 self.occ_aware_visibility[current_idx] = (self.occ_aware_visibility[current_idx][
@@ -1217,8 +1212,8 @@ class Mapper(object):
                         self.iteration_count % self.gaussian_update_every
                         == self.gaussian_update_offset and i > 100
                 )
-                if rm_initdy:  # 初始化动态移除模式特殊处理
-                    update_gaussian = (iters - i - 10 == 0)  # 最后10次迭代前强制更新
+                if rm_initdy:  
+                    update_gaussian = (iters - i - 10 == 0) 
                 if update_gaussian:
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
@@ -1237,10 +1232,6 @@ class Mapper(object):
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
                         not update_gaussian
                 ) and i > 100: #and idx1 < 100:
-                    print("iteration",self.iteration_count)
-                    print("update_gaussian",update_gaussian)
-                    print("idx",idx1)
-                    print("i",i)
                     self.printer.print("Resetting the opacity of non-visible Gaussians", FontColor.MAPPER)
                     self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                     gaussian_split = True
@@ -1374,7 +1365,6 @@ class Mapper(object):
 
             keyframes_opt = []
             for _ in range(10):
-            # 随机选择视角进行渲染------------------------------------------------
                 rand_idx = np.random.randint(0, len(random_viewpoint_stack))
                 viewpoint = random_viewpoint_stack[rand_idx]
                 if self.dynamic_model and self.gaussians.deform_init:
