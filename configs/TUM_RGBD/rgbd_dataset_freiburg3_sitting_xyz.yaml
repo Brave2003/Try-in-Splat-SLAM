@@ -30,3 +30,4 @@ tracking:
     thresh: 0.42
 mapping:
   first_s:  2.8471736907958984
+  shift: 1
