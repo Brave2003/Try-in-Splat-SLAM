@@ -24,7 +24,6 @@ import copy
 from thirdparty.gaussian_splatting.utils.graphics_utils import focal2fov
 import torchvision.transforms as transforms
 from ultralytics import YOLO
-from segment_anything import sam_model_registry
 def readEXR_onlydepth(filename):
     """
     Read depth data from EXR image file.
