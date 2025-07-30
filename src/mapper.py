@@ -158,9 +158,6 @@ class Mapper(object):
         self.set_hyperparams()
         self.device = torch.device(self.config['device'])
         self.static_msk = torch.from_numpy(static_msk).to(self.device)
-        if self.gaussians is None:
-            raise RuntimeError("高斯模型未初始化！")
-)
         self.frame_reader = get_dataset(
             self.config, device=self.device)
         if self.config["mapping"]["model_params"]["dynamic_model"]:
