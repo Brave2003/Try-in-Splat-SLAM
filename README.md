@@ -1,5 +1,5 @@
 <!-- PROJECT LOGO -->
-  <h1 align="center"><img src="./media/splat.png" alt="logo" width=60>MonoDy: Monocular Gaussian Splatting SLAM in Dynamic Scenes</h1>
+  <h1 align="center">Anonymous github</h1>
 
 
 <p align="center">
@@ -12,7 +12,7 @@ This is not an officially endorsed Google product.
 </p>
 
 <p align="center">
-<strong>MonoDy</strong>  Monocular Gaussian Splatting SLAM in Dynamic Scenes. 
+<strong>Anonymous github
 </p>
 
 <p align="center">
