@@ -156,6 +156,7 @@ class Mapper(object):
         self.cameras_extent = 6.0
         self.dyratio=0
         self.shift=self.config["mapping"]["shift"]
+        self.s=self.config["mapping"]["s"]
         self.set_hyperparams()
         self.device = torch.device(self.config['device'])
         self.static_msk = torch.from_numpy(static_msk).to(self.device)
@@ -510,7 +511,7 @@ class Mapper(object):
    
                 current_value = new_scale_alignFrame0[video_id]
 
-                if current_value is None or current_value > previous_value*1.1 or current_value*1.1<previous_value :
+                if current_value is None or current_value > previous_value*self.s or current_value*self.s<previous_value :
                     new_scale_alignFrame0[video_id] = previous_value
                     print(f"new，video_id={video_id} is: {new_scale_alignFrame0[video_id]}")
                 else:
