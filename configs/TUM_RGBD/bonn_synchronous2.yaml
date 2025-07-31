@@ -39,8 +39,8 @@ tracking:
     dynamic_frame: 123
 mapping:
   first_s: 2.4271233081817627
-  shift: 1
-  s: 1.1
+  shift: 1.1
+  s: 1.135
 ModelHiddenParams:
   position_lr_init: 0.00016
   position_lr_final: 0.00016
