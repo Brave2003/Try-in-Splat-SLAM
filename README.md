@@ -16,7 +16,7 @@ This is not an officially endorsed Google product.
 </p>
 
 <p align="center">
-    <img src="./media/framework.jpg" alt="framework" width="100%">
+    <img src="./media/framework.png" alt="framework" width="100%">
 </p>
 <p align="center">
 <strong>Anonymous Architecture</strong>.
@@ -125,6 +125,10 @@ wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.
 If it is not in the class segmented by the YOLO model, then optical flow can be cloned below to generate a mask.
 ```bash
 git clone https://github.com/zhengqili/Neural-Scene-Flow-Fields.git
+```
+Use YOLO and optical flow to generate a segmentation mask, then input it into SAM to obtain the final segmentation.
+```bash
+git clone https://github.com/facebookresearch/sam2.git
 ```
 ### Download flow model 
 download raft-things.pth directly from https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT
