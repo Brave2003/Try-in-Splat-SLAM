@@ -1427,7 +1427,7 @@ class Mapper(object):
                 order_mask = (viewpoint.depth > 0)
                 loss_order_depth = self.get_depth_order_loss(depth, viewpoint.depth, order_mask)
                 loss +=  0.1 * loss_order_depth#1e-3 * loss_depth +
-                if iteration < 7000:
+                if iteration < 7000: #Options
                     loss += 0.1 * self.get_loss_normal(depth, viewpoint)
                 else:
                     loss += 0.1 * self.get_loss_normal(depth, viewpoint) / 2
