@@ -60,8 +60,8 @@ class Tracker:
                 self.video.all_motion_masks = self.video.all_motion_masks[0:i]
             with torch.no_grad():
 
-                self.motion_filter.track(timestamp, image,depth,pose, intrinsic, mask)  # 运动滤波器跟踪
-                # 局部集束调整
+                self.motion_filter.track(timestamp, image,depth,pose, intrinsic, mask)  
+    
                 self.frontend()
 
             curr_kf_idx = self.video.counter.value-1
