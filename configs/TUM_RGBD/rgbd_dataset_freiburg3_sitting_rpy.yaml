@@ -27,7 +27,7 @@ cam:
 tracking:
   buffer: 1200
   motion_filter:
-    thresh: 1.3
+    thresh: 0.7
 mapping:
   first_s: 2.6950998306274414
   shift: 1.1
