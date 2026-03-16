@@ -3,7 +3,7 @@
 	url = https://github.com/camenduru/simple-knn.git
 [submodule "thirdparty/diff-gaussian-rasterization-w-pose"]
 	path = thirdparty/diff-gaussian-rasterization-w-pose
-	url = https://github.com/rmurai0610/diff-gaussian-rasterization-w-pose
+	url = https://github.com/Brave2003/diff-gaussian-rasterization-w-pose.git
 [submodule "thirdparty/evaluate_3d_reconstruction_lib"]
 	path = thirdparty/evaluate_3d_reconstruction_lib
 	url = https://github.com/eriksandstroem/evaluate_3d_reconstruction_lib.git
