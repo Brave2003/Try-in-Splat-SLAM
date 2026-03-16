@@ -48,13 +48,14 @@ This is not an officially endorsed Google product.
 ## Installation
 1. Clone the repo using the `--recursive` flag 
 ```bash
-git clone --recursive https://github.com/enterfutures/Anonymous.git
+git clone --recursive https://github.com/Brave2003/Try-in-Splat-SLAM.git
+mv Try-in-Splat-SLAM Anonymous   # 可选：保持项目目录名为 Anonymous
 cd Anonymous
 ```
-2. Creating a new conda environment. 
+2. Creating a new conda environment (recommended name: `splat`). 
 ```bash
-conda create --name Anonymous python=3.10
-conda activate Anonymous
+conda create --name splat python=3.10
+conda activate splat
 ```
 3. Install CUDA 11.7 using conda and torch 1.13.1
 ```bash
