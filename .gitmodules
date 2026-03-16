@@ -7,9 +7,9 @@
 [submodule "thirdparty/evaluate_3d_reconstruction_lib"]
 	path = thirdparty/evaluate_3d_reconstruction_lib
 	url = https://github.com/eriksandstroem/evaluate_3d_reconstruction_lib.git
-[submodule "thirdparty/lietorch"]
-	path = thirdparty/lietorch
-	url = https://github.com/princeton-vl/lietorch.git
 [submodule "thirdparty/sam2"]
 	path = thirdparty/sam2
 	url = https://github.com/facebookresearch/sam2.git
+[submodule "thirdparty/lietorch"]
+	path = thirdparty/lietorch
+	url = https://github.com/princeton-vl/lietorch.git
