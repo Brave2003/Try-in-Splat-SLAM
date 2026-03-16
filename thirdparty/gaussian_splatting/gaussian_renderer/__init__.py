@@ -271,7 +271,7 @@ def render(
             del drot
         else:
             print("⚠️  Warning: dx/ds/dr provided but pc.dygs does not exist, skipping dynamic deformation")
-
+    
     # PGSR-style: when return_normal=True, compute normal_precomp in caller so grad flows through scales/rotation automatically.
     normal_precomp = None
     if return_normal:
@@ -284,7 +284,7 @@ def render(
         normal_precomp = compute_shortest_axis_view(_scales, _rotations, means3D, campos, viewmatrix)
         if mask is not None:
             normal_precomp = normal_precomp[mask]
-
+    
     # ========== Rasterize visible Gaussians to image (单 pass 可同时输出 color + normal) ==========
     if mask is not None:
         # Use mask for selective rendering
@@ -547,4 +547,5 @@ def get_dynamic_mask(
 
         static_mask = position_mask & scale_mask & direction_mask
         return static_mask
+
 

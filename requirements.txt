@@ -10,7 +10,7 @@ pyopengl-accelerate==3.1.6
 pyrender==0.1.43
 ninja==1.10.2.4
 setuptools==65.5.0
-torch-scatter==2.0.9
+# torch-scatter==2.0.9
 timm==0.6.12
 plyfile==0.8.1
 tqdm==4.64.1

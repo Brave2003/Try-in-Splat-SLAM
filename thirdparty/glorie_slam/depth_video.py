@@ -133,10 +133,10 @@ class DepthVideo:
 
 
         if item[4] is not None:
-            save_dir = os.path.join("output", "depth_out")
-            os.makedirs(save_dir, exist_ok=True)
-            file_name = f"depth_{index:04d}.png"
-            file_path = os.path.join(save_dir, file_name)
+            # save_dir = os.path.join("output", "depth_out")
+            # os.makedirs(save_dir, exist_ok=True)
+            # file_name = f"depth_{index:04d}.png"
+            # file_path = os.path.join(save_dir, file_name)
             mono_depth = item[4][self.down_scale//2-1::self.down_scale,
                                  self.down_scale//2-1::self.down_scale]
             self.mono_disps[index] = torch.where(mono_depth>0, 1.0/mono_depth, 0)

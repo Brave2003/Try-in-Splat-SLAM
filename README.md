@@ -70,7 +70,71 @@ python -c "import torch; print(torch.cuda.is_available())"
 ```bash
 if (p_view.z <= 0.001f)// || ((p_proj.x < -1.3 || p_proj.x > 1.3 || p_proj.y < -1.3 || p_proj.y > 1.3)))
 ```
-5. Install the remaining dependencies.
+5. (可选，但强烈推荐) 安装 SAM2 环境与依赖（用于动态掩码 SAM 精修）
+
+> SAM2 代码已作为子模块放在 `thirdparty/sam2` 下。我们建议使用**单独的 conda 环境（默认名为 `sam2env`）**来安装 SAM2，避免与主环境依赖冲突。  
+> 下面给出按照官方推荐“最佳配置”的安装方式（参考 `thirdparty/sam2/INSTALL.md`）：
+>
+> - Linux  
+> - Python ≥ 3.10  
+> - PyTorch ≥ 2.5.1 + 匹配的 `torchvision`（建议直接用 [pytorch.org](https://pytorch.org/) 提供的一键命令，默认 CUDA 12.1）  
+> - CUDA Toolkit 版本与 PyTorch 对应（若用官网默认命令，则通常是 CUDA 12.1）
+
+```bash
+conda deactivate
+# 创建并激活 sam2env（Python 3.10）
+conda create -n sam2env python=3.10
+conda activate sam2env
+
+# 从 https://pytorch.org 选择 Linux + Pip + CUDA 12.1 的推荐命令，例如（示例，实际请以官网为准）：
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# 在 sam2 子模块目录下按官方方式安装 SAM2（含 notebooks 依赖）
+cd thirdparty/sam2
+pip install -e ".[notebooks]"
+
+# 若只想安装 CPU 版本或跳过 CUDA 后处理扩展，可使用：
+# SAM2_BUILD_CUDA=0 pip install -e ".[notebooks]"
+
+# 安装完成后返回主工程目录
+cd ../../
+```
+
+`utils/sam2_bridge.py` 默认会按如下规则寻找 SAM2 环境：
+
+- 优先使用环境变量：
+  - `SAM2_PYTHON`：显式指定用于运行 `run_sam2_once.py` 的 Python 解释器；
+  - `SAM2_ENV_PREFIX`：指定 SAM2 conda 环境前缀路径（例如 `/opt/miniconda3/envs/sam2env`）；
+  - `SAM2_ENV_NAME`：仅指定环境名，默认与 `CONDA_ROOT` 组合；
+  - `CONDA_ROOT`：若未设置，则默认 `~/miniconda3`。
+- 若以上均未设置，则回退到：`~/miniconda3/envs/sam2env/bin/python`。
+
+如果你在非默认位置安装了 conda 或 SAM2 环境，只需在运行前设置对应的环境变量，例如：
+
+```bash
+export CONDA_ROOT=/data/opt/miniconda3
+export SAM2_ENV_NAME=sam2env
+# 或直接设置
+# export SAM2_PYTHON=/data/opt/miniconda3/envs/sam2env/bin/python
+```
+
+6. Install the remaining dependencies.
+> 后面加上参数 --no-build-isolation ， 避免显示没有torch报错
+> simple-knn 如果编译不过，可以尝试 创建 
+> ``` bash
+> thirdparty/simple-knn/simple_knn/__init__.py
+> ```
+> 然后写入 
+> ``` bash
+> from . import _C
+> ```
+> 并在  thirdparty/simple-knn/setup.py 添加
+> ``` diff
+> name="simple_knn",
+> packages=["simple_knn"],
+> ```
+> 仅供参考
+
 ```bash
 python -m pip install -e thirdparty/lietorch/
 python -m pip install -e thirdparty/diff-gaussian-rasterization-w-pose/
@@ -78,23 +142,23 @@ python -m pip install -e thirdparty/simple-knn/
 python -m pip install -e thirdparty/evaluate_3d_reconstruction_lib/
 ```
 
-6. Check installation.
+1. Check installation.
 ```bash
-python -c "import torch; import lietorch; import simple_knn; import
-diff_gaussian_rasterization; print(torch.cuda.is_available())"
+python -c "import torch; import lietorch; import simple_knn; import diff_gaussian_rasterization; print(torch.cuda.is_available())"
 ```
 
-7. Now install the droid backends and the other requirements
+1. Now install the droid backends and the other requirements
 ```bash
 python -m pip install -e .
+pip install "torch-scatter==2.0.9" --no-build-isolation
 python -m pip install -r requirements.txt
 python -m pip install pytorch-lightning==1.9 --no-deps
 pip install lightning-utilities==0.4.2
 pip install ultralytics
-pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+pip install "git+https://github.com/facebookresearch/pytorch3d.git"  --no-build-isolation
 ```
 
-8. Download pretrained models (统一放在 `pretrained/` 下，推荐一键脚本).
+1. Download pretrained models (统一放在 `pretrained/` 下，推荐一键脚本).
 ```bash
 # 在项目根目录执行，将下载 droid / depth_anything_v2_vitl / yolo11l-seg / sam2.1_hiera_base_plus / raft-things（光流）
 bash scripts/download_pretrained.sh

@@ -15,7 +15,6 @@ import os
 from PIL import Image
 from click import pass_context
 import cv2
-from kornia import depth
 import torch.nn.functional as F
 import numpy as np
 import open3d as o3d

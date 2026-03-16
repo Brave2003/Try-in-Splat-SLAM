@@ -26,53 +26,53 @@ echo "========== 下载到 $PRETRAINED =========="
 
 # 1. yolo11l-seg.pt
 if [ -f "yolo11l-seg.pt" ]; then
-    echo "[跳过] yolo11l-seg.pt 已存在"
-else
-    echo "[下载] yolo11l-seg.pt ..."
-    download yolo11l-seg.pt "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.pt" || {
-        echo "失败: yolo11l-seg.pt"; exit 1;
-    }
+    echo "[删除] 旧的 yolo11l-seg.pt"
+    rm -f "yolo11l-seg.pt"
 fi
+echo "[下载] yolo11l-seg.pt ..."
+download yolo11l-seg.pt "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.pt" || {
+    echo "失败: yolo11l-seg.pt"; exit 1;
+}
 
 # 2. sam2.1_hiera_base_plus.pt
 if [ -f "sam2.1_hiera_base_plus.pt" ]; then
-    echo "[跳过] sam2.1_hiera_base_plus.pt 已存在"
-else
-    echo "[下载] sam2.1_hiera_base_plus.pt ..."
-    download sam2.1_hiera_base_plus.pt "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt" || {
-        echo "失败: sam2.1_hiera_base_plus.pt"; exit 1;
-    }
+    echo "[删除] 旧的 sam2.1_hiera_base_plus.pt"
+    rm -f "sam2.1_hiera_base_plus.pt"
 fi
+echo "[下载] sam2.1_hiera_base_plus.pt ..."
+download sam2.1_hiera_base_plus.pt "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt" || {
+    echo "失败: sam2.1_hiera_base_plus.pt"; exit 1;
+}
 
 # 3. depth_anything_v2_vitl.pth
 if [ -f "depth_anything_v2_vitl.pth" ]; then
-    echo "[跳过] depth_anything_v2_vitl.pth 已存在"
-else
-    echo "[下载] depth_anything_v2_vitl.pth ..."
-    download depth_anything_v2_vitl.pth "https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth" || {
-        echo "失败: depth_anything_v2_vitl.pth"; exit 1;
-    }
+    echo "[删除] 旧的 depth_anything_v2_vitl.pth"
+    rm -f "depth_anything_v2_vitl.pth"
 fi
+echo "[下载] depth_anything_v2_vitl.pth ..."
+download depth_anything_v2_vitl.pth "https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth" || {
+    echo "失败: depth_anything_v2_vitl.pth"; exit 1;
+}
 
 # 4. droid.pth
 if [ -f "droid.pth" ]; then
-    echo "[跳过] droid.pth 已存在"
-else
-    echo "[下载] droid.pth ..."
-    download droid.pth "https://huggingface.co/vslamlab/droidslam/resolve/main/droid.pth" || {
-        echo "失败: droid.pth (可尝试从 Google Drive 下载: https://drive.google.com/file/d/1oZbVPrubtaIUjRRuT8F-YjjHBW-1spKT)"; exit 1;
-    }
+    echo "[删除] 旧的 droid.pth"
+    rm -f "droid.pth"
 fi
+echo "[下载] droid.pth ..."
+download droid.pth "https://huggingface.co/vslamlab/droidslam/resolve/main/droid.pth" || {
+    echo "失败: droid.pth (可尝试从 Google Drive 下载: https://drive.google.com/file/d/1oZbVPrubtaIUjRRuT8F-YjjHBW-1spKT)"; exit 1;
+}
 
 # 5. raft-things.pth (光流 RAFT)
 if [ -f "raft-things.pth" ]; then
-    echo "[跳过] raft-things.pth 已存在"
-else
-    echo "[下载] raft-things.pth (RAFT 光流) ..."
-    download raft-things.pth "https://huggingface.co/ddrfan/RAFT/resolve/main/raft-things.pth" || {
-        echo "失败: raft-things.pth (可尝试: https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT)"; exit 1;
-    }
+    echo "[删除] 旧的 raft-things.pth"
+    rm -f "raft-things.pth"
 fi
+echo "[下载] raft-things.pth (RAFT 光流) ..."
+download raft-things.pth "https://huggingface.co/ddrfan/RAFT/resolve/main/raft-things.pth" || {
+    echo "失败: raft-things.pth (可尝试: https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT)"; exit 1;
+}
 
 echo "========== 全部下载完成 =========="
 ls -la "$PRETRAINED"

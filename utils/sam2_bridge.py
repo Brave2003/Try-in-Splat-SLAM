@@ -13,13 +13,25 @@ import imageio.v2 as imageio  # 可换成 cv2.imwrite
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 # 工程根目录：try
 PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, ".."))
-# SAM2 目录：try/sam2
-SAM2_DIR = os.path.join(PROJECT_ROOT, "sam2")
+# SAM2 目录：try/thirdparty/sam2
+SAM2_DIR = os.path.join(PROJECT_ROOT, "thirdparty", "sam2")
 
 # run_sam2_once.py 的绝对路径
 SAM2_RUNNER_PY = os.path.join(SAM2_DIR, "run_sam2_once.py")
-SAM2_ENV_NAME = "/home/xuzhifeng/miniconda3/envs/sam2env"
-SAM2_PYTHON = os.path.join(SAM2_ENV_NAME, "bin", "python")
+
+# 默认的 conda 根目录与环境名（相对当前用户的 $HOME）
+DEFAULT_CONDA_ROOT = os.path.expanduser(os.environ.get("CONDA_ROOT", "~/miniconda3"))
+DEFAULT_SAM2_ENV_NAME = os.environ.get("SAM2_ENV_NAME", "sam2env")
+
+# SAM2 环境前缀与 Python 路径（可通过环境变量覆盖）
+SAM2_ENV_PREFIX = os.environ.get(
+    "SAM2_ENV_PREFIX",
+    os.path.join(DEFAULT_CONDA_ROOT, "envs", DEFAULT_SAM2_ENV_NAME),
+)
+SAM2_PYTHON = os.environ.get(
+    "SAM2_PYTHON",
+    os.path.join(SAM2_ENV_PREFIX, "bin", "python"),
+)
 
 # cfg 用相对名字，让 Hydra 去 sam2 包里找
 SAM2_CFG = "configs/sam2.1/sam2.1_hiera_b+.yaml"

@@ -16,13 +16,11 @@ import numpy as np
 import torch
 import argparse
 import os
-from torch.cuda import memory_reserved, empty_cache
 from thirdparty.glorie_slam import config
 from src.slam import SLAM
 from src.utils.datasets import get_dataset
 from time import gmtime, strftime
 from colorama import Fore,Style
-from ultralytics import YOLO
 import random
 def setup_seed(seed):
     torch.manual_seed(seed)

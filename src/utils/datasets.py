@@ -474,6 +474,7 @@ class BaseDataset(Dataset):
             self.load_yolo()  # 使用 self.yolo_pretrained（来自 cfg data.yolo_pretrained）
             # print("yolo true")
         color_data = color_data.unsqueeze(dim=0)  # [1, 3, h, w]
+        mono_data = None
         if self.mono_paths:
             mono_data=self.mono_paths[index]
             mono_data= np.load(mono_data)

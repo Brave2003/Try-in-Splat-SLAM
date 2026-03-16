@@ -438,7 +438,9 @@ def run_sam2_with_flow_dino(
     img_t = vp_t.original_image
     img_np = img_t.permute(1, 2, 0).cpu().numpy()
     img_u8 = (img_np * 255.0).clip(0, 255).astype(np.uint8) if img_np.max() <= 1.0 else img_np.astype(np.uint8)
-    tmp_root = os.path.join("/home/xuzhifeng/try", "sam2", "io")
+    # 使用项目根目录下的相对路径：<project_root>/thirdparty/sam2/io
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    tmp_root = os.path.join(project_root, "thirdparty", "sam2", "io")
     
     # 暂不使用 neg_seed_np，负样本传全零
     neg_for_sam = np.zeros_like(pos_seed_np, dtype=np.uint8)
