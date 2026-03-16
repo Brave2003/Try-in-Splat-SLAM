@@ -111,97 +111,111 @@ def get_loss_tracking_rgbd(
     return (1 - alpha) * l1_rgb + alpha * l1_depth.mean()
 
 
+# ---------------------------------------------------------------------------
+# Mapping loss：统一为  w_rgb * L1_rgb + w_depth * L1_depth，掩码与权重均从 config 读取
+# ---------------------------------------------------------------------------
+
+def _get_mapping_loss_config(config):
+    """从 config['Training'] 读取 mapping loss 权重与阈值，避免散落魔法数。"""
+    t = config.get("Training", config)
+    return {
+        "alpha": t.get("alpha", 0.9),                    # RGB 权重，深度权重 = 1 - alpha
+        "rgb_boundary_threshold": t.get("rgb_boundary_threshold", 0.01),
+        "depth_min": t.get("depth_min", 0.01),
+        "depth_max": t.get("depth_max", 10000.0),
+        "dynamic_region_weight": t.get("dynamic_region_weight", 1.0),  # 动态区域 L1 权重倍数，1 表示不加重
+    }
+
+
 def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False, alpha=None, rm_dynamic=False,
                      mask=None, dynamic=False, split=False):
     if initialization:
         image_ab = image
     else:
         image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
-    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint, alpha=alpha, rm_dynamic=rm_dynamic, mask=mask,
-                                 dynamic=dynamic, split=split)
+    return get_loss_mapping_rgbd(
+        config, image_ab, depth, viewpoint,
+        alpha=alpha, rm_dynamic=rm_dynamic, mask=mask, dynamic=dynamic, split=split,
+    )
 
 
 def get_loss_mapping_rgb(config, image, depth, viewpoint):
+    """纯 RGB L1，用于 monocular 模式。"""
+    cfg = _get_mapping_loss_config(config)
     gt_image = viewpoint.original_image.cuda()
     _, h, w = gt_image.shape
     mask_shape = (1, h, w)
-    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-
-    return l1_rgb.mean()
+    th = cfg["rgb_boundary_threshold"]
+    rgb_mask = (gt_image.sum(dim=0) > th).view(*mask_shape)
+    l1_rgb = torch.abs(image * rgb_mask - gt_image * rgb_mask)
+    n = (rgb_mask.sum() * 3).float().clamp(min=1e-8)
+    return (l1_rgb * rgb_mask.unsqueeze(0)).sum() / n
 
 
 def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False, alpha=None, rm_dynamic=False,
                           mask=None, dynamic=False, split=False):
-    alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
-    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+    """
+    统一 mapping 重建损失：L = w_rgb * L1_rgb + w_depth * L1_depth。
+    - 有效像素：rgb_boundary_threshold 过滤黑边，depth 在 [depth_min, depth_max]。
+    - rm_dynamic=True 时用 motion_mask 只保留静态区域；mask 额外与有效区域交。
+    - dynamic=True 时对动态区域误差乘 dynamic_region_weight（配置项，默认 1.0）。
+    - split=True 时返回 (loss_static, loss_dynamic) 供外部加权。
+    """
+    cfg = _get_mapping_loss_config(config)
+    w_rgb = alpha if alpha is not None else cfg["alpha"]
+    w_depth = 1.0 - w_rgb
+    th_rgb = cfg["rgb_boundary_threshold"]
+    d_min, d_max = cfg["depth_min"], cfg["depth_max"]
+    dyn_weight = cfg["dynamic_region_weight"]
+
     gt_image = viewpoint.original_image.cuda()
-    _, h, w = gt_image.shape
-    mask_shape = (1, h, w)
     if not isinstance(viewpoint.depth, torch.Tensor):
-        viewpoint.depth = torch.from_numpy(viewpoint.depth)  # 强制转换为 Tensor
-    gt_depth = (viewpoint.depth).to(
-        dtype=torch.float32, device=image.device
-    )[None]
-    # gt_depth = torch.from_numpy(viewpoint.depth).to(
-    #     dtype=torch.float32, device=image.device
-    # )[None]
-    # gt_depth = (viewpoint.depth).to(
-    #     dtype=torch.float32, device=image.device
-    # )[None]
-    #gt_depth = torch.tensor(viewpoint.depth).to(image.device)[None]
-    loss = 0
-    # if config["Training"]["ssim_loss"]:
-    #     ssim_loss = 1.0 - ssim(image, gt_image)
+        viewpoint.depth = torch.from_numpy(np.asarray(viewpoint.depth)).float()
+    gt_depth = viewpoint.depth.to(dtype=torch.float32, device=image.device)[None]
 
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-    # if config["Training"]["ssim_loss"]:
-    #     hyperparameter = config["opt_params"]["lambda_dssim"]
-    #     loss += (1.0 - hyperparameter) * l1_rgb + hyperparameter * ssim_loss
-    # else:
-    #     loss += l1_rgb
+    # 有效区域掩码
+    rgb_mask = (gt_image.sum(dim=0) > th_rgb).view(*depth.shape)
+    depth_mask = (gt_depth > d_min).view(*depth.shape) & (gt_depth < d_max).view(*depth.shape)
 
-    depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
-    depth_pixel_mask *= (gt_depth < 10000.).view(*depth.shape)
-    if viewpoint.motion_mask is not None and rm_dynamic:  # and viewpoint.uid>0:
-        rgb_pixel_mask = viewpoint.motion_mask.view(*depth.shape) * rgb_pixel_mask
-        depth_pixel_mask = viewpoint.motion_mask.view(*depth.shape) * depth_pixel_mask
+    if viewpoint.motion_mask is not None and rm_dynamic:
+        m = viewpoint.motion_mask.view(*depth.shape)
+        rgb_mask = rgb_mask & m
+        depth_mask = depth_mask & m
     if mask is not None and rm_dynamic:
-        rgb_pixel_mask = mask.view(*depth.shape) * rgb_pixel_mask
-        depth_pixel_mask = mask.view(*depth.shape) * depth_pixel_mask
+        m = mask.view(*depth.shape)
+        rgb_mask = rgb_mask & m
+        depth_mask = depth_mask & m
 
-    if split:
-        motion_mask = viewpoint.motion_mask.view(*depth.shape)
-        l1_static = alpha * torch.abs(
-            motion_mask * rgb_pixel_mask * image - motion_mask * rgb_pixel_mask * gt_image).mean()
-        l1_static += (1 - alpha) * torch.abs(
-            motion_mask * depth_pixel_mask * depth - motion_mask * depth_pixel_mask * gt_depth).mean()
+    l1_rgb = torch.abs(image * rgb_mask - gt_image * rgb_mask)
+    l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
 
-        l1_dynamic = alpha * torch.abs(
-            (~motion_mask) * rgb_pixel_mask * image - (~motion_mask) * rgb_pixel_mask * gt_image).mean()
-        l1_dynamic += (1 - alpha) * torch.abs(
-            (~motion_mask) * depth_pixel_mask * depth - (~motion_mask) * depth_pixel_mask * gt_depth).mean()
+    if split and viewpoint.motion_mask is not None:
+        motion = viewpoint.motion_mask.view(*depth.shape)
+        sm = (rgb_mask & motion).float()
+        dm = (depth_mask & motion).float()
+        static_rgb = (l1_rgb * sm.unsqueeze(0)).sum() / (sm.sum() * 3 + 1e-8)
+        static_depth = (l1_depth * dm).sum() / (dm.sum() + 1e-8)
+        sm_d = (rgb_mask & ~motion).float()
+        dm_d = (depth_mask & ~motion).float()
+        dyn_rgb = (l1_rgb * sm_d.unsqueeze(0)).sum() / (sm_d.sum() * 3 + 1e-8)
+        dyn_depth = (l1_depth * dm_d).sum() / (dm_d.sum() + 1e-8)
+        loss_static = w_rgb * static_rgb + w_depth * static_depth
+        loss_dynamic = w_rgb * dyn_rgb + w_depth * dyn_depth
         if dynamic:
-            return l1_static, 2 * l1_dynamic
-        else:
-            return l1_static, l1_dynamic
-    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
-    if dynamic:
-        if mask is not None:
-            # l1_depth[(~viewpoint.motion_mask.view(*depth.shape)) | (~mask.view(*depth.shape))] *= 5
-            # l1_rgb[((~viewpoint.motion_mask.view(*depth.shape)) | (~mask.view(*depth.shape))).repeat(3, 1, 1)] *= 5
-            l1_depth[mask.view(*depth.shape).bool().detach() | ~viewpoint.motion_mask.view(*depth.shape).detach()] *= 2
-            l1_rgb[mask.view(*depth.shape).repeat(3, 1, 1).bool().detach() | ~viewpoint.motion_mask.view(
-                *depth.shape).repeat(3, 1, 1).detach()] *= 2
-            # l1_rgb[((~viewpoint.motion_mask.view(*depth.shape)) | (mask.view(*depth.shape))).repeat(3, 1, 1)] *= 3 ����ã���
-        else:
-            l1_depth[~viewpoint.motion_mask.view(*depth.shape)] *= 2
-            l1_rgb[~viewpoint.motion_mask.view(*depth.shape).repeat(3, 1, 1)] *= 2
+            return loss_static, dyn_weight * loss_dynamic
+        return loss_static, loss_dynamic
 
-    return alpha * l1_rgb.mean() +  (1-alpha)*l1_depth.mean()
+    # 动态区域加权：对非静态像素的误差乘 dyn_weight
+    if dynamic and viewpoint.motion_mask is not None and dyn_weight != 1.0:
+        non_static = ~viewpoint.motion_mask.view(*depth.shape)
+        l1_rgb = l1_rgb * (1.0 + (dyn_weight - 1.0) * non_static.unsqueeze(0).float())
+        l1_depth = l1_depth * (1.0 + (dyn_weight - 1.0) * non_static.float())
+
+    n_rgb = rgb_mask.sum().float().clamp(min=1e-8)
+    n_depth = depth_mask.sum().float().clamp(min=1e-8)
+    loss_rgb = (l1_rgb * rgb_mask).sum() / n_rgb
+    loss_depth = (l1_depth * depth_mask).sum() / n_depth
+    return w_rgb * loss_rgb + w_depth * loss_depth
 
 
 def depth_loss_dpt(pred_depth, gt_depth, weight=None):

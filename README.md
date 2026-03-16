@@ -93,8 +93,11 @@ pip install ultralytics
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
 ```
 
-8. Download pretrained model.
-Download the pretained models from [Google Drive](https://drive.google.com/file/d/1oZbVPrubtaIUjRRuT8F-YjjHBW-1spKT/view?usp=drive_link), unzip them inside the `pretrained` folder. The `middle_fine.pt``omnidata_dpt_depth_v2.ckpt` decoder will not be used and can be removed.
+8. Download pretrained models (统一放在 `pretrained/` 下，推荐一键脚本).
+```bash
+# 在项目根目录执行，将下载 droid / depth_anything_v2_vitl / yolo11l-seg / sam2.1_hiera_base_plus / raft-things（光流）
+bash scripts/download_pretrained.sh
+```
 <details>
   <summary>[Directory structure of pretrained (click to expand)]</summary>
   
@@ -103,25 +106,16 @@ Download the pretained models from [Google Drive](https://drive.google.com/file/
   └── pretrained
         ├── .gitkeep
         ├── droid.pth
-        ├── middle_fine.pt
-        └── omnidata_dpt_depth_v2.ckpt
-
+        ├── depth_anything_v2_vitl.pth
+        ├── yolo11l-seg.pt
+        ├── sam2.1_hiera_base_plus.pt
+        └── raft-things.pth
 ```
 </details>
 
-
-
 ## Data Download
-### Download depth_anything_v2_vitl.pth
-```bash
-cd pretrained
-wget https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
-```
-### Download yolo11l-seg.pt
-```bash
-cd Anonymous
-wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l-seg.pt
-```
+### 预训练模型（已由上面脚本覆盖）
+若需手动下载：depth_anything_v2_vitl、yolo11l-seg、sam2.1_hiera_base_plus、droid、raft-things 均放入 `pretrained/`，参见 `scripts/download_pretrained.sh` 中的 URL。
 If it is not in the class segmented by the YOLO model, then optical flow can be cloned below to generate a mask.
 ```bash
 git clone https://github.com/zhengqili/Neural-Scene-Flow-Fields.git
@@ -130,14 +124,8 @@ Use YOLO and optical flow to generate a segmentation mask, then input it into SA
 ```bash
 git clone https://github.com/facebookresearch/sam2.git
 ```
-### Download flow model 
-download raft-things.pth directly from https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT
-
-
-download gma-things.pth
-```
-https://github.com/zacjiang/GMA/blob/main/checkpoints/gma-things.pth
-```
+### 光流模型
+`raft-things.pth` 已由 `scripts/download_pretrained.sh` 下载到 `pretrained/`。若需 GMA 可选：`gma-things.pth` 见 https://github.com/zacjiang/GMA/blob/main/checkpoints/gma-things.pth，放入 `pretrained/` 后可在代码中改为使用 `pretrained/gma-things.pth`。
 ### TUM-RGBD
 ```bash
 bash scripts/download_tum.sh
@@ -173,6 +161,8 @@ Our codebase is partially based on [splat-SLAM](https://github.com/google-resear
 ## Reproducibility
 There may be minor differences between the released codebase and the results reported in the paper. Further, we note that the GPU hardware has an influence, despite running the same seed and conda environment.
 
+## 提交到自己的 GitHub 仓库
+若要将本仓库整理后推送到你自己的 GitHub，请参阅 [GITHUB_PUSH.md](GITHUB_PUSH.md)。
 
 
 

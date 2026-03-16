@@ -143,44 +143,24 @@ class SLAM:
 
     def terminate(self):
         """ fill poses for non-keyframe images and evaluate """
-        print("final",self.cfg['mapping']['eval_before_final_ba'])
-        print("before",self.cfg['mapping']['eval_before_final_ba'])
-        if self.cfg['tracking']['backend']['final_ba'] and self.cfg['mapping']['eval_before_final_ba']:
-            print("enter")
+        if self.cfg["tracking"]["backend"]["final_ba"] and self.cfg["mapping"]["eval_before_final_ba"]:
             self.video.save_video(f"{self.save_dir}/video.npz")
             try:
                 ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
                     f"{self.save_dir}/video.npz",
                     f"{self.save_dir}/traj",
-                    "kf_traj",self.stream,self.logger,self.printer)
+                    "kf_traj", self.stream, self.logger, self.printer)
             except Exception as e:
-                self.printer.print(e,FontColor.ERROR)
+                self.printer.print(e, FontColor.ERROR)
 
-            if not self.only_tracking: 
-                # prepare aligned camera list of mapped frames
-                traj_est_aligned = []
-                cams = self.mapper.cameras
-                for kf_idx in self.mapper.video_idxs:
-                    traj_est_aligned.append(np.linalg.inv(gen_pose_matrix(cams[kf_idx].R, cams[kf_idx].T)))
-
-                traj_est_aligned = PosePath3D(poses_se3=traj_est_aligned)
-                traj_est_aligned.scale(global_scale)
-                traj_est_aligned.transform(lie.se3(r_a, t_a))
-                rendering_result = eval_rendering(
-                    self.mapper,
-                    self.save_dir,
+            if not self.only_tracking:
+                _prepare_traj_and_eval_rendering(
+                    self, global_scale, r_a, t_a,
                     iteration="before_refine",
-                    monocular=True,
                     mesh=self.cfg["meshing"]["mesh_before_final_ba"],
-                    traj_est_aligned=list(traj_est_aligned.poses_se3),
-                    global_scale=global_scale,
-                    scene=self.cfg['scene'],
-                    eval_mesh=True if self.cfg['dataset'] == 'replica' else False,
-                    gt_mesh_path=self.cfg['meshing']['gt_mesh_path']
                 )
-                print("out")
 
-        if self.cfg['tracking']['backend']['final_ba']:
+        if self.cfg["tracking"]["backend"]["final_ba"]:
             self.backend()
 
         self.video.save_video(f"{self.save_dir}/video.npz")
@@ -188,36 +168,18 @@ class SLAM:
             ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
                 f"{self.save_dir}/video.npz",
                 f"{self.save_dir}/traj",
-                "kf_traj",self.stream,self.logger,self.printer)
+                "kf_traj", self.stream, self.logger, self.printer)
         except Exception as e:
-            self.printer.print(e,FontColor.ERROR)
+            self.printer.print(e, FontColor.ERROR)
 
         if not self.only_tracking:
-            if self.cfg['tracking']['backend']['final_ba']:
-                # The final refine method includes the final update of the poses and depths
-                self.mapper.final_refine(iters=self.cfg["mapping"]["final_refine_iters"]) # this performs a set of optimizations with RGBD loss to correct
+            if self.cfg["tracking"]["backend"]["final_ba"]:
+                self.mapper.final_refine(iters=self.cfg["mapping"]["final_refine_iters"])
 
-            # prepare aligned camera list of mapped frames
-            traj_est_aligned = []
-            cams = self.mapper.cameras
-            for kf_idx in self.mapper.video_idxs:
-                traj_est_aligned.append(np.linalg.inv(gen_pose_matrix(cams[kf_idx].R, cams[kf_idx].T)))
-
-            traj_est_aligned = PosePath3D(poses_se3=traj_est_aligned)
-            traj_est_aligned.scale(global_scale)
-            traj_est_aligned.transform(lie.se3(r_a, t_a))
-            # evaluate the metrics
-            rendering_result = eval_rendering(
-                self.mapper,
-                self.save_dir,
+            _prepare_traj_and_eval_rendering(
+                self, global_scale, r_a, t_a,
                 iteration="after_refine",
-                monocular=True,
                 mesh=self.cfg["meshing"]["mesh"],
-                traj_est_aligned=list(traj_est_aligned.poses_se3),
-                global_scale=global_scale,
-                scene=self.cfg['scene'],
-                eval_mesh=True if self.cfg['dataset'] == 'replica' else False,
-                gt_mesh_path=self.cfg['meshing']['gt_mesh_path']
             )
 
         # evaluate depth error
@@ -284,3 +246,26 @@ def gen_pose_matrix(R, T):
     pose[0:3, 0:3] = R.cpu().numpy()
     pose[0:3, 3] = T.cpu().numpy()
     return pose
+
+
+def _prepare_traj_and_eval_rendering(slam, global_scale, r_a, t_a, iteration, mesh):
+    """根据当前 mapper 位姿与对齐参数构建轨迹并调用 eval_rendering，避免 terminate 内重复代码。"""
+    traj_est_aligned = []
+    cams = slam.mapper.cameras
+    for kf_idx in slam.mapper.video_idxs:
+        traj_est_aligned.append(np.linalg.inv(gen_pose_matrix(cams[kf_idx].R, cams[kf_idx].T)))
+    traj_est_aligned = PosePath3D(poses_se3=traj_est_aligned)
+    traj_est_aligned.scale(global_scale)
+    traj_est_aligned.transform(lie.se3(r_a, t_a))
+    return eval_rendering(
+        slam.mapper,
+        slam.save_dir,
+        iteration=iteration,
+        monocular=True,
+        mesh=mesh,
+        traj_est_aligned=list(traj_est_aligned.poses_se3),
+        global_scale=global_scale,
+        scene=slam.cfg["scene"],
+        eval_mesh=True if slam.cfg["dataset"] == "replica" else False,
+        gt_mesh_path=slam.cfg["meshing"]["gt_mesh_path"],
+    )

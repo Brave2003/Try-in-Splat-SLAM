@@ -146,7 +146,6 @@ def eval_rendering(
         # compute depth errors
         #depth_mask = (depth > 0) * (gt_depth > 0)
         depth_mask= gt_depth>0
-        print("gaussians.deform_init",gaussians.deform_init)
         if not gaussians.deform_init:
             #print("eval remove motion region")
             mask = mask * motion_mask.view(*depth_mask.shape) * torch.from_numpy(depth_mask).to(device=motion_mask.device)

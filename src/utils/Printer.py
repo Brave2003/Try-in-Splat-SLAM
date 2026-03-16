@@ -61,6 +61,7 @@ class Printer(TrivialPrinter):
     def print(self,msg:str,color=None):
         msg_prefix = get_msg_prefix(color)
         msg = msg_prefix + msg + Style.RESET_ALL
+        # Queue message for the printer process to avoid mixed console output.
         with self.msg_lock:
             self.msg_queue.put(msg)
     def update_pbar(self):

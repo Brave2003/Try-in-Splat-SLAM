@@ -1,18 +1,65 @@
-__pycache__
-GO-SLAM
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+*.so
+
+# Build / install
+build/
+dist/
+*.egg
+*.egg-info/
+*.egg-info
+*.eggs/
+*.manifest
+*.spec
+install_requires.txt
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+
+# Logs and outputs
+log/
+*.log
+*log
+nohup.out
+output/
+evaluate_on*
+
+# Model weights and checkpoints (too large for git)
 *.pth
 *.pt
-*.pyc
+*.ckpt
+*.onnx
+
+# Project-specific
+GO-SLAM
 keyframeidx.txt
 SUMMARY
-.vscode
-*.code-workspace
 *test.sh
-build
-log
-evaluate_on*
 depth_estimator
-wandb
+wandb/
 cull_replica_mesh
-*.egg*
 euler/
+Neural-Scene-Flow-Fields/
+cofusin mask_output/
+*mask_output/
+sam2/io
+
+# Optional: 若不想把以下提交，可取消注释
+# pretrained/*.pth
+# pretrained/*.ckpt
+# RAFT/
+# GMA/
+# sam2/
+datasets/
+*.out
+*.png
+*.mp4
+plot_flow_motion.py

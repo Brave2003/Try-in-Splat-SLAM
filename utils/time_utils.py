@@ -9,7 +9,7 @@ from utils.deform_utils import cal_connectivity_from_points, cal_arap_error, ara
 
 try:
     from torch_batch_svd import svd
-    print('Using speed up torch_batch_svd!')
+    # print('Using speed up torch_batch_svd!')
 except:
     svd = torch.svd
     print('Use original torch svd!')
@@ -328,7 +328,7 @@ class DeformNetwork(nn.Module):
     def __init__(self, D=8, W=256, input_ch=3, output_ch=59, t_multires=6, multires=10,
                  is_blender=False, local_frame=False, pred_opacity=False, pred_color=False, resnet_color=True, hash_color=False, color_wrt_dir=False, progressive_brand_time=False, max_d_scale=-1, **kwargs):  # t_multires 6 for D-NeRF; 10 for HyperNeRF
         super(DeformNetwork, self).__init__()
-        print("enter deform")
+        # print("enter deform")
         self.name = 'mlp'
         self.D = D
         self.W = W

@@ -10,6 +10,3 @@
 [submodule "thirdparty/lietorch"]
 	path = thirdparty/lietorch
 	url = https://github.com/princeton-vl/lietorch.git
-[submodule "thirdparty/simple-knn"]
-	path = thirdparty/simple-knn
-	url = https://github.com/camenduru/simple-knn.git

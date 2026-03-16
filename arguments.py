@@ -168,7 +168,7 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
-        self.rotation_lr = 0.001
+        self.rotation_lr = 0.002  # 用法向/扁平化损失时可设为 0.002 加快 rotation 收敛
         self.percent_dense = 0.01
         self.lambda_dssim = 0
         self.lambda_lpips = 0

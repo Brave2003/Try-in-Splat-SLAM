@@ -30,7 +30,7 @@ tracking:
     thresh: 10
     dynamic_later: True
     dynamic_thresh: 0.5
-    dynamic_frame: 280
+    dynamic_frame: 140
 mapping:
   first_s: 2.4271233081817627
   shift: 1.1

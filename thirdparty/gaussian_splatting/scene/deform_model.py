@@ -25,7 +25,7 @@ class DeformModel:
         self.optimizer = None
         self.spatial_lr_scale = 5
         self.d_rot_as_res = d_rot_as_res
-        print("deform type",deform_type)
+        # print("deform type",deform_type)
     @property
     def reg_loss(self):
         return self.deform.reg_loss

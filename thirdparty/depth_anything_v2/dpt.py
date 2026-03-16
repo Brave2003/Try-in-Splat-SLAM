@@ -178,7 +178,7 @@ class DepthAnythingV2(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
         
         depth = self.depth_head(features, patch_h, patch_w)
-        print("before",depth.max())
+        # print("before",depth.max())
         depth = F.relu(depth)
         
         return depth.squeeze(1)
@@ -188,7 +188,7 @@ class DepthAnythingV2(nn.Module):
         image,(h, w) = self.image2tensor(raw_image, input_size)
         #print(f"均值: {image.mean().item():.4f}, 标准差: {image.std().item():.4f}, 形状: {image.shape}")
         depth = self.forward(image)
-        print("depth",depth.max())
+        # print("depth",depth.max())
         #depth = F.interpolate(depth.unsqueeze(0), image_size, mode='bicubic').squeeze(0)
         depth = F.interpolate(depth[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
         

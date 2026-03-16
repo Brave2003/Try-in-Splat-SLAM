@@ -75,8 +75,8 @@ class Frontend:
         # set initial pose for next frame
         d = self.video.distance([self.t1 - 2], [self.t1 - 1], beta=self.beta, bidirectional=True)
 
-        print("keyframe", self.keyframe_thresh)
-        print("d.item", d.item())
+        # print("keyframe", self.keyframe_thresh)
+        # print("d.item", d.item())
         if d.item() < self.keyframe_thresh:
             self.graph.rm_keyframe(self.t1 - 1)
             with self.video.get_lock():

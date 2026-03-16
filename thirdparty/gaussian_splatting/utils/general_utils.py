@@ -137,8 +137,77 @@ def strip_lowerdiag(L):
     uncertainty[:, 4] = L[:, 1, 2]
     uncertainty[:, 5] = L[:, 2, 2]
     return uncertainty
+def get_normals(z, camera_metadata):
+    pixels = camera_metadata.get_pixels()
+    y = (pixels[..., 1] - camera_metadata.principal_point_y) / camera_metadata.scale_factor_y
+    x = (
+        pixels[..., 0] - camera_metadata.principal_point_x - y * camera_metadata.skew
+    ) / camera_metadata.scale_factor_x
+    viewdirs = np.stack([x, y, np.ones_like(x)], axis=-1)
+    viewdirs = torch.from_numpy(viewdirs).to(z.device)
+
+    coords = viewdirs[None] * z[..., None]
+    coords = coords.permute(0, 3, 1, 2)
+
+    dxdu = coords[..., 0, :, 1:] - coords[..., 0, :, :-1]
+    dydu = coords[..., 1, :, 1:] - coords[..., 1, :, :-1]
+    dzdu = coords[..., 2, :, 1:] - coords[..., 2, :, :-1]
+    dxdv = coords[..., 0, 1:, :] - coords[..., 0, :-1, :]
+    dydv = coords[..., 1, 1:, :] - coords[..., 1, :-1, :]
+    dzdv = coords[..., 2, 1:, :] - coords[..., 2, :-1, :]
+
+    dxdu = torch.nn.functional.pad(dxdu, (0, 1), mode="replicate")
+    dydu = torch.nn.functional.pad(dydu, (0, 1), mode="replicate")
+    dzdu = torch.nn.functional.pad(dzdu, (0, 1), mode="replicate")
+
+    dxdv = torch.cat([dxdv, dxdv[..., -1:, :]], dim=-2)
+    dydv = torch.cat([dydv, dydv[..., -1:, :]], dim=-2)
+    dzdv = torch.cat([dzdv, dzdv[..., -1:, :]], dim=-2)
+
+    n_x = dydv * dzdu - dydu * dzdv
+    n_y = dzdv * dxdu - dzdu * dxdv
+    n_z = dxdv * dydu - dxdu * dydv
+
+    pred_normal = torch.stack([n_x, n_y, n_z], dim=-3)
+    pred_normal = torch.nn.functional.normalize(pred_normal, dim=-3)
+    return pred_normal
+def get_gs_mask(s_image_tensor, gt_image_tensor, s_depth_tensor, depth_tensor, CVD):
+    B, C, H, W = s_image_tensor.shape
+
+    # Color based
+    gs_error = torch.mean(torch.abs(s_image_tensor - gt_image_tensor), 1, True)
+    gs_mask_c = error_to_prob(gs_error.detach())
+
+    # Depth based
+    gs_mask_d = error_to_prob(torch.mean(torch.abs(s_depth_tensor - depth_tensor), 1, True).detach())
+    norm_disp = 1 / (CVD + 1e-7)
+    norm_disp = (norm_disp + F.max_pool2d(-norm_disp, kernel_size=(H, W))) / (
+        F.max_pool2d(norm_disp, kernel_size=(H, W)) + F.max_pool2d(-norm_disp, kernel_size=(H, W))
+    )
+    gs_mask_d = 1 - norm_disp * (1 - gs_mask_d)
+
+    return gs_mask_c.detach(), gs_mask_d.detach()
 
 
+def get_pixels(image_size_x, image_size_y, use_center=None):
+    """Return the pixel at center or corner."""
+    xx, yy = np.meshgrid(
+        np.arange(image_size_x, dtype=np.float32),
+        np.arange(image_size_y, dtype=np.float32),
+    )
+    offset = 0.5 if use_center else 0
+    return np.stack([xx, yy], axis=-1) + offset
+
+
+def error_to_prob(error, mask=None, mean_prob=0.5):
+    if mask is None:
+        mean_err = torch.mean(error, dim=(3, 2, 1)) + 1e-7
+    else:
+        mean_err = torch.sum(mask * error, dim=(3, 2)) / (torch.sum(mask, dim=(3, 2)) + 1e-7) + 1e-7
+    prob = mean_prob * (error / mean_err.view(error.shape[0], 1, 1, 1))
+    prob[prob > 1] = 1
+    prob = 1 - prob
+    return prob
 def strip_symmetric(sym):
     return strip_lowerdiag(sym)
 
@@ -167,6 +236,42 @@ def build_rotation(r):
     R[:, 2, 1] = 2 * (y * z + r * x)
     R[:, 2, 2] = 1 - 2 * (x * x + y * y)
     return R
+
+def build_rotation_matrix_from_normal(normals):
+    """
+    Build rotation matrices so that the third column (local z-axis) aligns with the given world-space normals.
+    Used to initialize Gaussian orientations from depth-derived normals (shortest axis = normal).
+
+    Args:
+        normals: (N, 3) tensor, unit normals in world space.
+
+    Returns:
+        R: (N, 3, 3) rotation matrices with R[:, :, 2] = normals (and degenerate -> identity).
+    """
+    N = normals.shape[0]
+    device = normals.device
+    n = torch.nn.functional.normalize(normals.float(), dim=1, eps=1e-8)
+    # Tangent frame: pick a not parallel to n, then t1 = cross(a,n), t2 = cross(n,t1)
+    a = torch.tensor([[1, 0, 0]], dtype=n.dtype, device=device).expand(N, 3).clone()
+    mask = (n[:, 0].abs() > 0.9)
+    a[mask] = torch.tensor([[0, 1, 0]], dtype=n.dtype, device=device)
+    t1 = torch.cross(a, n, dim=1)
+    t1_norm = t1.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    t1 = t1 / t1_norm
+    t2 = torch.cross(n, t1, dim=1)
+    t2 = torch.nn.functional.normalize(t2, dim=1, eps=1e-8)
+    # Degenerate: n too small -> identity third column [0,0,1]
+    valid = (normals.norm(dim=1) > 1e-4)
+    R = torch.zeros((N, 3, 3), device=device, dtype=n.dtype)
+    R[:, :, 0] = t1
+    R[:, :, 1] = t2
+    R[:, :, 2] = n
+    R[~valid, :, 2] = 0.0
+    R[~valid, 2, 2] = 1.0
+    R[~valid, 0, 0] = 1.0
+    R[~valid, 1, 1] = 1.0
+    return R
+
 
 def rotation_matrix_to_quaternion(R):
     """

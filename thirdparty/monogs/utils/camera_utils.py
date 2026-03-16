@@ -17,11 +17,31 @@ from RAFT.utils.utils import InputPadder
 class raft_param():
     def __init__(self):
         self.dataset_path =  "/path/to/dataset"
-        self.model = "raft-things.pth"
+        self.model = "pretrained/raft-things.pth"
         #self.model = "gma-things.pth"  # ʹ��RAFTGMA���ƹ����ٶ���Щ
         self.small = False  # Сģ��
         self.mixed_precision = False  # ��ʹ�û�Ͼ���
-
+        
+def process_image(color):
+    resized_image_rgb = color
+    gt_image = resized_image_rgb
+    # if len(image.split()) > 3:
+    #     resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in image.split()[:3]], dim=0)
+    #     loaded_mask = PILtoTorch(image.split()[3], resolution)
+    #     gt_image = resized_image_rgb
+    #     if ncc_scale != 1.0:
+    #         ncc_resolution = (int(resolution[0] / ncc_scale), int(resolution[1] / ncc_scale))
+    #         resized_image_rgb = torch.cat([PILtoTorch(im, ncc_resolution) for im in image.split()[:3]], dim=0)
+    # else:
+    #     resized_image_rgb = PILtoTorch(image, resolution)
+    #     loaded_mask = None
+    #     gt_image = resized_image_rgb
+    #     if ncc_scale != 1.0:
+    #         ncc_resolution = (int(resolution[0] / ncc_scale), int(resolution[1] / ncc_scale))
+    #         resized_image_rgb = PILtoTorch(image, ncc_resolution)
+    gray_image = (0.299 * resized_image_rgb[0] + 0.587 * resized_image_rgb[1] + 0.114 * resized_image_rgb[2])[None]
+    return gt_image, gray_image
+    
 class Camera(nn.Module):
     def __init__(
         self,
@@ -53,7 +73,7 @@ class Camera(nn.Module):
         self.T = T[:3, 3]
         self.R_gt = gt_T[:3, :3]
         self.T_gt = gt_T[:3, 3]
-
+        self.gt_T = gt_T
         self.original_image = color
         self.depth = depth
         self.grad_mask = None
@@ -96,11 +116,29 @@ class Camera(nn.Module):
         self.mask_fwd = None
         self.mask_bwd = None
         self.epi_error = None
+        self.dino_feat = None  # 由 dynamic_mask_detector 填充，用于 SAM/DINO 动态分割
     @staticmethod
     def init_from_dataset(dataset, video_idx,idx,data, projection_matrix):
-        _,_, depth_gtd, _, motion_mask,normal,mono,static_msk = dataset[idx]
+        _, _, _, _, motion_mask, _, _, _ = dataset[idx]
         time = idx / (len(dataset) - 1)
 
+        # 使用 PGSR 方式从真实深度计算法向，仅在创建 viewpoint 时算一次，不在每次渲染时算。
+        glorie_depth = data["glorie_depth"]
+        if isinstance(glorie_depth, np.ndarray):
+            glorie_depth_t = torch.from_numpy(glorie_depth).float().to(dataset.device)
+        elif isinstance(glorie_depth, torch.Tensor):
+            glorie_depth_t = glorie_depth.to(device=dataset.device, dtype=torch.float32)
+        else:
+            glorie_depth_t = None
+
+        normal = None
+        if glorie_depth_t is not None:
+            try:
+                normal = dataset.depth_to_normal_pgsr(glorie_depth_t)
+            except Exception:
+                pass
+        if normal is None:
+            normal = torch.zeros(3, dataset.H_out, dataset.W_out, device=dataset.device, dtype=torch.float32)
 
         return Camera(
             data["idx"],
@@ -170,7 +208,31 @@ class Camera(nn.Module):
         self.exposure_a = None
         self.exposure_b = None
 
-
+    def get_rays(self, scale=1.0):
+        W, H = int(self.image_width / scale), int(self.image_height / scale)
+        ix, iy = torch.meshgrid(
+            torch.arange(W), torch.arange(H), indexing='xy')
+        rays_d = torch.stack(
+            [(ix - self.cx / scale) / self.fx * scale,
+             (iy - self.cy / scale) / self.fy * scale,
+             torch.ones_like(ix)], -1).float().cuda()
+        return rays_d
+    def get_k(self, scale=1.0):
+        K = torch.tensor([[self.fx / scale, 0, self.cx / scale],
+                        [0, self.fy / scale, self.cy / scale],
+                        [0, 0, 1]]).cuda()
+        return K
+    def get_inv_k(self, scale=1.0):
+        K_T = torch.tensor([[scale/self.fx, 0, -self.cx/self.fx],
+                            [0, scale/self.fy, -self.cy/self.fy],
+                            [0, 0, 1]]).cuda()
+        return K_T
+    def get_image(self):
+        # if self.preload_img:
+        #     return self.original_image.cuda(), self.original_image_gray.cuda()
+        # else:
+        gt_image, gray_image = process_image(self.original_image)
+        return gt_image.cuda(), gray_image.cuda()
     def reproject_mask(self, dataset, cam_0):
         # if self.uid==0:  # ��0֡��ȥ����̬���巴����Ч�������
         #    return None

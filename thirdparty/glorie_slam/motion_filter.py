@@ -91,7 +91,7 @@ class MotionFilter:
         if self.video.counter.value == 0:
             net, inp = self.__context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
-            print("shape",image.shape)
+            # print("shape",image.shape)
             if self.cfg["mono_prior"]["predict_online"]:
 
                 mono_depth=predict_mono_depth(self.mono_depth_estimator,tstamp,depth,image,self.cfg,self.device,mask)

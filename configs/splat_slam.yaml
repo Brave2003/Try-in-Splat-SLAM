@@ -12,12 +12,20 @@
 # limitations under the License.
 
 verbose: true
-stride: 1            # use every X image from the dataset 
+stride: 1          # use every X image from the dataset 
 max_frames: -1       # use the first X images from the dataset, -1 means using all
 only_tracking: False # only do tracking without mapping if enabled
 setup_seed: 43
 device: "cuda:0"
 disable_vis: False
+# 是否保存调试用可视化（mask 中间结果、迭代中 depth/normal/flow、d_mask 等），设为 true 会降低运行速度
+save_debug_visualization: False
+# 是否在前端启用动态掩码检测模块（每 6 个 keyframe 用光流 + YOLO 更新 motion_mask）
+enable_dynamic_mask_detection: True
+
+# 预训练模型统一放在 pretrained/，可用 scripts/download_pretrained.sh 下载
+data:
+  yolo_pretrained: pretrained/yolo11l-seg.pt
 
 mapping:
   sensor_type: 'depth'
@@ -44,16 +52,20 @@ mapping:
     init_gaussian_th: 0.005
     init_gaussian_extent: 30
     mapping_itr_num: 50
+    map_iters_per_kf: 400  # 每关键帧 mapping 迭代数，显存不足时可减小（如 200）
     gaussian_update_every: 150 # we prune and densify once every 150 iterations.
     gaussian_update_offset: 50
     gaussian_th: 0.7 # used in densify and prune - minimum opacity to be kept
     gaussian_extent: 1.0 # used in densify and prune. We prune points with larger 3d scale than 0.1 * gaussian_extent
     gaussian_reset: 2001
     size_threshold: 20 # used in densify and prune. We prune points that have a larger radius than 20 in screen space
-    window_size: 8
+    window_size: 8  # 显存不足时可降至 4 或 5
     pose_window: 3 #5
     edge_threshold: 1.1 #4
-    rgb_boundary_threshold: 0.01
+    rgb_boundary_threshold: 0.01   # mapping loss：过滤过暗像素
+    depth_min: 0.01                # 有效深度下界（米）
+    depth_max: 10000.0             # 有效深度上界（米）
+    dynamic_region_weight: 1.0     # 动态区域 L1 权重倍数，1=不加重，>1 加强动态区
     kf_translation: 0.04
     kf_min_translation: 0.02
     kf_overlap: 0.9
@@ -61,6 +73,8 @@ mapping:
     spherical_harmonics: False # kept for reference, but not tested when True
     flow_loss: 3
     flow_loss_fine: 3
+    flattening_loss_weight: 0.1  # 高斯扁平化损失权重（渲染最短轴法向量 vs 真实深度法向量）
+    flat_loss_weight: 0.1  # L_flat = (1/N)*sum_i min(s_x,s_y,s_z)，使最短轴趋近更短
     lr:
       cam_rot_delta: 0.003
       cam_trans_delta: 0.001
