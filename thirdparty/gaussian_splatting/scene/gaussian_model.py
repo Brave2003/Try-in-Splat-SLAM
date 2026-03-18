@@ -257,7 +257,7 @@ class GaussianModel:
         rots[:, 0] = 1
         # 小改动：若 viewpoint 有预计算的法向图，将世界点投影到图像采样法向，仅用其初始化旋转以加速法向收敛
         normal_map = getattr(cam, "normal", None)
-        if normal_map is not None:
+        if normal_map is not None and False:
             R_w2c = cam.R if torch.is_tensor(cam.R) else torch.from_numpy(np.asarray(cam.R)).float().to(fused_point_cloud.device)
             T_w2c = cam.T if torch.is_tensor(cam.T) else torch.from_numpy(np.asarray(cam.T).reshape(3)).float().to(fused_point_cloud.device)
             if R_w2c.dim() == 1:
@@ -373,8 +373,8 @@ class GaussianModel:
         rays_d = fov_camera.get_rays(scale=scale)
         depth_view = depth_view[:rays_d.shape[0], :rays_d.shape[1]]
         pts = (rays_d * depth_view[..., None]).reshape(-1, 3)
-        R = (fov_camera.R_gt.clone().detach() if isinstance(fov_camera.R_gt, torch.Tensor) else torch.tensor(fov_camera.R_gt)).float().cuda()
-        T = (fov_camera.T_gt.clone().detach() if isinstance(fov_camera.T_gt, torch.Tensor) else torch.tensor(fov_camera.T_gt)).float().cuda()
+        R = torch.tensor(fov_camera.R_gt).float().cuda()
+        T = torch.tensor(fov_camera.T_gt).float().cuda()
         pts = (pts - T) @ R.transpose(-1, -2)
         return pts
     def get_points_depth_in_depth_map(self, fov_camera, depth, points_in_camera_space, scale=1):
@@ -778,9 +778,8 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
-            old_param = group["params"][0]
             extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(old_param, None)
+            stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
                 # Add to the optimizer internal variables like the exponential averaging
                 # for each variable that we want to add. Initialize to zero.
@@ -792,33 +791,22 @@ class GaussianModel:
                     dim=0,
                 )
 
-                del self.optimizer.state[old_param]
-                new_param = nn.Parameter(
+                del self.optimizer.state[group["params"][0]]
+                group["params"][0] = nn.Parameter(
                     torch.cat(
-                        (old_param.data, extension_tensor), dim=0
+                        (group["params"][0], extension_tensor), dim=0
                     ).requires_grad_(True)
                 )
-                # 替换参数后新 tensor 没有 .grad，同轮 optimizer.step() 会失效；把旧梯度拼到新参数上（新位置填 0）
-                if old_param.grad is not None:
-                    new_param.grad = torch.cat(
-                        (old_param.grad, torch.zeros_like(extension_tensor)), dim=0
-                    )
-                group["params"][0] = new_param
-                self.optimizer.state[new_param] = stored_state
+                self.optimizer.state[group["params"][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = new_param
+                optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                new_param = nn.Parameter(
+                group["params"][0] = nn.Parameter(
                     torch.cat(
-                        (old_param.data, extension_tensor), dim=0
+                        (group["params"][0], extension_tensor), dim=0
                     ).requires_grad_(True)
                 )
-                if old_param.grad is not None:
-                    new_param.grad = torch.cat(
-                        (old_param.grad, torch.zeros_like(extension_tensor)), dim=0
-                    )
-                group["params"][0] = new_param
-                optimizable_tensors[group["name"]] = new_param
+                optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
 
@@ -891,7 +879,7 @@ class GaussianModel:
             self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)
         )
         # 分裂出的 N 个子高斯继承父高斯的旋转（法向），显式 clone 保证独立张量
-        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1).clone()
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
@@ -938,7 +926,7 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         # 显式复制法向/旋转，保证新高斯与父高斯朝向一致且为独立张量
-        new_rotation = self._rotation[selected_pts_mask].clone()
+        new_rotation = self._rotation[selected_pts_mask]
 
         new_kf_id = self.unique_kfIDs[selected_pts_mask.cpu()]
         new_n_obs = self.n_obs[selected_pts_mask.cpu()]

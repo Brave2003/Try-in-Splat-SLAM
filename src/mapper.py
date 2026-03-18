@@ -13,16 +13,12 @@
 import os
 #from encodings.punycode import selective_find
 from PIL import Image
-from click import pass_context
 import cv2
 import torch.nn.functional as F
 import numpy as np
-import open3d as o3d
 import torch
-import random
 import torch.nn as nn
 #from jsonschema.benchmarks.const_vs_enum import invalid
-from pygments.lexer import combined
 from tqdm import tqdm
 import time
 from colorama import Fore, Style
@@ -33,16 +29,14 @@ from src.utils.datasets import get_dataset, load_mono_depth
 from src.utils.common import as_intrinsics_matrix, setup_seed
 import matplotlib.pyplot as plt
 from src.utils.Printer import Printer, FontColor
-from lietorch import SE3, SO3
 from thirdparty.glorie_slam.depth_video import DepthVideo
 from thirdparty.gaussian_splatting.gaussian_renderer import render,render_flow
 from thirdparty.gaussian_splatting.utils.general_utils import rotation_matrix_to_quaternion, quaternion_multiply
-from thirdparty.gaussian_splatting.utils.loss_utils import l1_loss, ssim
+from thirdparty.gaussian_splatting.utils.loss_utils import l1_loss
 from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
 from thirdparty.gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
-from thirdparty.lietorch.examples.rgbdslam.rgbd_benchmark.evaluate_rpe import find_closest_index
 from thirdparty.monogs.utils.pose_utils import update_pose
-from thirdparty.monogs.utils.slam_utils import get_loss_mapping, get_median_depth,get_loss_tracking,depth_loss_dpt
+from thirdparty.monogs.utils.slam_utils import get_loss_mapping, get_median_depth,depth_loss_dpt
 from thirdparty.monogs.utils.camera_utils import Camera
 # 动态掩码改由前端保存图片，后端通过 dataset 读盘获得，不再在此导入
 # from utils.dynamic_mask_detector import maybe_update_motion_masks
@@ -116,6 +110,7 @@ class Mapper(object):
 
     """
 
+    # --------------- 1. 配置与初始化 ---------------
     def __init__(self, slam, pipe: Connection):
         # 步骤1：种子与配置
         setup_seed(slam.cfg["setup_seed"])
@@ -172,6 +167,7 @@ class Mapper(object):
         if self.dynamic_model:
             self.gaussians.deform.train_setting(hp)
             self.gaussians.time_interval = 1 / len(self.frame_reader)
+
     def set_pipe(self, pipe):
         self.pipe = pipe
 
@@ -212,6 +208,7 @@ class Mapper(object):
         # 为 True 时在 map() 中统计各阶段耗时并定期打印，用于分析瓶颈
         self.profile_mapping_time = c.get("profile_mapping_time", False)
 
+    # --------------- 2. 初始化与关键帧 ---------------
     def add_next_kf(self, frame_idx,idx, viewpoint, init=False, scale=2.0, depth_map=None):
         # This function computes the new Gaussians to be added given a new keyframe
         #print("depth",depth_map)
@@ -234,6 +231,7 @@ class Mapper(object):
         # remove all gaussians
         self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
 
+    # --------------- 3. 深度/位姿/尺度 ---------------
     def update_mapping_points(self, frame_idx, w2c, w2c_old, depth, depth_old, intrinsics, method=None):
         """步骤1：rigid 则仅按 SE(3) 移动点；否则步骤2：投影取深度并缩放/位姿更新。"""
         if method == "rigid":
@@ -343,6 +341,7 @@ class Mapper(object):
             scales[frame_mask] = scales[frame_mask] + torch.log(rescale_scale)
             self.gaussians._scaling = self.gaussians.replace_tensor_to_optimizer(scales, "scaling")["scaling"]
 
+    # --------------- 4. 几何与图像 ---------------
     def init_image_coor(self,height, width):
         x_row = np.arange(0, width)
         x = np.tile(x_row, (height, 1))
@@ -714,6 +713,8 @@ class Mapper(object):
                                  psnr_score.item(), depth_l1, plot_dir=plot_dir, idx=str(cur_idx),
                                  diff_rgb=np.abs(gt - pred))
         return render_pkg
+
+    # --------------- 5. 变形与渲染 ---------------
     def find_closest_keyframe(self, uid):
         keys = [key for key in self.viewpoints if key < uid]
         if not keys:
@@ -844,6 +845,7 @@ class Mapper(object):
         loss_bwd = flow_weights * l1_loss(flow * dynamic_mask_b, coor2to1_motion * dynamic_mask_b)
         return loss_fwd + loss_bwd, d_value2
 
+    # --------------- 6. 损失 ---------------
     def _add_deform_regularization_losses(self, viewpoint, delta=None, scale_arap=1e-3, scale_acc=1e-5, scale_elastic=1e-3):
         """步骤：按 viewpoint.fid 计算 arap_loss、acc_loss、elastic_loss 并加权求和。"""
         delta_t = (delta or 5) * self.gaussians.time_interval
@@ -858,6 +860,459 @@ class Mapper(object):
         )
         return loss
 
+    # --------------- 7. 多视角/NCC（map 依赖） ---------------
+    def lncc(self,ref, nea):
+        # ref_gray: [batch_size, total_patch_size]
+        # nea_grays: [batch_size, total_patch_size]
+        bs, tps = nea.shape
+        patch_size = int(np.sqrt(tps))
+
+        ref_nea = ref * nea
+        ref_nea = ref_nea.view(bs, 1, patch_size, patch_size)
+        ref = ref.view(bs, 1, patch_size, patch_size)
+        nea = nea.view(bs, 1, patch_size, patch_size)
+        ref2 = ref.pow(2)
+        nea2 = nea.pow(2)
+
+        # sum over kernel
+        filters = torch.ones(1, 1, patch_size, patch_size, device=ref.device)
+        padding = patch_size // 2
+        ref_sum = F.conv2d(ref, filters, stride=1, padding=padding)[:, :, padding, padding]
+        nea_sum = F.conv2d(nea, filters, stride=1, padding=padding)[:, :, padding, padding]
+        ref2_sum = F.conv2d(ref2, filters, stride=1, padding=padding)[:, :, padding, padding]
+        nea2_sum = F.conv2d(nea2, filters, stride=1, padding=padding)[:, :, padding, padding]
+        ref_nea_sum = F.conv2d(ref_nea, filters, stride=1, padding=padding)[:, :, padding, padding]
+
+        # average over kernel
+        ref_avg = ref_sum / tps
+        nea_avg = nea_sum / tps
+
+        cross = ref_nea_sum - nea_avg * ref_sum
+        ref_var = ref2_sum - ref_avg * ref_sum
+        nea_var = nea2_sum - nea_avg * nea_sum
+
+        cc = cross * cross / (ref_var * nea_var + 1e-8)
+        ncc = 1 - cc
+        ncc = torch.clamp(ncc, 0.0, 2.0)
+        ncc = torch.mean(ncc, dim=1, keepdim=True)
+        mask = (ncc < 0.9)
+        return ncc, mask
+    def patch_warp(self,H, uv):
+        B, P = uv.shape[:2]
+        H = H.view(B, 3, 3)
+        ones = torch.ones((B, P, 1), device=uv.device)
+        homo_uv = torch.cat((uv, ones), dim=-1)
+
+        grid_tmp = torch.einsum("bik,bpk->bpi", H, homo_uv)
+        grid_tmp = grid_tmp.reshape(B, P, 3)
+        grid = grid_tmp[..., :2] / (grid_tmp[..., 2:] + 1e-10)
+        return grid
+    def patch_offsets(self,h_patch_size, device):
+        offsets = torch.arange(-h_patch_size, h_patch_size + 1, device=device)
+        return torch.stack(torch.meshgrid(offsets, offsets, indexing='xy')[::-1], dim=-1).view(1, -1, 2)
+    def compute_multi_view_loss(self, viewpoint_cam, render_pkg, gaussians, pipe, bg, dxyz, d_scale, d_rot, d_opac, d_color, nearest_cam):
+        """步骤：渲染最近视角→当前深度投影到最近视角→深度校正→重投影回当前像平面→几何掩码 d_mask→与 motion_mask 结合→NCC 损失。"""
+        if nearest_cam is None:
+            return 0.0
+        use_virtul_cam = False
+        # 获取配置参数
+        patch_size = 3
+        sample_num = 102400
+        pixel_noise_th = 1.0
+        ncc_weight = 0.15
+        # geo_weight = self.opt.multi_view_geo_weight
+        total_patch_size = (patch_size * 2 + 1) ** 2
+        gt_image, gt_image_gray = viewpoint_cam.get_image()
+        # 初始化损失
+        total_loss = 0.0
+
+        try:
+            ## 计算几何一致性掩码和损失
+            # 检查是否有动态掩码，如果两个视角都没有动态掩码，则跳过多视角损失计算
+            has_current_motion_mask = viewpoint_cam.motion_mask is not None
+            has_nearest_motion_mask = nearest_cam.motion_mask is not None
+
+
+            H, W = render_pkg["depth"].squeeze().shape
+            ix, iy = torch.meshgrid(
+                torch.arange(W), torch.arange(H), indexing='xy')
+            pixels = torch.stack([ix, iy], dim=-1).float().to(render_pkg["depth"].device)
+
+            # 渲染最近视角
+            nearest_render_pkg = render(nearest_cam, gaussians, pipe, bg, dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot,
+                                        do=d_opac, dc=d_color)
+
+            # 计算3D点投影
+            pts = gaussians.get_points_from_depth(viewpoint_cam, render_pkg["depth"])
+            pts_in_nearest_cam = pts @ nearest_cam.R_gt + nearest_cam.T_gt
+            map_z, d_mask = gaussians.get_points_depth_in_depth_map(nearest_cam, nearest_render_pkg["depth"],
+                                                                    pts_in_nearest_cam)
+
+            # 深度校正
+            pts_in_nearest_cam = pts_in_nearest_cam / (pts_in_nearest_cam[:, 2:3])
+            pts_in_nearest_cam = pts_in_nearest_cam * map_z.squeeze()[..., None]
+
+            # 坐标变换：最近视角相机坐标系 → 世界坐标系 → 当前视角相机坐标系
+            R_wvt = nearest_cam.R_gt
+            T_wvt = nearest_cam.T_gt
+            pts_ = (pts_in_nearest_cam - T_wvt) @ R_wvt.transpose(-1, -2)
+            pts_in_view_cam = pts_ @ viewpoint_cam.R_gt + viewpoint_cam.T_gt
+
+            # 投影到图像平面
+            pts_projections = torch.stack(
+                [pts_in_view_cam[:, 0] * viewpoint_cam.fx / pts_in_view_cam[:, 2] + viewpoint_cam.cx,
+                 pts_in_view_cam[:, 1] * viewpoint_cam.fy / pts_in_view_cam[:, 2] + viewpoint_cam.cy], -1).float()
+
+            # 计算像素噪声和权重
+            pixel_noise = torch.norm(pts_projections - pixels.reshape(*pts_projections.shape), dim=-1)
+            d_mask_before_motion = d_mask & (pixel_noise < pixel_noise_th)  # 保存应用motion_mask之前的d_mask
+            d_mask = d_mask_before_motion.clone()
+
+            # 将d_mask与motion_mask相乘（motion_mask=True表示静态区域）
+            # 直接在一维空间操作，避免reshape开销
+
+            # 与当前视角的静态掩码相乘
+            current_motion_mask = None
+            if has_current_motion_mask:
+                current_motion_mask = viewpoint_cam.motion_mask.reshape(-1).to(d_mask.device)
+                d_mask = d_mask & current_motion_mask
+
+            # 与临近视角的静态掩码相乘
+            nearest_motion_mask = None
+            if has_nearest_motion_mask:
+                nearest_motion_mask = nearest_cam.motion_mask.reshape(-1).to(d_mask.device)
+                d_mask = d_mask & nearest_motion_mask
+
+            # 可视化 d_mask 和 motion_mask 的结合效果
+            if hasattr(self, 'visualize_mask_combination') and self.visualize_mask_combination:
+                self._visualize_mask_combination(
+                    d_mask_before_motion, current_motion_mask, nearest_motion_mask, d_mask,
+                    H, W, viewpoint_cam, render_pkg, render_pkg["render"]
+                )
+
+            weights = (1.0 / torch.exp(pixel_noise)).detach()
+            weights[~d_mask] = 0
+
+            # 可视化 d_mask（可选，设置 visualize_mask=True 启用）
+            if hasattr(self, 'visualize_mask') and self.visualize_mask:
+                self._visualize_d_mask(d_mask, pixel_noise, H, W, viewpoint_cam, render_pkg)
+
+            # 几何项：必须始终参与计算图，否则 multi_view 损失无法对 d_value2 / 当前 depth 反传。
+            # 无有效 d_mask 时用全局 pixel_noise 均值作为 fallback，保证梯度路径存在。
+            geo_fallback = 0.001 * pixel_noise.mean()
+            total_loss = total_loss + geo_fallback
+
+            # 有有效 d_mask 时再加 NCC（内部含 geo_loss + ncc_loss），与 fallback 一起保证反传
+            if torch.any(d_mask) and use_virtul_cam is False:
+                ncc_loss = self._compute_ncc_loss(
+                    viewpoint_cam, nearest_cam, render_pkg, gt_image_gray, pixel_noise,
+                    d_mask, weights, pixels, patch_size, sample_num, total_patch_size,
+                    ncc_weight
+                )
+                total_loss = total_loss + ncc_loss
+
+            # 始终返回张量，避免 return 0.0 时 loss_mapping += 0.0 导致该分支完全脱离计算图
+            return 100.0 * total_loss
+
+        except Exception as e:
+            print(f"Error in compute_multi_view_loss: {e}")
+            return 0.0
+
+    def _visualize_d_mask(self, d_mask, pixel_noise, H, W, viewpoint_cam, render_pkg):
+        """
+        可视化深度一致性掩码 d_mask
+
+        参数:
+            d_mask: 布尔掩码张量 [H*W]
+            pixel_noise: 像素重投影误差 [H*W]
+            H, W: 图像高度和宽度
+            viewpoint_cam: 当前视角相机
+            render_pkg: 渲染结果包
+        """
+        import matplotlib.pyplot as plt
+        import os
+
+        # 创建保存目录
+        vis_dir = os.path.join(self.save_dir, "d_mask_visualization")
+        os.makedirs(vis_dir, exist_ok=True)
+
+        # 将掩码和噪声转换为图像格式 - 先全部转换为numpy
+        d_mask_np = d_mask.reshape(H, W).detach().cpu().numpy()
+        d_mask_img = (d_mask_np * 255).astype(np.uint8)
+
+        pixel_noise_np = pixel_noise.reshape(H, W).detach().cpu().numpy()
+        pixel_noise_flat = pixel_noise_np.reshape(-1)  # 展平为一维数组
+
+        # 获取渲染的RGB图像和深度图
+        rendered_image = render_pkg["render"].detach().cpu().permute(1, 2, 0).numpy()
+        rendered_depth = render_pkg["depth"].squeeze().detach().cpu().numpy()
+
+        # 创建可视化图像
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+        # 1. 渲染的RGB图像
+        axes[0, 0].imshow(rendered_image)
+        axes[0, 0].set_title('渲染图像')
+        axes[0, 0].axis('off')
+
+        # 2. 渲染的深度图
+        depth_vis = axes[0, 1].imshow(rendered_depth, cmap='turbo')
+        axes[0, 1].set_title('渲染深度图')
+        axes[0, 1].axis('off')
+        plt.colorbar(depth_vis, ax=axes[0, 1])
+
+        # 3. d_mask 掩码（黑白）
+        axes[0, 2].imshow(d_mask_img, cmap='gray')
+        axes[0, 2].set_title(f'd_mask (有效点: {d_mask.sum().item()}/{d_mask.numel()})')
+        axes[0, 2].axis('off')
+
+        # 4. d_mask 叠加在RGB图像上（绿色表示有效区域）
+        overlay = rendered_image.copy()
+        mask_colored = np.zeros_like(overlay)
+        mask_colored[:, :, 1] = d_mask_img / 255.0  # 绿色通道
+        axes[1, 0].imshow(overlay * 0.5 + mask_colored * 0.5)
+        axes[1, 0].set_title('d_mask 叠加（绿色=有效）')
+        axes[1, 0].axis('off')
+
+        # 5. 像素重投影误差热力图
+        noise_vis = axes[1, 1].imshow(pixel_noise_np, cmap='hot', vmin=0, vmax=5)
+        axes[1, 1].set_title('像素重投影误差')
+        axes[1, 1].axis('off')
+        plt.colorbar(noise_vis, ax=axes[1, 1])
+
+        # 6. 误差分布直方图 - 修复这里！
+        d_mask_flat = d_mask_np.reshape(-1).astype(bool)  # 展平并转换为布尔数组
+        valid_noise = pixel_noise_flat[d_mask_flat]
+        invalid_noise = pixel_noise_flat[~d_mask_flat]
+
+        axes[1, 2].hist(valid_noise, bins=50, alpha=0.5, label='有效点', color='green')
+        axes[1, 2].hist(invalid_noise, bins=50, alpha=0.5, label='无效点', color='red')
+        axes[1, 2].set_xlabel('重投影误差 (像素)')
+        axes[1, 2].set_ylabel('频数')
+        axes[1, 2].set_title('误差分布')
+        axes[1, 2].legend()
+        axes[1, 2].set_xlim(0, 10)
+
+        plt.tight_layout()
+
+        # 保存图像
+        frame_id = viewpoint_cam.uid if hasattr(viewpoint_cam, 'uid') else 'unknown'
+        save_path = os.path.join(vis_dir, f"d_mask_frame_{frame_id}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"[可视化] d_mask 已保存到: {save_path}")
+        print(
+            f"[统计] 有效点数: {d_mask.sum().item()} / {d_mask.numel()} ({100 * d_mask.sum().item() / d_mask.numel():.2f}%)")
+        print(f"[统计] 平均重投影误差 (有效): {valid_noise.mean():.3f} 像素")
+        if len(invalid_noise) > 0:
+            print(f"[统计] 平均重投影误差 (无效): {invalid_noise.mean():.3f} 像素")
+    
+    def _visualize_mask_combination(self, d_mask_before, current_motion_mask, nearest_motion_mask, 
+                                    d_mask_after, H, W, viewpoint_cam, render_pkg, gt_image):
+        """
+        可视化 d_mask 与 motion_mask 的结合效果
+        
+        参数:
+            d_mask_before: 应用 motion_mask 之前的 d_mask [H*W]
+            current_motion_mask: 当前视角的 motion_mask [H*W] 或 None
+            nearest_motion_mask: 临近视角的 motion_mask [H*W] 或 None
+            d_mask_after: 应用 motion_mask 之后的 d_mask [H*W]
+            H, W: 图像高度和宽度
+            viewpoint_cam: 当前视角相机
+            render_pkg: 渲染结果包
+            gt_image: 真实图像 [3, H, W]
+        """
+        import matplotlib.pyplot as plt
+        import os
+        
+        # 创建保存目录
+        vis_dir = os.path.join(self.save_dir, "mask_combination_visualization")
+        os.makedirs(vis_dir, exist_ok=True)
+        
+        # 转换为 numpy 数组
+        d_mask_before_np = d_mask_before.reshape(H, W).detach().cpu().numpy()
+        d_mask_after_np = d_mask_after.reshape(H, W).detach().cpu().numpy()
+        
+        # 获取真实图像
+        gt_image_np = gt_image.detach().cpu().permute(1, 2, 0).numpy()
+        gt_image_np = np.clip(gt_image_np, 0, 1)
+        
+        # 获取渲染图像
+        rendered_image = render_pkg["render"].detach().cpu().permute(1, 2, 0).numpy()
+        rendered_image = np.clip(rendered_image, 0, 1)
+        
+        # 计算需要的行数
+        num_rows = 3 if (current_motion_mask is not None or nearest_motion_mask is not None) else 2
+        fig, axes = plt.subplots(num_rows, 3, figsize=(15, 5 * num_rows))
+        
+        # 第一行：原始图像和 d_mask
+        axes[0, 0].imshow(gt_image_np)
+        axes[0, 0].set_title('真实图像')
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(d_mask_before_np, cmap='gray')
+        valid_before = d_mask_before.sum().item()
+        axes[0, 1].set_title(f'd_mask (应用motion_mask前)\n有效点: {valid_before}/{d_mask_before.numel()} ({100*valid_before/d_mask_before.numel():.1f}%)')
+        axes[0, 1].axis('off')
+        
+        # d_mask 叠加在真实图像上
+        overlay_before = gt_image_np.copy()
+        mask_overlay = np.zeros_like(overlay_before)
+        mask_overlay[:, :, 1] = d_mask_before_np  # 绿色通道
+        axes[0, 2].imshow(overlay_before * 0.6 + mask_overlay * 0.4)
+        axes[0, 2].set_title('d_mask 叠加（绿色=有效）')
+        axes[0, 2].axis('off')
+        
+        # 第二行：motion_mask
+        row_idx = 1
+        if current_motion_mask is not None:
+            current_motion_np = current_motion_mask.reshape(H, W).detach().cpu().numpy()
+            axes[row_idx, 0].imshow(current_motion_np, cmap='RdYlGn')  # 红色=动态，绿色=静态
+            static_current = current_motion_mask.sum().item()
+            axes[row_idx, 0].set_title(f'当前视角 motion_mask\n静态点: {static_current}/{current_motion_mask.numel()} ({100*static_current/current_motion_mask.numel():.1f}%)')
+            axes[row_idx, 0].axis('off')
+        else:
+            axes[row_idx, 0].text(0.5, 0.5, 'No current\nmotion_mask', ha='center', va='center', fontsize=14)
+            axes[row_idx, 0].axis('off')
+        
+        if nearest_motion_mask is not None:
+            nearest_motion_np = nearest_motion_mask.reshape(H, W).detach().cpu().numpy()
+            axes[row_idx, 1].imshow(nearest_motion_np, cmap='RdYlGn')  # 红色=动态，绿色=静态
+            static_nearest = nearest_motion_mask.sum().item()
+            axes[row_idx, 1].set_title(f'临近视角 motion_mask\n静态点: {static_nearest}/{nearest_motion_mask.numel()} ({100*static_nearest/nearest_motion_mask.numel():.1f}%)')
+            axes[row_idx, 1].axis('off')
+        else:
+            axes[row_idx, 1].text(0.5, 0.5, 'No nearest\nmotion_mask', ha='center', va='center', fontsize=14)
+            axes[row_idx, 1].axis('off')
+        
+        # 组合的 motion_mask（如果两者都存在）
+        if current_motion_mask is not None and nearest_motion_mask is not None:
+            combined_motion = (current_motion_mask & nearest_motion_mask).reshape(H, W).detach().cpu().numpy()
+            axes[row_idx, 2].imshow(combined_motion, cmap='RdYlGn')
+            static_combined = (current_motion_mask & nearest_motion_mask).sum().item()
+            axes[row_idx, 2].set_title(f'组合 motion_mask (交集)\n静态点: {static_combined}/{current_motion_mask.numel()} ({100*static_combined/current_motion_mask.numel():.1f}%)')
+            axes[row_idx, 2].axis('off')
+        elif current_motion_mask is not None:
+            axes[row_idx, 2].imshow(current_motion_np, cmap='RdYlGn')
+            axes[row_idx, 2].set_title('组合 motion_mask\n(只有当前视角)')
+            axes[row_idx, 2].axis('off')
+        elif nearest_motion_mask is not None:
+            axes[row_idx, 2].imshow(nearest_motion_np, cmap='RdYlGn')
+            axes[row_idx, 2].set_title('组合 motion_mask\n(只有临近视角)')
+            axes[row_idx, 2].axis('off')
+        else:
+            axes[row_idx, 2].text(0.5, 0.5, 'No motion_mask', ha='center', va='center', fontsize=14)
+            axes[row_idx, 2].axis('off')
+        
+        # 第三行：最终结果和对比
+        row_idx = 2
+        axes[row_idx, 0].imshow(d_mask_after_np, cmap='gray')
+        valid_after = d_mask_after.sum().item()
+        axes[row_idx, 0].set_title(f'd_mask (应用motion_mask后)\n有效点: {valid_after}/{d_mask_after.numel()} ({100*valid_after/d_mask_after.numel():.1f}%)')
+        axes[row_idx, 0].axis('off')
+        
+        # 最终 d_mask 叠加在真实图像上
+        overlay_after = gt_image_np.copy()
+        mask_overlay_after = np.zeros_like(overlay_after)
+        mask_overlay_after[:, :, 1] = d_mask_after_np  # 绿色通道
+        axes[row_idx, 1].imshow(overlay_after * 0.6 + mask_overlay_after * 0.4)
+        axes[row_idx, 1].set_title('最终 d_mask 叠加')
+        axes[row_idx, 1].axis('off')
+        
+        # 差异图：显示被 motion_mask 过滤掉的点
+        diff_mask = d_mask_before_np.astype(float) - d_mask_after_np.astype(float)
+        diff_img = axes[row_idx, 2].imshow(diff_mask, cmap='Reds', vmin=0, vmax=1)
+        filtered_points = (d_mask_before & ~d_mask_after).sum().item()
+        axes[row_idx, 2].set_title(f'被 motion_mask 过滤的点\n过滤点数: {filtered_points} ({100*filtered_points/d_mask_before.numel():.1f}%)')
+        axes[row_idx, 2].axis('off')
+        plt.colorbar(diff_img, ax=axes[row_idx, 2])
+        
+        plt.tight_layout()
+        
+        # 保存图像
+        frame_id = viewpoint_cam.uid if hasattr(viewpoint_cam, 'uid') else 'unknown'
+        save_path = os.path.join(vis_dir, f"mask_combination_frame_{frame_id}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+    
+    def _compute_ncc_loss(self, viewpoint_cam, nearest_cam, render_pkg, gt_image_gray,pixel_noise,
+                          d_mask, weights, pixels, patch_size, sample_num, total_patch_size,
+                          ncc_weight):
+        """
+        计算 NCC 损失（内部辅助函数）
+        注意：单应性与 NCC 部分必须在 no_grad 外计算，否则多视角损失无法对深度/高斯回传梯度。
+        """
+        try:
+            loss = 0.0
+            geo_loss = 0.03 * ((weights * pixel_noise)[d_mask]).mean()
+            loss += geo_loss
+
+            # 仅在 no_grad 下做采样与 GT 相关计算，避免对不需要梯度的部分建图
+            with torch.no_grad():
+                d_mask_flat = d_mask.reshape(-1)
+                valid_indices = torch.arange(d_mask_flat.shape[0], device=d_mask.device)[d_mask_flat]
+                num_valid = valid_indices.shape[0]
+                if num_valid > sample_num:
+                    rand_indices = torch.randperm(num_valid, device=d_mask.device)[:sample_num]
+                    valid_indices = valid_indices[rand_indices]
+                weights_m = weights.reshape(-1)[valid_indices]
+                pixels_sampled = pixels.reshape(-1, 2)[valid_indices]
+                offsets = self.patch_offsets(patch_size, pixels.device)
+                ori_pixels_patch = pixels_sampled.reshape(-1, 1, 2) / 1.0 + offsets.float()
+                H, W = gt_image_gray.squeeze().shape
+                pixels_patch = ori_pixels_patch.clone()
+                pixels_patch[:, :, 0] = 2 * pixels_patch[:, :, 0] / (W - 1) - 1.0
+                pixels_patch[:, :, 1] = 2 * pixels_patch[:, :, 1] / (H - 1) - 1.0
+                ref_gray_val = F.grid_sample(gt_image_gray.unsqueeze(1), pixels_patch.view(1, -1, 1, 2),
+                                             align_corners=True)
+                ref_gray_val = ref_gray_val.reshape(-1, total_patch_size)
+                ref_to_neareast_r = nearest_cam.R_gt.transpose(-1, -2) @ viewpoint_cam.R_gt
+                ref_to_neareast_t = -ref_to_neareast_r @ viewpoint_cam.T_gt + nearest_cam.T_gt
+
+            # 使用渲染的法向量（最短轴按不透明度）计算单应，无则退化为深度法向量
+            ref_local_n = render_pkg["normal"].permute(1, 2, 0).reshape(-1, 3)[valid_indices]
+            ix, iy = torch.meshgrid(
+                torch.arange(W, device=render_pkg["depth"].device),
+                torch.arange(H, device=render_pkg["depth"].device), indexing='xy')
+            rays_d = torch.stack(
+                [(ix - viewpoint_cam.cx / 1) / viewpoint_cam.fx * 1,
+                 (iy - viewpoint_cam.cy / 1) / viewpoint_cam.fy * 1,
+                 torch.ones_like(ix)], -1).float().to(render_pkg["depth"].device)
+            ref_local_d = render_pkg["depth"] / rays_d[..., 2]
+            ref_local_d = ref_local_d.reshape(-1)[valid_indices]
+
+            H_ref_to_neareast = ref_to_neareast_r[None] - \
+                                torch.matmul(ref_to_neareast_t[None, :, None].expand(ref_local_d.shape[0], 3, 1),
+                                             ref_local_n[:, :, None].expand(ref_local_d.shape[0], 3, 1).permute(0, 2, 1)) / \
+                                ref_local_d[..., None, None]
+            H_ref_to_neareast = torch.matmul(
+                nearest_cam.get_k(1)[None].expand(ref_local_d.shape[0], 3, 3), H_ref_to_neareast)
+            H_ref_to_neareast = H_ref_to_neareast @ viewpoint_cam.get_inv_k(1)
+
+            grid = self.patch_warp(H_ref_to_neareast.reshape(-1, 3, 3), ori_pixels_patch)
+            grid = grid.clone()
+            grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
+            grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
+            _, nearest_image_gray = nearest_cam.get_image()
+            sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
+            sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
+
+            ncc, ncc_mask = self.lncc(ref_gray_val, sampled_gray_val)
+            mask = ncc_mask.reshape(-1)
+            ncc = ncc.reshape(-1) * weights_m
+            ncc = ncc[mask].squeeze()
+
+            if ncc.numel() > 0:
+                ncc_loss = ncc_weight * ncc.mean()
+                loss = loss + ncc_loss
+            return loss
+
+        except Exception as e:
+            print(f"Error in _compute_ncc_loss: {e}")
+            return 0.0
+    # --------------- 8. 地图与优化 ---------------
     def map(self, stream, idx1, current_window, prune=False, iters=1, dynamic_network=False, dynamic_render=False, rm_initdy=False):
         """每轮对当前窗口内多视角累积 loss 再 backward，与 mapper_copy 一致，保证 map 优化效果。
 
@@ -1944,6 +2399,7 @@ class Mapper(object):
 
         return window, removed_frame
 
+    # --------------- 9. 主循环与收尾 ---------------
     def run(self,stream:BaseDataset):
         """
         Trigger mapping process, get estimated pose and depth from tracking process,
@@ -2222,51 +2678,25 @@ class Mapper(object):
 
     def initialize_network(self, cur_frame_idx, viewpoint, update_gaussians=False):
         """与 Splat-slam-try-copy 完全一致：expand_time + deform.step + render(仅 dx,ds,dr)，100 次迭代。"""
+        from src.utils.Printer import get_msg_prefix
+        prefix = get_msg_prefix(FontColor.MAPPER)
         if cur_frame_idx == self.dystart:
             inited = self.gaussians.create_node_from_depth(viewpoint, self.opt_params, self.sc_params)
             if not inited:
                 return
-        time_input = self.gaussians.deform.deform.expand_time(viewpoint.fid)
-        for mapping_iteration in range(100):
-            d_values = self.gaussians.deform.step(
-                self.gaussians.get_dygs_xyz.detach(),
-                time_input,
-                iteration=0,
-                feature=None,
-                motion_mask=self.gaussians.motion_mask,
-                camera_center=viewpoint.camera_center,
-                time_interval=self.gaussians.time_interval,
+        pbar = tqdm(
+            range(100),
+            desc=prefix + "Init deform network",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            position=0,
+            leave=True,
+        )
+        for mapping_iteration in pbar:
+            dxyz, d_rot, d_scale, _, _ = self._get_deform_d_values(
+                viewpoint, use_noise=False, detach_outputs=False, iteration=0
             )
-            dxyz = d_values["d_xyz"]
-            d_rot = d_values["d_rotation"]
-            d_scale = d_values["d_scaling"]
-            render_pkg = render(
-                viewpoint,
-                self.gaussians,
-                self.pipeline_params,
-                self.background,
-                dynamic=False,
-                dx=dxyz,
-                ds=d_scale,
-                dr=d_rot,
-            )
-            (
-                image,
-                viewspace_point_tensor,
-                visibility_filter,
-                radii,
-                depth,
-                opacity,
-                n_touched,
-            ) = (
-                render_pkg["render"],
-                render_pkg["viewspace_points"],
-                render_pkg["visibility_filter"],
-                render_pkg["radii"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-                render_pkg["n_touched"],
-            )
+            render_pkg = self._render_viewpoint(viewpoint, dxyz, d_scale, d_rot)
+            image, _, _, _, depth, opacity, _, _ = self._unpack_render_pkg(render_pkg)
             loss_init = get_loss_mapping(
                 self.config["mapping"], image, depth, viewpoint, opacity, initialization=True
             )
@@ -2292,451 +2722,4 @@ class Mapper(object):
             dynamic=True,
             save_debug=getattr(self, "save_debug_visualization", False),
         )
-                           
-    def lncc(self,ref, nea):
-        # ref_gray: [batch_size, total_patch_size]
-        # nea_grays: [batch_size, total_patch_size]
-        bs, tps = nea.shape
-        patch_size = int(np.sqrt(tps))
 
-        ref_nea = ref * nea
-        ref_nea = ref_nea.view(bs, 1, patch_size, patch_size)
-        ref = ref.view(bs, 1, patch_size, patch_size)
-        nea = nea.view(bs, 1, patch_size, patch_size)
-        ref2 = ref.pow(2)
-        nea2 = nea.pow(2)
-
-        # sum over kernel
-        filters = torch.ones(1, 1, patch_size, patch_size, device=ref.device)
-        padding = patch_size // 2
-        ref_sum = F.conv2d(ref, filters, stride=1, padding=padding)[:, :, padding, padding]
-        nea_sum = F.conv2d(nea, filters, stride=1, padding=padding)[:, :, padding, padding]
-        ref2_sum = F.conv2d(ref2, filters, stride=1, padding=padding)[:, :, padding, padding]
-        nea2_sum = F.conv2d(nea2, filters, stride=1, padding=padding)[:, :, padding, padding]
-        ref_nea_sum = F.conv2d(ref_nea, filters, stride=1, padding=padding)[:, :, padding, padding]
-
-        # average over kernel
-        ref_avg = ref_sum / tps
-        nea_avg = nea_sum / tps
-
-        cross = ref_nea_sum - nea_avg * ref_sum
-        ref_var = ref2_sum - ref_avg * ref_sum
-        nea_var = nea2_sum - nea_avg * nea_sum
-
-        cc = cross * cross / (ref_var * nea_var + 1e-8)
-        ncc = 1 - cc
-        ncc = torch.clamp(ncc, 0.0, 2.0)
-        ncc = torch.mean(ncc, dim=1, keepdim=True)
-        mask = (ncc < 0.9)
-        return ncc, mask
-    def patch_warp(self,H, uv):
-        B, P = uv.shape[:2]
-        H = H.view(B, 3, 3)
-        ones = torch.ones((B, P, 1), device=uv.device)
-        homo_uv = torch.cat((uv, ones), dim=-1)
-
-        grid_tmp = torch.einsum("bik,bpk->bpi", H, homo_uv)
-        grid_tmp = grid_tmp.reshape(B, P, 3)
-        grid = grid_tmp[..., :2] / (grid_tmp[..., 2:] + 1e-10)
-        return grid
-    def patch_offsets(self,h_patch_size, device):
-        offsets = torch.arange(-h_patch_size, h_patch_size + 1, device=device)
-        return torch.stack(torch.meshgrid(offsets, offsets, indexing='xy')[::-1], dim=-1).view(1, -1, 2)
-    def compute_multi_view_loss(self, viewpoint_cam, render_pkg, gaussians, pipe, bg, dxyz, d_scale, d_rot, d_opac, d_color, nearest_cam):
-        """步骤：渲染最近视角→当前深度投影到最近视角→深度校正→重投影回当前像平面→几何掩码 d_mask→与 motion_mask 结合→NCC 损失。"""
-        if nearest_cam is None:
-            return 0.0
-        use_virtul_cam = False
-        # 获取配置参数
-        patch_size = 3
-        sample_num = 102400
-        pixel_noise_th = 1.0
-        ncc_weight = 0.15
-        # geo_weight = self.opt.multi_view_geo_weight
-        total_patch_size = (patch_size * 2 + 1) ** 2
-        gt_image, gt_image_gray = viewpoint_cam.get_image()
-        # 初始化损失
-        total_loss = 0.0
-
-        try:
-            ## 计算几何一致性掩码和损失
-            # 检查是否有动态掩码，如果两个视角都没有动态掩码，则跳过多视角损失计算
-            has_current_motion_mask = viewpoint_cam.motion_mask is not None
-            has_nearest_motion_mask = nearest_cam.motion_mask is not None
-
-
-            H, W = render_pkg["depth"].squeeze().shape
-            ix, iy = torch.meshgrid(
-                torch.arange(W), torch.arange(H), indexing='xy')
-            pixels = torch.stack([ix, iy], dim=-1).float().to(render_pkg["depth"].device)
-
-            # 渲染最近视角
-            nearest_render_pkg = render(nearest_cam, gaussians, pipe, bg, dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot,
-                                        do=d_opac, dc=d_color)
-
-            # 计算3D点投影
-            pts = gaussians.get_points_from_depth(viewpoint_cam, render_pkg["depth"])
-            pts_in_nearest_cam = pts @ nearest_cam.R_gt + nearest_cam.T_gt
-            map_z, d_mask = gaussians.get_points_depth_in_depth_map(nearest_cam, nearest_render_pkg["depth"],
-                                                                    pts_in_nearest_cam)
-
-            # 深度校正
-            pts_in_nearest_cam = pts_in_nearest_cam / (pts_in_nearest_cam[:, 2:3])
-            pts_in_nearest_cam = pts_in_nearest_cam * map_z.squeeze()[..., None]
-
-            # 坐标变换：最近视角相机坐标系 → 世界坐标系 → 当前视角相机坐标系
-            R_wvt = nearest_cam.R_gt
-            T_wvt = nearest_cam.T_gt
-            pts_ = (pts_in_nearest_cam - T_wvt) @ R_wvt.transpose(-1, -2)
-            pts_in_view_cam = pts_ @ viewpoint_cam.R_gt + viewpoint_cam.T_gt
-
-            # 投影到图像平面
-            pts_projections = torch.stack(
-                [pts_in_view_cam[:, 0] * viewpoint_cam.fx / pts_in_view_cam[:, 2] + viewpoint_cam.cx,
-                 pts_in_view_cam[:, 1] * viewpoint_cam.fy / pts_in_view_cam[:, 2] + viewpoint_cam.cy], -1).float()
-
-            # 计算像素噪声和权重
-            pixel_noise = torch.norm(pts_projections - pixels.reshape(*pts_projections.shape), dim=-1)
-            d_mask_before_motion = d_mask & (pixel_noise < pixel_noise_th)  # 保存应用motion_mask之前的d_mask
-            d_mask = d_mask_before_motion.clone()
-
-            # 将d_mask与motion_mask相乘（motion_mask=True表示静态区域）
-            # 直接在一维空间操作，避免reshape开销
-
-            # 与当前视角的静态掩码相乘
-            current_motion_mask = None
-            if has_current_motion_mask:
-                current_motion_mask = viewpoint_cam.motion_mask.reshape(-1).to(d_mask.device)
-                d_mask = d_mask & current_motion_mask
-
-            # 与临近视角的静态掩码相乘
-            nearest_motion_mask = None
-            if has_nearest_motion_mask:
-                nearest_motion_mask = nearest_cam.motion_mask.reshape(-1).to(d_mask.device)
-                d_mask = d_mask & nearest_motion_mask
-
-            # 可视化 d_mask 和 motion_mask 的结合效果
-            if hasattr(self, 'visualize_mask_combination') and self.visualize_mask_combination:
-                self._visualize_mask_combination(
-                    d_mask_before_motion, current_motion_mask, nearest_motion_mask, d_mask,
-                    H, W, viewpoint_cam, render_pkg, render_pkg["render"]
-                )
-
-            weights = (1.0 / torch.exp(pixel_noise)).detach()
-            weights[~d_mask] = 0
-
-            # 可视化 d_mask（可选，设置 visualize_mask=True 启用）
-            if hasattr(self, 'visualize_mask') and self.visualize_mask:
-                self._visualize_d_mask(d_mask, pixel_noise, H, W, viewpoint_cam, render_pkg)
-
-            # 几何损失（使用 torch.any 避免 GPU-CPU 同步）
-            if torch.any(d_mask):
-                # 如果不是虚拟相机，计算 NCC 损失
-                if use_virtul_cam is False:
-                    ncc_loss = self._compute_ncc_loss(
-                        viewpoint_cam, nearest_cam, render_pkg, gt_image_gray, pixel_noise,
-                        d_mask, weights, pixels, patch_size, sample_num, total_patch_size,
-                        ncc_weight
-                    )
-                    total_loss += ncc_loss
-
-            return 100*total_loss
-
-        except Exception as e:
-            print(f"Error in compute_multi_view_loss: {e}")
-            return 0.0
-
-    def _visualize_d_mask(self, d_mask, pixel_noise, H, W, viewpoint_cam, render_pkg):
-        """
-        可视化深度一致性掩码 d_mask
-
-        参数:
-            d_mask: 布尔掩码张量 [H*W]
-            pixel_noise: 像素重投影误差 [H*W]
-            H, W: 图像高度和宽度
-            viewpoint_cam: 当前视角相机
-            render_pkg: 渲染结果包
-        """
-        import matplotlib.pyplot as plt
-        import os
-
-        # 创建保存目录
-        vis_dir = os.path.join(self.save_dir, "d_mask_visualization")
-        os.makedirs(vis_dir, exist_ok=True)
-
-        # 将掩码和噪声转换为图像格式 - 先全部转换为numpy
-        d_mask_np = d_mask.reshape(H, W).detach().cpu().numpy()
-        d_mask_img = (d_mask_np * 255).astype(np.uint8)
-
-        pixel_noise_np = pixel_noise.reshape(H, W).detach().cpu().numpy()
-        pixel_noise_flat = pixel_noise_np.reshape(-1)  # 展平为一维数组
-
-        # 获取渲染的RGB图像和深度图
-        rendered_image = render_pkg["render"].detach().cpu().permute(1, 2, 0).numpy()
-        rendered_depth = render_pkg["depth"].squeeze().detach().cpu().numpy()
-
-        # 创建可视化图像
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-
-        # 1. 渲染的RGB图像
-        axes[0, 0].imshow(rendered_image)
-        axes[0, 0].set_title('渲染图像')
-        axes[0, 0].axis('off')
-
-        # 2. 渲染的深度图
-        depth_vis = axes[0, 1].imshow(rendered_depth, cmap='turbo')
-        axes[0, 1].set_title('渲染深度图')
-        axes[0, 1].axis('off')
-        plt.colorbar(depth_vis, ax=axes[0, 1])
-
-        # 3. d_mask 掩码（黑白）
-        axes[0, 2].imshow(d_mask_img, cmap='gray')
-        axes[0, 2].set_title(f'd_mask (有效点: {d_mask.sum().item()}/{d_mask.numel()})')
-        axes[0, 2].axis('off')
-
-        # 4. d_mask 叠加在RGB图像上（绿色表示有效区域）
-        overlay = rendered_image.copy()
-        mask_colored = np.zeros_like(overlay)
-        mask_colored[:, :, 1] = d_mask_img / 255.0  # 绿色通道
-        axes[1, 0].imshow(overlay * 0.5 + mask_colored * 0.5)
-        axes[1, 0].set_title('d_mask 叠加（绿色=有效）')
-        axes[1, 0].axis('off')
-
-        # 5. 像素重投影误差热力图
-        noise_vis = axes[1, 1].imshow(pixel_noise_np, cmap='hot', vmin=0, vmax=5)
-        axes[1, 1].set_title('像素重投影误差')
-        axes[1, 1].axis('off')
-        plt.colorbar(noise_vis, ax=axes[1, 1])
-
-        # 6. 误差分布直方图 - 修复这里！
-        d_mask_flat = d_mask_np.reshape(-1).astype(bool)  # 展平并转换为布尔数组
-        valid_noise = pixel_noise_flat[d_mask_flat]
-        invalid_noise = pixel_noise_flat[~d_mask_flat]
-
-        axes[1, 2].hist(valid_noise, bins=50, alpha=0.5, label='有效点', color='green')
-        axes[1, 2].hist(invalid_noise, bins=50, alpha=0.5, label='无效点', color='red')
-        axes[1, 2].set_xlabel('重投影误差 (像素)')
-        axes[1, 2].set_ylabel('频数')
-        axes[1, 2].set_title('误差分布')
-        axes[1, 2].legend()
-        axes[1, 2].set_xlim(0, 10)
-
-        plt.tight_layout()
-
-        # 保存图像
-        frame_id = viewpoint_cam.uid if hasattr(viewpoint_cam, 'uid') else 'unknown'
-        save_path = os.path.join(vis_dir, f"d_mask_frame_{frame_id}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-        print(f"[可视化] d_mask 已保存到: {save_path}")
-        print(
-            f"[统计] 有效点数: {d_mask.sum().item()} / {d_mask.numel()} ({100 * d_mask.sum().item() / d_mask.numel():.2f}%)")
-        print(f"[统计] 平均重投影误差 (有效): {valid_noise.mean():.3f} 像素")
-        if len(invalid_noise) > 0:
-            print(f"[统计] 平均重投影误差 (无效): {invalid_noise.mean():.3f} 像素")
-    
-    def _visualize_mask_combination(self, d_mask_before, current_motion_mask, nearest_motion_mask, 
-                                    d_mask_after, H, W, viewpoint_cam, render_pkg, gt_image):
-        """
-        可视化 d_mask 与 motion_mask 的结合效果
-        
-        参数:
-            d_mask_before: 应用 motion_mask 之前的 d_mask [H*W]
-            current_motion_mask: 当前视角的 motion_mask [H*W] 或 None
-            nearest_motion_mask: 临近视角的 motion_mask [H*W] 或 None
-            d_mask_after: 应用 motion_mask 之后的 d_mask [H*W]
-            H, W: 图像高度和宽度
-            viewpoint_cam: 当前视角相机
-            render_pkg: 渲染结果包
-            gt_image: 真实图像 [3, H, W]
-        """
-        import matplotlib.pyplot as plt
-        import os
-        
-        # 创建保存目录
-        vis_dir = os.path.join(self.save_dir, "mask_combination_visualization")
-        os.makedirs(vis_dir, exist_ok=True)
-        
-        # 转换为 numpy 数组
-        d_mask_before_np = d_mask_before.reshape(H, W).detach().cpu().numpy()
-        d_mask_after_np = d_mask_after.reshape(H, W).detach().cpu().numpy()
-        
-        # 获取真实图像
-        gt_image_np = gt_image.detach().cpu().permute(1, 2, 0).numpy()
-        gt_image_np = np.clip(gt_image_np, 0, 1)
-        
-        # 获取渲染图像
-        rendered_image = render_pkg["render"].detach().cpu().permute(1, 2, 0).numpy()
-        rendered_image = np.clip(rendered_image, 0, 1)
-        
-        # 计算需要的行数
-        num_rows = 3 if (current_motion_mask is not None or nearest_motion_mask is not None) else 2
-        fig, axes = plt.subplots(num_rows, 3, figsize=(15, 5 * num_rows))
-        
-        # 第一行：原始图像和 d_mask
-        axes[0, 0].imshow(gt_image_np)
-        axes[0, 0].set_title('真实图像')
-        axes[0, 0].axis('off')
-        
-        axes[0, 1].imshow(d_mask_before_np, cmap='gray')
-        valid_before = d_mask_before.sum().item()
-        axes[0, 1].set_title(f'd_mask (应用motion_mask前)\n有效点: {valid_before}/{d_mask_before.numel()} ({100*valid_before/d_mask_before.numel():.1f}%)')
-        axes[0, 1].axis('off')
-        
-        # d_mask 叠加在真实图像上
-        overlay_before = gt_image_np.copy()
-        mask_overlay = np.zeros_like(overlay_before)
-        mask_overlay[:, :, 1] = d_mask_before_np  # 绿色通道
-        axes[0, 2].imshow(overlay_before * 0.6 + mask_overlay * 0.4)
-        axes[0, 2].set_title('d_mask 叠加（绿色=有效）')
-        axes[0, 2].axis('off')
-        
-        # 第二行：motion_mask
-        row_idx = 1
-        if current_motion_mask is not None:
-            current_motion_np = current_motion_mask.reshape(H, W).detach().cpu().numpy()
-            axes[row_idx, 0].imshow(current_motion_np, cmap='RdYlGn')  # 红色=动态，绿色=静态
-            static_current = current_motion_mask.sum().item()
-            axes[row_idx, 0].set_title(f'当前视角 motion_mask\n静态点: {static_current}/{current_motion_mask.numel()} ({100*static_current/current_motion_mask.numel():.1f}%)')
-            axes[row_idx, 0].axis('off')
-        else:
-            axes[row_idx, 0].text(0.5, 0.5, 'No current\nmotion_mask', ha='center', va='center', fontsize=14)
-            axes[row_idx, 0].axis('off')
-        
-        if nearest_motion_mask is not None:
-            nearest_motion_np = nearest_motion_mask.reshape(H, W).detach().cpu().numpy()
-            axes[row_idx, 1].imshow(nearest_motion_np, cmap='RdYlGn')  # 红色=动态，绿色=静态
-            static_nearest = nearest_motion_mask.sum().item()
-            axes[row_idx, 1].set_title(f'临近视角 motion_mask\n静态点: {static_nearest}/{nearest_motion_mask.numel()} ({100*static_nearest/nearest_motion_mask.numel():.1f}%)')
-            axes[row_idx, 1].axis('off')
-        else:
-            axes[row_idx, 1].text(0.5, 0.5, 'No nearest\nmotion_mask', ha='center', va='center', fontsize=14)
-            axes[row_idx, 1].axis('off')
-        
-        # 组合的 motion_mask（如果两者都存在）
-        if current_motion_mask is not None and nearest_motion_mask is not None:
-            combined_motion = (current_motion_mask & nearest_motion_mask).reshape(H, W).detach().cpu().numpy()
-            axes[row_idx, 2].imshow(combined_motion, cmap='RdYlGn')
-            static_combined = (current_motion_mask & nearest_motion_mask).sum().item()
-            axes[row_idx, 2].set_title(f'组合 motion_mask (交集)\n静态点: {static_combined}/{current_motion_mask.numel()} ({100*static_combined/current_motion_mask.numel():.1f}%)')
-            axes[row_idx, 2].axis('off')
-        elif current_motion_mask is not None:
-            axes[row_idx, 2].imshow(current_motion_np, cmap='RdYlGn')
-            axes[row_idx, 2].set_title('组合 motion_mask\n(只有当前视角)')
-            axes[row_idx, 2].axis('off')
-        elif nearest_motion_mask is not None:
-            axes[row_idx, 2].imshow(nearest_motion_np, cmap='RdYlGn')
-            axes[row_idx, 2].set_title('组合 motion_mask\n(只有临近视角)')
-            axes[row_idx, 2].axis('off')
-        else:
-            axes[row_idx, 2].text(0.5, 0.5, 'No motion_mask', ha='center', va='center', fontsize=14)
-            axes[row_idx, 2].axis('off')
-        
-        # 第三行：最终结果和对比
-        row_idx = 2
-        axes[row_idx, 0].imshow(d_mask_after_np, cmap='gray')
-        valid_after = d_mask_after.sum().item()
-        axes[row_idx, 0].set_title(f'd_mask (应用motion_mask后)\n有效点: {valid_after}/{d_mask_after.numel()} ({100*valid_after/d_mask_after.numel():.1f}%)')
-        axes[row_idx, 0].axis('off')
-        
-        # 最终 d_mask 叠加在真实图像上
-        overlay_after = gt_image_np.copy()
-        mask_overlay_after = np.zeros_like(overlay_after)
-        mask_overlay_after[:, :, 1] = d_mask_after_np  # 绿色通道
-        axes[row_idx, 1].imshow(overlay_after * 0.6 + mask_overlay_after * 0.4)
-        axes[row_idx, 1].set_title('最终 d_mask 叠加')
-        axes[row_idx, 1].axis('off')
-        
-        # 差异图：显示被 motion_mask 过滤掉的点
-        diff_mask = d_mask_before_np.astype(float) - d_mask_after_np.astype(float)
-        diff_img = axes[row_idx, 2].imshow(diff_mask, cmap='Reds', vmin=0, vmax=1)
-        filtered_points = (d_mask_before & ~d_mask_after).sum().item()
-        axes[row_idx, 2].set_title(f'被 motion_mask 过滤的点\n过滤点数: {filtered_points} ({100*filtered_points/d_mask_before.numel():.1f}%)')
-        axes[row_idx, 2].axis('off')
-        plt.colorbar(diff_img, ax=axes[row_idx, 2])
-        
-        plt.tight_layout()
-        
-        # 保存图像
-        frame_id = viewpoint_cam.uid if hasattr(viewpoint_cam, 'uid') else 'unknown'
-        save_path = os.path.join(vis_dir, f"mask_combination_frame_{frame_id}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-
-    
-    def _compute_ncc_loss(self, viewpoint_cam, nearest_cam, render_pkg, gt_image_gray,pixel_noise,
-                          d_mask, weights, pixels, patch_size, sample_num, total_patch_size,
-                          ncc_weight):
-        """
-        计算 NCC 损失（内部辅助函数）
-        注意：单应性与 NCC 部分必须在 no_grad 外计算，否则多视角损失无法对深度/高斯回传梯度。
-        """
-        try:
-            loss = 0.0
-            geo_loss = 0.03 * ((weights * pixel_noise)[d_mask]).mean()
-            loss += geo_loss
-
-            # 仅在 no_grad 下做采样与 GT 相关计算，避免对不需要梯度的部分建图
-            with torch.no_grad():
-                d_mask_flat = d_mask.reshape(-1)
-                valid_indices = torch.arange(d_mask_flat.shape[0], device=d_mask.device)[d_mask_flat]
-                num_valid = valid_indices.shape[0]
-                if num_valid > sample_num:
-                    rand_indices = torch.randperm(num_valid, device=d_mask.device)[:sample_num]
-                    valid_indices = valid_indices[rand_indices]
-                weights_m = weights.reshape(-1)[valid_indices]
-                pixels_sampled = pixels.reshape(-1, 2)[valid_indices]
-                offsets = self.patch_offsets(patch_size, pixels.device)
-                ori_pixels_patch = pixels_sampled.reshape(-1, 1, 2) / 1.0 + offsets.float()
-                H, W = gt_image_gray.squeeze().shape
-                pixels_patch = ori_pixels_patch.clone()
-                pixels_patch[:, :, 0] = 2 * pixels_patch[:, :, 0] / (W - 1) - 1.0
-                pixels_patch[:, :, 1] = 2 * pixels_patch[:, :, 1] / (H - 1) - 1.0
-                ref_gray_val = F.grid_sample(gt_image_gray.unsqueeze(1), pixels_patch.view(1, -1, 1, 2),
-                                             align_corners=True)
-                ref_gray_val = ref_gray_val.reshape(-1, total_patch_size)
-                ref_to_neareast_r = nearest_cam.R_gt.transpose(-1, -2) @ viewpoint_cam.R_gt
-                ref_to_neareast_t = -ref_to_neareast_r @ viewpoint_cam.T_gt + nearest_cam.T_gt
-
-            # 使用渲染的法向量（最短轴按不透明度）计算单应，无则退化为深度法向量
-            ref_local_n = render_pkg["normal"].permute(1, 2, 0).reshape(-1, 3)[valid_indices]
-            ix, iy = torch.meshgrid(
-                torch.arange(W, device=render_pkg["depth"].device),
-                torch.arange(H, device=render_pkg["depth"].device), indexing='xy')
-            rays_d = torch.stack(
-                [(ix - viewpoint_cam.cx / 1) / viewpoint_cam.fx * 1,
-                 (iy - viewpoint_cam.cy / 1) / viewpoint_cam.fy * 1,
-                 torch.ones_like(ix)], -1).float().to(render_pkg["depth"].device)
-            ref_local_d = render_pkg["depth"] / rays_d[..., 2]
-            ref_local_d = ref_local_d.reshape(-1)[valid_indices]
-
-            H_ref_to_neareast = ref_to_neareast_r[None] - \
-                                torch.matmul(ref_to_neareast_t[None, :, None].expand(ref_local_d.shape[0], 3, 1),
-                                             ref_local_n[:, :, None].expand(ref_local_d.shape[0], 3, 1).permute(0, 2, 1)) / \
-                                ref_local_d[..., None, None]
-            H_ref_to_neareast = torch.matmul(
-                nearest_cam.get_k(1)[None].expand(ref_local_d.shape[0], 3, 3), H_ref_to_neareast)
-            H_ref_to_neareast = H_ref_to_neareast @ viewpoint_cam.get_inv_k(1)
-
-            grid = self.patch_warp(H_ref_to_neareast.reshape(-1, 3, 3), ori_pixels_patch)
-            grid = grid.clone()
-            grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
-            grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
-            _, nearest_image_gray = nearest_cam.get_image()
-            sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
-            sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
-
-            ncc, ncc_mask = self.lncc(ref_gray_val, sampled_gray_val)
-            mask = ncc_mask.reshape(-1)
-            ncc = ncc.reshape(-1) * weights_m
-            ncc = ncc[mask].squeeze()
-
-            if ncc.numel() > 0:
-                ncc_loss = ncc_weight * ncc.mean()
-                loss = loss + ncc_loss
-            return loss
-
-        except Exception as e:
-            print(f"Error in _compute_ncc_loss: {e}")
-            return 0.0
