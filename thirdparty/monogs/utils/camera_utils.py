@@ -119,26 +119,8 @@ class Camera(nn.Module):
         self.dino_feat = None  # 由 dynamic_mask_detector 填充，用于 SAM/DINO 动态分割
     @staticmethod
     def init_from_dataset(dataset, video_idx,idx,data, projection_matrix):
-        _, _, _, _, motion_mask, _, _, _ = dataset[idx]
+        _, _, _, _, motion_mask, normal, _, _ = dataset[idx]
         time = idx / (len(dataset) - 1)
-
-        # 使用 PGSR 方式从真实深度计算法向，仅在创建 viewpoint 时算一次，不在每次渲染时算。
-        glorie_depth = data["glorie_depth"]
-        if isinstance(glorie_depth, np.ndarray):
-            glorie_depth_t = torch.from_numpy(glorie_depth).float().to(dataset.device)
-        elif isinstance(glorie_depth, torch.Tensor):
-            glorie_depth_t = glorie_depth.to(device=dataset.device, dtype=torch.float32)
-        else:
-            glorie_depth_t = None
-
-        normal = None
-        if glorie_depth_t is not None:
-            try:
-                normal = dataset.depth_to_normal_pgsr(glorie_depth_t)
-            except Exception:
-                pass
-        if normal is None:
-            normal = torch.zeros(3, dataset.H_out, dataset.W_out, device=dataset.device, dtype=torch.float32)
 
         return Camera(
             data["idx"],

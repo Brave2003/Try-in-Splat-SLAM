@@ -503,24 +503,60 @@ class Mapper(object):
         return s.item(), t.item()
 
     def get_surface_normalv2(self, xyz, patch_size=3):
-        """从 xyz 网格计算法向（PGSR 方式）：四邻域 cross(left_to_right, bottom_to_top)，归一化后边界 pad。
-
-        xyz: (b, h, w, 3)；return: normal [h, w, 3, b]。与 PGSR depth_pcd2normal 一致，不再用 3x3 双叉乘平均。
         """
+        xyz: xyz coordinates
+        patch: [p1, p2, p3,
+                p4, p5, p6,
+                p7, p8, p9]
+        surface_normal = [(p9-p1) x (p3-p7)] + [(p6-p4) - (p8-p2)]
+        return: normal [h, w, 3, b]
+        """
+        eps = 1e-8
         b, h, w, c = xyz.shape
-        # PGSR: left/right/top/bottom 与 depth_pcd2normal 相同索引
-        left_point = xyz[:, 1 : h - 1, 0 : w - 2, :]
-        right_point = xyz[:, 1 : h - 1, 2:w, :]
-        top_point = xyz[:, 0 : h - 2, 1 : w - 1, :]
-        bottom_point = xyz[:, 2:h, 1 : w - 1, :]
-        left_to_right = right_point - left_point
-        bottom_to_top = top_point - bottom_point
-        xyz_normal = torch.cross(left_to_right, bottom_to_top, dim=-1)
-        xyz_normal = torch.nn.functional.normalize(xyz_normal, p=2, dim=-1)
-        xyz_normal = torch.nn.functional.pad(
-            xyz_normal, (0, 0, 1, 1, 1, 1), mode="constant"
-        )
-        return xyz_normal.permute(1, 2, 3, 0)
+        half_patch = patch_size // 2
+        xyz_pad = torch.zeros((b, h + patch_size - 1, w + patch_size - 1, c), dtype=xyz.dtype, device=xyz.device)
+        xyz_pad[:, half_patch:-half_patch, half_patch:-half_patch, :] = xyz
+
+
+        xyz_left = xyz_pad[:, half_patch:half_patch + h, :w, :]  # p4
+        xyz_right = xyz_pad[:, half_patch:half_patch + h, -w:, :]  # p6
+        xyz_top = xyz_pad[:, :h, half_patch:half_patch + w, :]  # p2
+        xyz_bottom = xyz_pad[:, -h:, half_patch:half_patch + w, :]  # p8
+        xyz_horizon = xyz_left - xyz_right  # p4p6
+        xyz_vertical = xyz_top - xyz_bottom  # p2p8
+
+        xyz_left_in = xyz_pad[:, half_patch:half_patch + h, 1:w + 1, :]  # p4
+        xyz_right_in = xyz_pad[:, half_patch:half_patch + h, patch_size - 1:patch_size - 1 + w, :]  # p6
+        xyz_top_in = xyz_pad[:, 1:h + 1, half_patch:half_patch + w, :]  # p2
+        xyz_bottom_in = xyz_pad[:, patch_size - 1:patch_size - 1 + h, half_patch:half_patch + w, :]  # p8
+        xyz_horizon_in = xyz_left_in - xyz_right_in  # p4p6
+        xyz_vertical_in = xyz_top_in - xyz_bottom_in  # p2p8
+
+        n_img_1 = torch.cross(xyz_horizon_in, xyz_vertical_in, dim=3)
+        n_img_2 = torch.cross(xyz_horizon, xyz_vertical, dim=3)
+
+        # re-orient normals consistently
+        orient_mask = torch.sum(n_img_1 * xyz, dim=3) > 0
+        n_img_1[orient_mask] *= -1
+        orient_mask = torch.sum(n_img_2 * xyz, dim=3) > 0
+        n_img_2[orient_mask] *= -1
+
+        n_img1_L2 = torch.sqrt(torch.sum(n_img_1 ** 2, dim=3, keepdim=True)+ eps)
+        n_img1_norm = n_img_1 / (n_img1_L2 + 1e-8)
+
+        n_img2_L2 = torch.sqrt(torch.sum(n_img_2 ** 2, dim=3, keepdim=True)+ eps)
+        n_img2_norm = n_img_2 / (n_img2_L2 + 1e-8)
+
+        # average 2 norms
+        n_img_aver = n_img1_norm + n_img2_norm
+        n_img_aver_L2 = torch.sqrt(torch.sum(n_img_aver ** 2, dim=3, keepdim=True)+ eps)
+        n_img_aver_norm = n_img_aver / (n_img_aver_L2 + 1e-8)
+        # re-orient normals consistently
+        orient_mask = torch.sum(n_img_aver_norm * xyz, dim=3) > 0
+        n_img_aver_norm[orient_mask] *= -1
+        n_img_aver_norm_out = n_img_aver_norm.permute((1, 2, 3, 0))  # [h, w, c, b]
+
+        return n_img_aver_norm_out  # n_img1_norm.permute((1, 2, 3, 0))
 
     def obtain_allimgs_st(
         self,

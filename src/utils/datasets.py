@@ -502,34 +502,33 @@ class BaseDataset(Dataset):
             color_data = color_data[:, :, edge:-edge, :]
             depth_data = depth_data[edge:-edge, :]
 
-        # 法向量改为从真实深度计算，不再从 normal_paths 加载
         if self.normal_paths:
             try:
                 normal_path = self.normal_paths[index]
-                normal_data = np.load(normal_path)
+                normal_data= np.load(normal_path)
                 normal_data = cv2.cvtColor(normal_data, cv2.COLOR_BGR2RGB)
-                normal_data = cv2.resize(
-                    normal_data, (self.W_out_with_edge, self.H_out_with_edge)
-                )
-                normal_data = (
-                    torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
-                )
-                normal_data = normal_data.unsqueeze(dim=0)
+                normal_data = cv2.resize(normal_data, (self.W_out_with_edge, self.H_out_with_edge))
+                normal_data= torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
+                normal_data=normal_data.unsqueeze(dim=0)
                 if self.W_edge > 0:
                     edge = self.W_edge
                     normal_data = normal_data[:, :, :, edge:-edge]
+
                 if self.H_edge > 0:
                     edge = self.H_edge
-                    normal_data = normal_data[:, :, edge:-edge, :]
-                normal_input = normal_data * 2.0 - 1.0
+                    normal_data = normal_data[:,  :,edge:-edge, :]
+                #normal_input  = torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
+
+                normal_input  = normal_data * 2.0 - 1.0
+                # print("norm",normal_input.shape)
             except Exception as e:
                 print(f"Failed to load normal map: {e}")
-        if depth_data_fullsize is not None:
-            normal_input = self.depth_to_normal(depth_data)
-        else:
-            normal_input = torch.zeros(
-                3, self.H_out, self.W_out, device=self.device, dtype=torch.float32
-            )
+        # if depth_data_fullsize is not None:
+        #     normal_input = self.depth_to_normal(depth_data)
+        # else:
+        #     normal_input = torch.zeros(
+        #         3, self.H_out, self.W_out, device=self.device, dtype=torch.float32
+        #     )
 
         # --- 4. 掩码：优先使用前端保存的 motion_mask 图片，否则默认全静态 ---
 
