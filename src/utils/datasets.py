@@ -26,23 +26,6 @@ import torchvision.transforms as transforms
 from ultralytics import YOLO
 
 
-def _depth_pcd2normal_pgsr(xyz):
-    """PGSR 风格：由相机系点云网格 (H,W,3) 计算法向，cross(left_to_right, bottom_to_top)，边界 pad 常数。
-
-    与 PGSR utils/graphics_utils.py 中 depth_pcd2normal 一致（无 offset 分支）。
-    """
-    hd, wd, _ = xyz.shape
-    bottom_point = xyz[2:hd, 1 : wd - 1, :]
-    top_point = xyz[0 : hd - 2, 1 : wd - 1, :]
-    right_point = xyz[1 : hd - 1, 2:wd, :]
-    left_point = xyz[1 : hd - 1, 0 : wd - 2, :]
-    left_to_right = right_point - left_point
-    bottom_to_top = top_point - bottom_point
-    xyz_normal = torch.cross(left_to_right, bottom_to_top, dim=-1)
-    xyz_normal = F.normalize(xyz_normal, p=2, dim=-1)
-    xyz_normal = F.pad(xyz_normal.permute(2, 0, 1), (1, 1, 1, 1), mode="constant").permute(1, 2, 0)
-    return xyz_normal
-
 
 def readEXR_onlydepth(filename):
     """
@@ -255,74 +238,6 @@ class BaseDataset(Dataset):
     #     depth_data = depth_data.astype(np.float32) / depth_scale
     #     return depth_data
 
-    def normalloader(self, index, normal_paths, normal_scale=1.0):
-        """
-        读取法向量图的函数
-
-        参数:
-            index: 要读取的法向量图索引
-            normal_paths: 法向量图路径列表
-            normal_scale: 法向量值缩放因子(默认为1.0)
-
-        返回:
-            normal_data: 法向量数据(torch.Tensor, shape: [H,W,3] 或 [3,H,W])
-        """
-        # 检查索引有效性
-        if index >= len(normal_paths):
-            raise IndexError(f"索引 {index} 越界，法向量图列表长度：{len(normal_paths)}")
-
-        normal_path = normal_paths[index]
-
-        # 检查文件存在性
-        if not os.path.exists(normal_path):
-            raise FileNotFoundError(f"法向量图文件不存在：{normal_path}")
-
-        # 读取文件
-        try:
-            if normal_path.endswith(".png"):
-                # PNG格式通常将法向量存储在RGB通道中，值范围[0,255]
-                normal_data = cv2.imread(normal_path, cv2.IMREAD_UNCHANGED)
-                if normal_data is not None and len(normal_data.shape) == 3:
-                    normal_data = cv2.cvtColor(normal_data, cv2.COLOR_BGR2RGB)  # 转换为RGB顺序
-            elif normal_path.endswith(".exr"):
-                # EXR格式可以直接存储浮点法向量
-                normal_data = cv2.imread(normal_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-            else:
-                raise ValueError(f"不支持的法向量图格式：{normal_path}")
-        except Exception as e:
-            raise RuntimeError(f"读取法向量图失败：{str(e)}")
-
-        # 检查数据有效性
-        if normal_data is None:
-            raise ValueError(f"无法解析法向量图：{normal_path}")
-        if not np.issubdtype(normal_data.dtype, np.number):
-            raise TypeError(f"法向量图数据非数值类型：{normal_path}")
-
-        # 检查缩放因子
-        if normal_scale <= 0 or not isinstance(normal_scale, (int, float)):
-            raise ValueError(f"无效的法向量缩放因子：{normal_scale}")
-
-        # 转换和缩放
-        if normal_path.endswith(".png"):
-            # PNG格式的法向量通常需要从[0,255]映射到[-1,1]
-            normal_data = normal_data.astype(np.float32) / 255.0 * 2.0 - 1.0
-        else:
-            # EXR或其他格式直接转换为浮点数
-            normal_data = normal_data.astype(np.float32)
-
-        # 应用缩放因子
-        normal_data = normal_data * normal_scale
-
-        # 确保法向量是单位向量(可选)
-        # norm = np.linalg.norm(normal_data, axis=-1, keepdims=True)
-        # normal_data = normal_data / (norm + 1e-6)
-
-        # 转换为PyTorch张量并调整维度顺序
-        normal_data = torch.from_numpy(normal_data).float()
-        if len(normal_data.shape) == 3:  # 如果有通道维度
-            normal_data = normal_data.permute(2, 0, 1)  # 从HWC转为CHW
-
-        return normal_data
     def get_color(self,index):
         # not used now
         color_path = self.color_paths[index]
@@ -359,40 +274,6 @@ class BaseDataset(Dataset):
         if self.H_edge > 0:
             intrinsic[3] -= self.H_edge   
         return intrinsic
-
-    def depth_to_normal_pgsr(self, depth, smooth_depth=False):
-        """从深度图计算法向量（PGSR 方式）：相机反投影得到 xyz，再用 cross(left_to_right, bottom_to_top) 归一化。
-
-        与 PGSR 的 normal_from_depth_image / depth_pcd2normal 一致，仅在创建 viewpoint 时用真实深度算一次，
-        不在每次渲染时重复计算。
-        """
-        dev = depth.device if isinstance(depth, torch.Tensor) else self.device
-        if not isinstance(depth, torch.Tensor):
-            depth = torch.from_numpy(depth).float().to(dev)
-        else:
-            depth = depth.to(dev)
-        H, W = depth.shape[0], depth.shape[1]
-        if smooth_depth:
-            depth_np = depth.cpu().numpy()
-            depth_np = cv2.medianBlur(depth_np.astype(np.float32), 3)
-            depth = torch.from_numpy(depth_np).float().to(dev)
-        fx, fy = self.fx, self.fy
-        cx, cy = self.cx, self.cy
-        if isinstance(fx, (int, float)):
-            fx = torch.tensor(fx, device=dev, dtype=depth.dtype)
-            fy = torch.tensor(fy, device=dev, dtype=depth.dtype)
-            cx = torch.tensor(cx, device=dev, dtype=depth.dtype)
-            cy = torch.tensor(cy, device=dev, dtype=depth.dtype)
-        u, v = torch.meshgrid(
-            torch.arange(W, device=dev, dtype=depth.dtype),
-            torch.arange(H, device=dev, dtype=depth.dtype),
-            indexing="xy",
-        )
-        x = (u - cx) / fx * depth
-        y = (v - cy) / fy * depth
-        xyz = torch.stack([x, y, depth], dim=-1)
-        xyz_normal = _depth_pcd2normal_pgsr(xyz)
-        return xyz_normal.permute(2, 0, 1)
 
     def depth_to_normal(self, depth, smooth_depth=True, use_median_filter=False, k_scale=1.0):
         """从深度图估计法向量（mapper 同款）：相机反投影 + 邻域叉乘。
@@ -541,63 +422,29 @@ class BaseDataset(Dataset):
             edge = self.H_edge
             color_data = color_data[:, :, edge:-edge, :]
             depth_data = depth_data[edge:-edge, :]
-
-        mask_input = torch.zeros((self.H_out, self.W_out), device=self.device, dtype=torch.bool)
-        if self.mask_paths:
+        
+        # 法向量改为从真实深度计算，不再从 normal_paths 加载
+        if self.normal_paths:
             try:
-                mask_img = Image.open(self.mask_paths[index])
-                
-                # Handle both color and grayscale masks
-                if mask_img.mode == 'RGB' or mask_img.mode == 'RGBA':
-                    # Color mask: any non-black pixel is considered dynamic
-                    mask_np = np.array(mask_img)
-                    if mask_img.mode == 'RGBA':
-                        mask_np = mask_np[:, :, :3]  # Remove alpha channel
-                    # Sum across RGB channels: any pixel with R+G+B > threshold is dynamic
-                    mask = (mask_np.sum(axis=2) > 10).astype(np.uint8) * 255
-                    mask_img = Image.fromarray(mask, mode='L')
-                else:
-                    # Grayscale mask: use as-is
-                    mask_img = mask_img.convert("L")
-                
-                mask_tensor = transforms.ToTensor()(mask_img)  # [1, H_orig, W_orig]
-                mask = (mask_tensor > 0.01).to(torch.bool).squeeze(0)  # [H_orig, W_orig]
-                mask_resized = F.interpolate(
-                    mask.unsqueeze(0).unsqueeze(0).float(),  
-                    size=outsize,
-                    mode='nearest'
-                ).squeeze().to(torch.bool)  # [H_out, W_out]
+                normal_path = self.normal_paths[index]
+                normal_data= np.load(normal_path)
+                normal_data = cv2.cvtColor(normal_data, cv2.COLOR_BGR2RGB)
+                normal_data = cv2.resize(normal_data, (self.W_out_with_edge, self.H_out_with_edge))
+                normal_data= torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
+                normal_data=normal_data.unsqueeze(dim=0)
                 if self.W_edge > 0:
                     edge = self.W_edge
-                    mask_resized = mask_resized[:, edge:-edge]
+                    normal_data = normal_data[:, :, :, edge:-edge]
                 if self.H_edge > 0:
                     edge = self.H_edge
-                    mask_resized = mask_resized[edge:-edge, :]
-                mask_input = mask_resized.to(self.device)
+                    normal_data = normal_data[:,  :,edge:-edge, :]
+                normal_input  = normal_data * 2.0 - 1.0
             except Exception as e:
-                print(f"mask error(index {index}): {e}")
-        # 法向量改为从真实深度计算，不再从 normal_paths 加载
-        # if self.normal_paths:
-        #     try:
-        #         normal_path = self.normal_paths[index]
-        #         normal_data= np.load(normal_path)
-        #         normal_data = cv2.cvtColor(normal_data, cv2.COLOR_BGR2RGB)
-        #         normal_data = cv2.resize(normal_data, (self.W_out_with_edge, self.H_out_with_edge))
-        #         normal_data= torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
-        #         normal_data=normal_data.unsqueeze(dim=0)
-        #         if self.W_edge > 0:
-        #             edge = self.W_edge
-        #             normal_data = normal_data[:, :, :, edge:-edge]
-        #         if self.H_edge > 0:
-        #             edge = self.H_edge
-        #             normal_data = normal_data[:,  :,edge:-edge, :]
-        #         normal_input  = normal_data * 2.0 - 1.0
-        #     except Exception as e:
-        #         print(f"Failed to load normal map: {e}")
-        # if depth_data_fullsize is not None:
-        #     normal_input = self.depth_to_normal(depth_data)
-        # else:
-        normal_input = torch.zeros(3, self.H_out, self.W_out, device=self.device, dtype=torch.float32)
+                print(f"Failed to load normal map: {e}")
+        if depth_data_fullsize is not None:
+            normal_input = self.depth_to_normal(depth_data)
+        else:
+            normal_input = torch.zeros(3, self.H_out, self.W_out, device=self.device, dtype=torch.float32)
 
         # --- 4. 掩码：优先使用前端保存的 motion_mask 图片，否则默认全静态 ---
         
@@ -941,7 +788,7 @@ class TUM_RGBD(BaseDataset):
             self.mask_path = None
         normal_paths = []
         if os.path.isdir(os.path.join(datapath, "normal")):
-            self.normal_path = sorted(glob.glob(os.path.join(self.input_folder, "normal", "*.npy")),
+            self.normal_path = sorted(glob.glob(os.path.join(self.input_folder, "normal", "normal_npz", "*.npy")),
                                        key=self.extract_number)
             # print("Using normal maps (normal)")
         else:
