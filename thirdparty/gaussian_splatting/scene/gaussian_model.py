@@ -18,7 +18,8 @@ from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
 from src.utils.deformation import pose_network
-#from models.sequence import GaussianSequence
+
+# from models.sequence import GaussianSequence
 from thirdparty.gaussian_splatting.utils.general_utils import (
     build_rotation,
     build_rotation_matrix_from_normal,
@@ -31,20 +32,28 @@ from thirdparty.gaussian_splatting.utils.general_utils import (
 )
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from thirdparty.gaussian_splatting.utils.graphics_utils import PHASE_NAMES
-from thirdparty.gaussian_splatting.utils.graphics_utils import BasicPointCloud, getWorld2View2,get_linear_noise_func
+from thirdparty.gaussian_splatting.utils.graphics_utils import (
+    BasicPointCloud,
+    getWorld2View2,
+    get_linear_noise_func,
+)
 from thirdparty.gaussian_splatting.utils.sh_utils import RGB2SH
 from thirdparty.gaussian_splatting.utils.system_utils import mkdir_p
 from thirdparty.gaussian_splatting.scene.deform_model import DeformModel
 from utils.deformation import deform_network
+
+
 class GaussianModel:
-    def __init__(self, sh_degree: int, config=None,args=None, fea_dim=0, init_deform=False):
+    def __init__(
+        self, sh_degree: int, config=None, args=None, fea_dim=0, init_deform=False
+    ):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         self._segmentation = torch.empty(0, device="cuda")
         self._xyz = torch.empty(0, device="cuda")
         self._features_dc = torch.empty(0, device="cuda")
         self._features_rest = torch.empty(0, device="cuda")
-        self._delta_xyz = torch.empty(0,device="cuda")
+        self._delta_xyz = torch.empty(0, device="cuda")
         self._scaling = torch.empty(0, device="cuda")
         self._rotation = torch.empty(0, device="cuda")
         self._opacity = torch.empty(0, device="cuda")
@@ -53,12 +62,12 @@ class GaussianModel:
         self.dygs = torch.empty(0, device="cuda").bool()
         self.unique_kfIDs = torch.empty(0).int()
         self.n_obs = torch.empty(0).int()
-        self.depth_remove_outliers=True
+        self.depth_remove_outliers = True
         self.optimizer = None
-        self.pcs=[]
+        self.pcs = []
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-        self.outlier_std_ratio=1.5
+        self.outlier_std_ratio = 1.5
         self.covariance_activation = self.build_covariance_from_scaling_rotation
 
         self.opacity_activation = torch.sigmoid
@@ -78,19 +87,31 @@ class GaussianModel:
         # self._deformation = deform_network(args, device=self._xyz.device)
         # SC-GS
         if init_deform:
-        #    print("args.deform  type",args.deform_type)
-           self.deform = DeformModel(K=args.K, deform_type=args.deform_type, is_blender=args.is_blender,
-                                      skinning=args.skinning, hyper_dim=args.hyper_dim, node_num=args.node_num,
-                                      pred_opacity=args.pred_opacity, pred_color=args.pred_color,
-                                      use_hash=args.use_hash,
-                                      hash_time=args.hash_time,
-                                      d_rot_as_res=args.d_rot_as_res and not args.d_rot_as_rotmat,
-                                      local_frame=args.local_frame, progressive_brand_time=args.progressive_brand_time,
-                                      with_arap_loss=not args.no_arap_loss, max_d_scale=args.max_d_scale,
-                                      enable_densify_prune=args.node_enable_densify_prune,
-                                      is_scene_static=args.is_scene_static)
+            #    print("args.deform  type",args.deform_type)
+            self.deform = DeformModel(
+                K=args.K,
+                deform_type=args.deform_type,
+                is_blender=args.is_blender,
+                skinning=args.skinning,
+                hyper_dim=args.hyper_dim,
+                node_num=args.node_num,
+                pred_opacity=args.pred_opacity,
+                pred_color=args.pred_color,
+                use_hash=args.use_hash,
+                hash_time=args.hash_time,
+                d_rot_as_res=args.d_rot_as_res and not args.d_rot_as_rotmat,
+                local_frame=args.local_frame,
+                progressive_brand_time=args.progressive_brand_time,
+                with_arap_loss=not args.no_arap_loss,
+                max_d_scale=args.max_d_scale,
+                enable_densify_prune=args.node_enable_densify_prune,
+                is_scene_static=args.is_scene_static,
+            )
         # # self.deform.train_setting(args)
-        self.smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
+        self.smooth_term = get_linear_noise_func(
+            lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000
+        )
+
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
     ):
@@ -98,8 +119,10 @@ class GaussianModel:
         actual_covariance = L @ L.transpose(1, 2)
         symm = strip_symmetric(actual_covariance)
         return symm
+
     def create_pose_network(self, dataset):
         self._posenet = pose_network(dataset=dataset).to("cuda")
+
     @property
     def get_scaling(self):
         # _scaling 为 log-scale（可为负），实际尺度 = exp(_scaling)，恒正
@@ -116,18 +139,21 @@ class GaussianModel:
     @property
     def motion_dy_mask(self):
         return torch.ones_like(self._xyz[self.dygs].unsqueeze(1))
+
     @property
     def motion_mask(self):
-        #print("mask",self.dygs, self._xyz[..., :1].shape)
+        # print("mask",self.dygs, self._xyz[..., :1].shape)
         return torch.ones_like(self.get_dygs_xyz[..., :1])
         return self.dygs.unsqueeze(1)
         if self.with_motion_mask:
             return torch.sigmoid(self.feature[..., -1:])
         else:
             return torch.ones_like(self._xyz[..., :1])
+
     @property
     def get_dygs_xyz(self):
         return self._xyz[self.dygs]
+
     @property
     def get_features(self):
         features_dc = self._features_dc
@@ -147,7 +173,9 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None, add_dygs=False):
+    def create_pcd_from_image(
+        self, cam_info, init=False, scale=2.0, depthmap=None, add_dygs=False
+    ):
         cam = cam_info
 
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
@@ -175,6 +203,7 @@ class GaussianModel:
             depth[cam.motion_mask.cpu().numpy()] = 0
             depth = o3d.geometry.Image(depth.astype(np.float32))
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
+
     def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
         if init:
             downsample_factor = self.config["mapping"]["pcd_downsample_init"]
@@ -184,12 +213,14 @@ class GaussianModel:
         if "adaptive_pointsize" in self.config["mapping"]:
             if self.config["mapping"]["adaptive_pointsize"]:
                 # The point size can at max be 0.05. I wonder if this can
-                # cause problems in the RGB-only case since 0.05 does not 
-                # really mean much then. Well as long as we initialize to 
+                # cause problems in the RGB-only case since 0.05 does not
+                # really mean much then. Well as long as we initialize to
                 # reasonable scale it should be ok.
-                #point_size = min(0.05, point_size * np.median(depth))
-                point_size = min(0.05, point_size * np.median(cam.depth[cam.depth > 0.1]))
-                #point_size = min(0.05, point_size * np.median(depth[depth>0.1]))
+                # point_size = min(0.05, point_size * np.median(depth))
+                point_size = min(
+                    0.05, point_size * np.median(cam.depth[cam.depth > 0.1])
+                )
+                # point_size = min(0.05, point_size * np.median(depth[depth>0.1]))
 
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             rgb,
@@ -258,16 +289,30 @@ class GaussianModel:
         # 小改动：若 viewpoint 有预计算的法向图，将世界点投影到图像采样法向，仅用其初始化旋转以加速法向收敛
         normal_map = getattr(cam, "normal", None)
         if normal_map is not None and False:
-            R_w2c = cam.R if torch.is_tensor(cam.R) else torch.from_numpy(np.asarray(cam.R)).float().to(fused_point_cloud.device)
-            T_w2c = cam.T if torch.is_tensor(cam.T) else torch.from_numpy(np.asarray(cam.T).reshape(3)).float().to(fused_point_cloud.device)
+            R_w2c = (
+                cam.R
+                if torch.is_tensor(cam.R)
+                else torch.from_numpy(np.asarray(cam.R))
+                .float()
+                .to(fused_point_cloud.device)
+            )
+            T_w2c = (
+                cam.T
+                if torch.is_tensor(cam.T)
+                else torch.from_numpy(np.asarray(cam.T).reshape(3))
+                .float()
+                .to(fused_point_cloud.device)
+            )
             if R_w2c.dim() == 1:
                 R_w2c = R_w2c.reshape(3, 3)
             xyz_w = fused_point_cloud  # (N, 3)
             p_c = (R_w2c @ xyz_w.T).T + T_w2c  # (N, 3)
+
             def _to_tensor(x, device, dtype):
                 if torch.is_tensor(x):
                     return x.to(device=device, dtype=dtype)
                 return torch.tensor(float(x), device=device, dtype=dtype)
+
             fx = _to_tensor(cam.fx, xyz_w.device, xyz_w.dtype)
             fy = _to_tensor(cam.fy, xyz_w.device, xyz_w.dtype)
             cx = _to_tensor(cam.cx, xyz_w.device, xyz_w.dtype)
@@ -275,7 +320,11 @@ class GaussianModel:
             z = p_c[:, 2].clamp(min=1e-6)
             u = (fx * p_c[:, 0] / z + cx).round().long().clamp(0, cam.image_width - 1)
             v = (fy * p_c[:, 1] / z + cy).round().long().clamp(0, cam.image_height - 1)
-            nn = normal_map if torch.is_tensor(normal_map) else torch.from_numpy(np.asarray(normal_map)).float()
+            nn = (
+                normal_map
+                if torch.is_tensor(normal_map)
+                else torch.from_numpy(np.asarray(normal_map)).float()
+            )
             nn = nn.to(device=xyz_w.device, dtype=xyz_w.dtype)
             if nn.dim() == 3 and nn.shape[0] == 3:
                 normal_cam = nn[:, v, u].T  # (N, 3)
@@ -305,11 +354,11 @@ class GaussianModel:
         if cam.motion_mask is not None and torch.all(cam.motion_mask):
             print("no dynamic object")
             return False
-        elif torch.sum(~cam.motion_mask) < self.config["mapping"]["pcd_downsample"]*2:
+        elif torch.sum(~cam.motion_mask) < self.config["mapping"]["pcd_downsample"] * 2:
             print("False count is too low.")
             return False
         if not self.deform_init:
-            downsample_factor = self.config["mapping"]["pcd_downsample_init"]*2
+            downsample_factor = self.config["mapping"]["pcd_downsample_init"] * 2
         else:
             downsample_factor = self.config["mapping"]["pcd_downsample_init"]
         depth_raw = np.copy(cam.depth)
@@ -349,56 +398,94 @@ class GaussianModel:
         fused_point_cloud = torch.from_numpy(new_xyz).float().cuda()
         if self.deform_init:
             print(len(fused_point_cloud))
-            self.deform.extend_node_from_point(init_pcl=fused_point_cloud, keep_all=True,force_init=True, reset_bbox=False)
+            self.deform.extend_node_from_point(
+                init_pcl=fused_point_cloud,
+                keep_all=True,
+                force_init=True,
+                reset_bbox=False,
+            )
         else:
-            self.deform.deform.init(opt=opt_params, init_pcl=fused_point_cloud, keep_all=True,
-                                    force_init=True, reset_bbox=False)
+            self.deform.deform.init(
+                opt=opt_params,
+                init_pcl=fused_point_cloud,
+                keep_all=True,
+                force_init=True,
+                reset_bbox=False,
+            )
 
             fused_point_cloud[:, 2] += 0.2
             self.deform.train_setting(sc_params)
-            self.deform.extend_node_from_point(init_pcl=fused_point_cloud, keep_all=True,force_init=True, reset_bbox=False)
+            self.deform.extend_node_from_point(
+                init_pcl=fused_point_cloud,
+                keep_all=True,
+                force_init=True,
+                reset_bbox=False,
+            )
             self.deform_init = True
-            #print("deform_init: ", self.deform_init)
+            # print("deform_init: ", self.deform_init)
             return True
-        #print("deform_init: ", self.deform_init)
+        # print("deform_init: ", self.deform_init)
         return False
-        
-        
+
     def init_lr(self, spatial_lr_scale):
 
         self.spatial_lr_scale = spatial_lr_scale
+
     def get_points_from_depth(self, fov_camera, depth, scale=1):
         st = int(max(int(scale / 2) - 1, 0))
         depth_view = depth.squeeze()[st::scale, st::scale]
         rays_d = fov_camera.get_rays(scale=scale)
-        depth_view = depth_view[:rays_d.shape[0], :rays_d.shape[1]]
+        depth_view = depth_view[: rays_d.shape[0], : rays_d.shape[1]]
         pts = (rays_d * depth_view[..., None]).reshape(-1, 3)
         R = torch.tensor(fov_camera.R_gt).float().cuda()
         T = torch.tensor(fov_camera.T_gt).float().cuda()
         pts = (pts - T) @ R.transpose(-1, -2)
         return pts
-    def get_points_depth_in_depth_map(self, fov_camera, depth, points_in_camera_space, scale=1):
-        st = max(int(scale/2)-1,0)
-        depth_view = depth[None,:,st::scale,st::scale]
-        W, H = int(fov_camera.image_width/scale), int(fov_camera.image_height/scale)
-        depth_view = depth_view[:H, :W]
-        pts_projections = torch.stack(
-                        [points_in_camera_space[:,0] * fov_camera.fx / points_in_camera_space[:,2] + fov_camera.cx,
-                         points_in_camera_space[:,1] * fov_camera.fy / points_in_camera_space[:,2] + fov_camera.cy], -1).float()/scale
-        mask = (pts_projections[:, 0] > 0) & (pts_projections[:, 0] < W) &\
-               (pts_projections[:, 1] > 0) & (pts_projections[:, 1] < H) & (points_in_camera_space[:,2] > 0.1)
 
-        pts_projections[..., 0] /= ((W - 1) / 2)
-        pts_projections[..., 1] /= ((H - 1) / 2)
+    def get_points_depth_in_depth_map(
+        self, fov_camera, depth, points_in_camera_space, scale=1
+    ):
+        st = max(int(scale / 2) - 1, 0)
+        depth_view = depth[None, :, st::scale, st::scale]
+        W, H = int(fov_camera.image_width / scale), int(fov_camera.image_height / scale)
+        depth_view = depth_view[:H, :W]
+        pts_projections = (
+            torch.stack(
+                [
+                    points_in_camera_space[:, 0]
+                    * fov_camera.fx
+                    / points_in_camera_space[:, 2]
+                    + fov_camera.cx,
+                    points_in_camera_space[:, 1]
+                    * fov_camera.fy
+                    / points_in_camera_space[:, 2]
+                    + fov_camera.cy,
+                ],
+                -1,
+            ).float()
+            / scale
+        )
+        mask = (
+            (pts_projections[:, 0] > 0)
+            & (pts_projections[:, 0] < W)
+            & (pts_projections[:, 1] > 0)
+            & (pts_projections[:, 1] < H)
+            & (points_in_camera_space[:, 2] > 0.1)
+        )
+
+        pts_projections[..., 0] /= (W - 1) / 2
+        pts_projections[..., 1] /= (H - 1) / 2
         pts_projections -= 1
         pts_projections = pts_projections.view(1, -1, 1, 2)
-        map_z = torch.nn.functional.grid_sample(input=depth_view,
-                                                grid=pts_projections,
-                                                mode='bilinear',
-                                                padding_mode='border',
-                                                align_corners=True
-                                                )[0, :, :, 0]
+        map_z = torch.nn.functional.grid_sample(
+            input=depth_view,
+            grid=pts_projections,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )[0, :, :, 0]
         return map_z, mask
+
     def extend_from_pcd(
         self, fused_point_cloud, features, scales, rots, opacities, kf_id, add_dygs
     ):
@@ -413,7 +500,7 @@ class GaussianModel:
         new_scaling = nn.Parameter(scales.requires_grad_(True))
         new_rotation = nn.Parameter(rots.requires_grad_(True))
         new_opacity = nn.Parameter(opacities.requires_grad_(True))
-        
+
         # Each Gaussian is assigned the kf id that anchored it. This is great,
         # since I need this for the deformation.
         new_unique_kfIDs = torch.ones((new_xyz.shape[0])).int() * kf_id
@@ -438,12 +525,21 @@ class GaussianModel:
         self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None, add_dygs=False
     ):
         fused_point_cloud, features, scales, rots, opacities = (
-            self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap,add_dygs=add_dygs)
+            self.create_pcd_from_image(
+                cam_info, init, scale=scale, depthmap=depthmap, add_dygs=add_dygs
+            )
         )
         self.extend_from_pcd(
             fused_point_cloud, features, scales, rots, opacities, kf_id, add_dygs
         )
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float=5., print_info=True, max_point_num=150_000):
+
+    def create_from_pcd(
+        self,
+        pcd: BasicPointCloud,
+        spatial_lr_scale: float = 5.0,
+        print_info=True,
+        max_point_num=150_000,
+    ):
         self.spatial_lr_scale = 5
         if type(pcd.points) == np.ndarray:
             fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -453,7 +549,11 @@ class GaussianModel:
             fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         else:
             fused_color = pcd.colors
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features = (
+            torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
+            .float()
+            .cuda()
+        )
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
@@ -465,19 +565,29 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(
+            0.1
+            * torch.ones(
+                (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
+            )
+        )
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(
+            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+        )
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-        #self.feature = nn.Parameter(-1e-2 * torch.ones([self._xyz.shape[0], self.fea_dim], dtype=torch.float32).to("cuda:0"), requires_grad=True)
+        # self.feature = nn.Parameter(-1e-2 * torch.ones([self._xyz.shape[0], self.fea_dim], dtype=torch.float32).to("cuda:0"), requires_grad=True)
         if self.with_motion_mask:
             self.feature.data[..., -1] = torch.zeros_like(self.feature[..., -1])
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -732,7 +842,6 @@ class GaussianModel:
                 # optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -972,8 +1081,10 @@ class GaussianModel:
     def compute_plane_smoothness(self, t):
         batch_size, c, h, w = t.shape
         # Convolve with a second derivative filter, in the time dimension which is dimension 2
-        first_difference = t[..., 1:, :] - t[..., :h - 1, :]  # [batch, c, h-1, w]
-        second_difference = first_difference[..., 1:, :] - first_difference[..., :h - 2, :]  # [batch, c, h-2, w]
+        first_difference = t[..., 1:, :] - t[..., : h - 1, :]  # [batch, c, h-1, w]
+        second_difference = (
+            first_difference[..., 1:, :] - first_difference[..., : h - 2, :]
+        )  # [batch, c, h-2, w]
         # Take the L2 norm of the result
         return torch.square(second_difference).mean()
 
@@ -1018,35 +1129,44 @@ class GaussianModel:
                 total += torch.abs(1 - grids[grid_id]).mean()
         return total
 
-    def compute_regulation(self, time_smoothness_weight=0.01, l1_time_planes_weight=0.0001, plane_tv_weight=0.0001):
-        return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
+    def compute_regulation(
+        self,
+        time_smoothness_weight=0.01,
+        l1_time_planes_weight=0.0001,
+        plane_tv_weight=0.0001,
+    ):
+        return (
+            plane_tv_weight * self._plane_regulation()
+            + time_smoothness_weight * self._time_regulation()
+            + l1_time_planes_weight * self._l1_regulation()
+        )
 
-   
     def step_stage(self, new_phase, scope_increase=None):
-   
+
         phase = PHASE_NAMES[self.phase.item()]
 
         if phase == new_phase:
             return
 
-
-        if phase == 'bundle-adjust' and new_phase == 'motion-estimation':
-            if len(self.gaussians) == 1: return
+        if phase == "bundle-adjust" and new_phase == "motion-estimation":
+            if len(self.gaussians) == 1:
+                return
             self.apply_merge()
             self.enter_motion_est_phase()
             self.phase += 1
 
-
-        elif phase in ['motion-estimation', 'motion-expansion'] and new_phase == 'bundle-adjust':
-            self.enter_bundle_adjust(reduce_scale=phase == 'motion-estimation')
+        elif (
+            phase in ["motion-estimation", "motion-expansion"]
+            and new_phase == "bundle-adjust"
+        ):
+            self.enter_bundle_adjust(reduce_scale=phase == "motion-estimation")
             self.phase *= 0
 
-
-        elif phase == 'bundle-adjust' and new_phase == 'motion-expansion':
-            if len(self.gaussians) == 1: return
+        elif phase == "bundle-adjust" and new_phase == "motion-expansion":
+            if len(self.gaussians) == 1:
+                return
             self.enter_motion_expansion_phase(scope_increase)
             self.phase += 2
-
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -1056,26 +1176,24 @@ class GaussianModel:
 
         idx = self._gaussian_idxs[0]
 
-
         delta_grad = self.gaussians[idx].get_delta_xyz[self._time].grad
         if torch.any(torch.isnan(delta_grad)):
-   
             self.gaussians[idx].optimizer.zero_grad()
             return
-
 
         self.gaussians[idx].optimizer.step()
         self.gaussians[idx].optimizer.zero_grad()
 
-
         phase = PHASE_NAMES[self.phase.item()]
-        if phase == 'motion-estimation' and self.config.freeze_previous_in_motion_estimation:
+        if (
+            phase == "motion-estimation"
+            and self.config.freeze_previous_in_motion_estimation
+        ):
             self.gaussians[idx].reset_previously_learned_motions(self._time)
 
         if len(self._gaussian_idxs) > 1:
             for idx in self._gaussian_idxs[1:]:
                 self.gaussians[idx].optimizer.zero_grad()
-
 
     def apply_merge(self):
 
@@ -1083,16 +1201,17 @@ class GaussianModel:
 
         new_gaussians = nn.ModuleList()
         for i in range(0, len(self.gaussians), 2):
-            g1, g2 = self.gaussians[i], self.gaussians[i + 1] if i + 1 < len(self.gaussians) else None
+            g1, g2 = (
+                self.gaussians[i],
+                self.gaussians[i + 1] if i + 1 < len(self.gaussians) else None,
+            )
 
             if g2 is None:
                 new_gaussians.append(g1)
             else:
-
                 merged = GaussianModel(self.config)
                 merged.merge_two_gaussian_sets(g1, g2)
 
-  
                 if self.config.prune_points:
                     merged.prune_points(0.02, 0.002)
                 merged.downsample(self.maxpoints)
@@ -1100,14 +1219,13 @@ class GaussianModel:
 
         self.gaussians = new_gaussians
 
-
     def enter_motion_est_phase(self):
-  
+
         for g in self.gaussians:
-            g.only_optimize_motion()  
+            g.only_optimize_motion()
 
     def enter_bundle_adjust(self, reduce_scale=True):
-     
+
         for g in self.gaussians:
             g.optimize_all_except_motion()
             if reduce_scale:
@@ -1115,7 +1233,9 @@ class GaussianModel:
 
 
 class StandardGaussianModel(GaussianModel):
-    def __init__(self, sh_degree: int, fea_dim=0, with_motion_mask=True, all_the_same=False):
+    def __init__(
+        self, sh_degree: int, fea_dim=0, with_motion_mask=True, all_the_same=False
+    ):
         super().__init__(sh_degree, fea_dim)
         self.all_the_same = all_the_same
         self.with_motion_mask = with_motion_mask
