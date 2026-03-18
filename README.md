@@ -198,9 +198,36 @@ bash scripts/download_tum.sh
 Please change the `input_folder` path in the scene specific config files to point to where the data is stored.
 ### preprocessing
 
-Enter this task and use it to generate normal vectors, then place the generated normal vectors into the corresponding datasets folder https://github.com/fuxiao0719/GeoWizard then run bash rename picture name
+使用 [GeoWizard](https://github.com/fuxiao0719/GeoWizard.git) 生成法向量（normal map）。先 clone GeoWizard 并按其 README 配好环境，然后用本仓库脚本在你的数据集目录上跑指定的 GeoWizard 推理脚本，输出会保存在数据集目录下的一个子目录里。
+
 ```bash
-python new.py   source_dir  target_dir
+# 1) clone GeoWizard（只需一次）
+git clone https://github.com/fuxiao0719/GeoWizard.git
+
+# 2) 批量运行：遍历每个序列的 rgb/，输出写到同级的 normal/
+# 例如：BONN/sequence1/rgb -> BONN/sequence1/normal
+python scripts/run_geowizard.py \
+  --geowizard_repo /path/to/GeoWizard \
+  --entry run_infer.py \
+  --dataset_root /path/to/BONN \
+  --input_subdir rgb \
+  --output_subdir normal \
+  --conda_env geowizard \
+  --cuda_visible_devices 0 \
+  --require_outputs \
+  -- --ensemble_size 10 --denoise_steps 50 --seed 0 --domain indoor
+
+# （可选）先 dry-run 看看会跑哪些序列/命令
+python scripts/run_geowizard.py \
+  --geowizard_repo /path/to/GeoWizard \
+  --entry run_infer.py \
+  --dataset_root /path/to/BONN \
+  --input_subdir rgb \
+  --output_subdir normal \
+  --dry_run \
+  --conda_env geowizard \
+  --cuda_visible_devices 0 \
+  -- --ensemble_size 3 --denoise_steps 10 --seed 0 --domain indoor
 
 ```
 ## Run
