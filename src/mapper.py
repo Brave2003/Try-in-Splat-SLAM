@@ -967,11 +967,15 @@ class Mapper(object):
 
     # --------------- 5. 变形与渲染 ---------------
     def find_closest_keyframe(self, uid):
-        keys = [key for key in self.viewpoints if key < uid]
-        if not keys:
-            return None
-        closest_key = max(keys)
-        return closest_key
+        prev_keys = [key for key in self.viewpoints if key < uid]
+        if prev_keys:
+            return max(prev_keys)
+
+        next_keys = [key for key in self.viewpoints if key > uid]
+        if next_keys:
+            return min(next_keys)
+
+        return None
 
     # --------------- 映射阶段复用：变形量 / 渲染 / 光流损失 / 正则 ---------------
     def _get_deform_d_values(
@@ -1223,6 +1227,57 @@ class Mapper(object):
             torch.meshgrid(offsets, offsets, indexing="xy")[::-1], dim=-1
         ).view(1, -1, 2)
 
+    def _compute_normal_from_rendered_depth(self, depth, viewpoint_cam):
+        """从渲染深度估计法向（可微），用于无渲染法向时的多视角单应。"""
+        if depth.dim() == 3:
+            depth_map = depth.squeeze(0)
+        else:
+            depth_map = depth
+
+        device = depth_map.device
+        dtype = depth_map.dtype
+        H, W = depth_map.shape
+
+        fx = torch.tensor(viewpoint_cam.fx, device=device, dtype=dtype)
+        fy = torch.tensor(viewpoint_cam.fy, device=device, dtype=dtype)
+        cx = torch.tensor(viewpoint_cam.cx, device=device, dtype=dtype)
+        cy = torch.tensor(viewpoint_cam.cy, device=device, dtype=dtype)
+
+        u, v = torch.meshgrid(
+            torch.arange(W, device=device, dtype=dtype),
+            torch.arange(H, device=device, dtype=dtype),
+            indexing="xy",
+        )
+        x = (u - cx) / fx * depth_map
+        y = (v - cy) / fy * depth_map
+        pts = torch.stack([x, y, depth_map], dim=-1)
+
+        pts_l = torch.roll(pts, shifts=1, dims=1)
+        pts_r = torch.roll(pts, shifts=-1, dims=1)
+        pts_u = torch.roll(pts, shifts=1, dims=0)
+        pts_d = torch.roll(pts, shifts=-1, dims=0)
+
+        normal_hwc = torch.cross(pts_r - pts_l, pts_d - pts_u, dim=-1)
+        normal_hwc = F.normalize(normal_hwc, dim=-1, eps=1e-6)
+
+        valid = depth_map > 1e-6
+        valid = (
+            valid
+            & torch.roll(valid, 1, 0)
+            & torch.roll(valid, -1, 0)
+            & torch.roll(valid, 1, 1)
+            & torch.roll(valid, -1, 1)
+        )
+        valid[0, :] = False
+        valid[-1, :] = False
+        valid[:, 0] = False
+        valid[:, -1] = False
+
+        normal_hwc = torch.where(
+            valid.unsqueeze(-1), normal_hwc, torch.zeros_like(normal_hwc)
+        )
+        return normal_hwc.permute(2, 0, 1)
+
     def compute_multi_view_loss(
         self,
         viewpoint_cam,
@@ -1387,7 +1442,7 @@ class Mapper(object):
 
         except Exception as e:
             print(f"Error in compute_multi_view_loss: {e}")
-            return 0.0
+            return render_pkg["depth"].mean() * 0.0
 
     def _visualize_d_mask(self, d_mask, pixel_noise, H, W, viewpoint_cam, render_pkg):
         """
@@ -1719,10 +1774,15 @@ class Mapper(object):
                     -ref_to_neareast_r @ viewpoint_cam.T_gt + nearest_cam.T_gt
                 )
 
-            # 使用渲染的法向量（最短轴按不透明度）计算单应，无则退化为深度法向量
-            ref_local_n = (
-                render_pkg["normal"].permute(1, 2, 0).reshape(-1, 3)[valid_indices]
-            )
+            # 法向优先用渲染法向；若当前渲染未返回 normal，则用渲染深度估计可微法向。
+            normal_map = render_pkg.get("normal", None)
+            if normal_map is None:
+                normal_map = self._compute_normal_from_rendered_depth(
+                    render_pkg["depth"], viewpoint_cam
+                )
+            if normal_map.dim() == 4:
+                normal_map = normal_map.squeeze(0)
+            ref_local_n = normal_map.permute(1, 2, 0).reshape(-1, 3)[valid_indices]
             ix, iy = torch.meshgrid(
                 torch.arange(W, device=render_pkg["depth"].device),
                 torch.arange(H, device=render_pkg["depth"].device),
@@ -1783,7 +1843,7 @@ class Mapper(object):
 
         except Exception as e:
             print(f"Error in _compute_ncc_loss: {e}")
-            return 0.0
+            return pixel_noise.mean() * 0.0
 
     # --------------- 8. 地图与优化 ---------------
     def map(
@@ -1852,14 +1912,26 @@ class Mapper(object):
                 )
 
             num_views = min(frames_to_optimize, len(current_window))
+            optimize_window = list(current_window[:num_views])
+            all_keyframes = list(self.viewpoints.keys())
+            current_window_set = set(current_window)
+            if len(all_keyframes) >= len(current_window) + 2:
+                outside_candidates = [
+                    kf for kf in all_keyframes if kf not in current_window_set
+                ]
+                if len(outside_candidates) >= 2:
+                    random_kfs = np.random.choice(
+                        outside_candidates, size=2, replace=False
+                    ).tolist()
+                    optimize_window.extend(random_kfs)
+
             viewspace_point_tensor_acm = []
             visibility_filter_acm = []
             radii_acm = []
             n_touched_acm = []
             keyframes_opt = []
 
-            for cam_idx in range(num_views):
-                kf_idx = current_window[cam_idx]
+            for kf_idx in optimize_window:
                 if kf_idx not in self.viewpoints:
                     continue
                 viewpoint = self.viewpoints[kf_idx]
@@ -1930,7 +2002,7 @@ class Mapper(object):
                     loss_order_depth = self.get_depth_order_loss(
                         depth, viewpoint.depth, order_mask
                     )
-                    loss_mapping += (
+                    l = (
                         get_loss_mapping(
                             self.config["mapping"],
                             image,
@@ -1942,6 +2014,9 @@ class Mapper(object):
                         )
                         + 0.1 * loss_order_depth
                     )
+                    loss_mapping += l
+                    loss_network += l
+                    
                     # if flatten_w > 0 and normal is not None:
                     #     loss_mapping += flatten_w * self.get_loss_flattening(
                     #         normal, viewpoint, opacity=opacity
@@ -2049,8 +2124,7 @@ class Mapper(object):
                     gaussian_split = True
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
-                for cam_idx in range(min(frames_to_optimize, len(current_window))):
-                    kf = current_window[cam_idx]
+                for kf in keyframes_opt:
                     if kf not in self.viewpoints:
                         continue
                     vp = self.viewpoints[kf]
