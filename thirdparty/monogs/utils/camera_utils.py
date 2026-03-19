@@ -419,14 +419,14 @@ class Camera(nn.Module):
             flow_bwd_copy = flow_bwd.clone().cpu().numpy()
             flow_fimg = flow_viz.flow_to_image(flow_fwd_copy)
             flow_bimg = flow_viz.flow_to_image(flow_bwd_copy)
-            output_dir = os.path.join("output", "flow2_xyz_image")
-            os.makedirs(output_dir, exist_ok=True)
+            # output_dir = os.path.join("output", "flow2_xyz_image")
+            # os.makedirs(output_dir, exist_ok=True)
             # image1 = image.permute(1, 2, 0).cpu().detach().numpy()
             # image1_normalized = (image1 - image1.min()) / (
             #         image1.max() - image1.min()) * 255
             # depth_normalized = image1_normalized.astype(np.uint8)
             # cv2_image = cv2.cvtColor(depth_normalized, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(output_dir, f"image1_flow{idx:4d}.png"), flow_fimg [:, :, [2, 1, 0]])
+            # cv2.imwrite(os.path.join(output_dir, f"image1_flow{idx:4d}.png"), flow_fimg [:, :, [2, 1, 0]])
             mask_fwd, mask_bwd = self.compute_fwdbwd_mask(flow_fwd_copy, flow_bwd_copy)
 
             coor1to2_flow = flow_fwd / torch.tensor(flow_fwd.shape[:2][::-1], dtype=torch.float32).cuda() * 2
