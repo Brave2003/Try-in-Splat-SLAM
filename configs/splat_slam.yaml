@@ -73,7 +73,8 @@ mapping:
     spherical_harmonics: False # kept for reference, but not tested when True
     flow_loss: 3
     flow_loss_fine: 3
-    flattening_loss_weight: 0.1  # 高斯扁平化损失权重（渲染最短轴法向量 vs 真实深度法向量）
+    flattening_loss_weight: 0  # 高斯扁平化损失权重（渲染最短轴法向量 vs 真实深度法向量）
+    scale_loss_weight: 0
     flat_loss_weight: 0.1  # L_flat = (1/N)*sum_i min(s_x,s_y,s_z)，使最短轴趋近更短
     lr:
       cam_rot_delta: 0.003

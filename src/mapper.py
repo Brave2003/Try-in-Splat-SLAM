@@ -876,14 +876,14 @@ class Mapper(object):
                 initialization=True,
                 rm_dynamic=not (self.dystart == cur_frame_idx),
             )
-            if flatten_w > 0 and normal is not None:
-                loss_init += flatten_w * self.get_loss_flattening(
-                    normal, viewpoint, opacity=opacity
-                )
-            if flatten_w > 0:
-                loss_init += self.scale_loss_weight * self.get_loss_flat(
-                    visibility_filter
-                )
+            # if flatten_w > 0 and normal is not None:
+            #     loss_init += flatten_w * self.get_loss_flattening(
+            #         normal, viewpoint, opacity=opacity
+            #     )
+            # if flatten_w > 0:
+            #     loss_init += self.scale_loss_weight * self.get_loss_flat(
+            #         visibility_filter
+            #     )
             loss_init.backward()
 
             # 步骤2：无梯度下更新 max_radii2D、densification_stats、densify_and_prune、reset_opacity、optimizer.step
@@ -1822,11 +1822,6 @@ class Mapper(object):
             leave=True,
         )
         flatten_w = self.flattening_loss_weight
-        if flatten_w > 0 and self.rotation_lr is not None:
-            for pg in self.gaussians.optimizer.param_groups:
-                if pg.get("name") == "rotation":
-                    pg["lr"] = float(self.rotation_lr)
-                    break
         visibility_filter_cache = {}
         if getattr(self, "profile_mapping_time", False):
             t_acc = {
@@ -1887,8 +1882,7 @@ class Mapper(object):
                     torch.cuda.synchronize()
                     t_acc["deform"] += time.perf_counter() - _t0
                     _t0 = time.perf_counter()
-
-                need_normal = flatten_w > 0
+                
                 render_pkg = self._render_viewpoint(
                     viewpoint,
                     dxyz,
@@ -1896,7 +1890,7 @@ class Mapper(object):
                     d_rot,
                     d_opac,
                     d_color,
-                    return_normal=need_normal,
+                    return_normal=(flatten_w > 0),
                 )
                 if self.profile_mapping_time:
                     torch.cuda.synchronize()
@@ -1912,7 +1906,8 @@ class Mapper(object):
                     n_touched,
                     normal,
                 ) = self._unpack_render_pkg(render_pkg)
-
+                
+                
                 if dynamic_network and self.gaussians.deform_init:
                     closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
                     d_value2 = None
@@ -1972,23 +1967,11 @@ class Mapper(object):
                     loss_network += self._add_deform_regularization_losses(
                         viewpoint, delta=delta
                     )
-                else:
-                    loss_mapping += get_loss_mapping(
-                        self.config["mapping"],
-                        image,
-                        depth,
-                        viewpoint,
-                        opacity,
-                        rm_dynamic=not dynamic_network,
-                    )
-                    if flatten_w > 0 and normal is not None:
-                        loss_mapping += flatten_w * self.get_loss_flattening(
-                            normal, viewpoint, opacity=opacity
-                        )
-
+                
                 if self.profile_mapping_time:
                     torch.cuda.synchronize()
                     t_acc["mapping_loss"] += time.perf_counter() - _t0
+                
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -2342,11 +2325,6 @@ class Mapper(object):
             leave=True,
         )
         flatten_w = self.flattening_loss_weight
-        if flatten_w > 0 and self.rotation_lr is not None:
-            for pg in self.gaussians.optimizer.param_groups:
-                if pg.get("name") == "rotation":
-                    pg["lr"] = float(self.rotation_lr)
-                    break
         for iteration in pbar:
             loss = 0
             self.iteration_count += 1
@@ -2359,7 +2337,6 @@ class Mapper(object):
             n_touched_acm = []
 
             keyframes_opt = []
-            flatten_w = self.flattening_loss_weight
             for _ in range(10):
                 # 随机选择视角进行渲染
                 rand_idx = np.random.randint(0, len(random_viewpoint_stack))
@@ -2428,10 +2405,10 @@ class Mapper(object):
                     dtype=torch.float32, device=image.device
                 )[None]
                 depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
-                if flatten_w > 0 and normal is not None:
-                    loss += flatten_w * self.get_loss_flattening(
-                        normal, viewpoint, opacity=opacity
-                    )
+                # if flatten_w > 0 and normal is not None:
+                #     loss += flatten_w * self.get_loss_flattening(
+                #         normal, viewpoint, opacity=opacity
+                #     )
                 if self.dynamic_model:
                     Ll1 = l1_loss(image, gt_image)
                     loss += (1.0 - self.opt_params.lambda_dssim) * (
@@ -2490,8 +2467,8 @@ class Mapper(object):
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss += 10 * isotropic_loss.mean()
-            if flatten_w > 0 and self.scale_loss_weight > 0:
-                loss += self.scale_loss_weight * self.get_loss_flat(visibility_filter)
+            # if flatten_w > 0 and self.scale_loss_weight > 0:
+            #     loss += self.scale_loss_weight * self.get_loss_flat(visibility_filter)
 
             loss.backward()
 
