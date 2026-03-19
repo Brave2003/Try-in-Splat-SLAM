@@ -1382,9 +1382,8 @@ class Mapper(object):
                     ncc_weight,
                 )
                 total_loss = total_loss + ncc_loss
-
-            # 始终返回张量，避免 return 0.0 时 loss_mapping += 0.0 导致该分支完全脱离计算图
-            return 100.0 * total_loss
+            return total_loss
+            # return 100.0 * total_loss
 
         except Exception as e:
             print(f"Error in compute_multi_view_loss: {e}")
@@ -1795,8 +1794,6 @@ class Mapper(object):
         prune=False,
         iters=1,
         dynamic_network=False,
-        dynamic_render=False,
-        rm_initdy=False,
     ):
         """每轮对当前窗口内多视角累积 loss 再 backward，与 mapper_copy 一致，保证 map 优化效果。
 
@@ -1883,16 +1880,6 @@ class Mapper(object):
                         detach_outputs=False,
                         iteration=0,
                     )
-                elif dynamic_render and self.gaussians.deform_init:
-                    with torch.no_grad():
-                        dxyz, d_rot, d_scale, d_opac, d_color = (
-                            self._get_deform_d_values(
-                                viewpoint,
-                                use_noise=True,
-                                detach_outputs=True,
-                                iteration=0,
-                            )
-                        )
                 else:
                     dxyz = 0
                     d_rot, d_scale, d_opac, d_color = None, 0, None, None
@@ -1925,11 +1912,6 @@ class Mapper(object):
                     n_touched,
                     normal,
                 ) = self._unpack_render_pkg(render_pkg)
-                if rm_initdy:
-                    with torch.no_grad():
-                        mask = viewpoint.reproject_mask(stream, self.viewpoints[0])
-                else:
-                    mask = None
 
                 if dynamic_network and self.gaussians.deform_init:
                     closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
@@ -1960,15 +1942,15 @@ class Mapper(object):
                             depth,
                             viewpoint,
                             opacity,
-                            rm_dynamic=not (dynamic_network or dynamic_render),
+                            rm_dynamic=not dynamic_network,
                             dynamic=dynamic,
                         )
                         + 0.1 * loss_order_depth
                     )
-                    if flatten_w > 0 and normal is not None:
-                        loss_mapping += flatten_w * self.get_loss_flattening(
-                            normal, viewpoint, opacity=opacity
-                        )
+                    # if flatten_w > 0 and normal is not None:
+                    #     loss_mapping += flatten_w * self.get_loss_flattening(
+                    #         normal, viewpoint, opacity=opacity
+                    #     )
                     if (
                         closest_keyframe is not None
                         and closest_keyframe in self.viewpoints
@@ -1997,8 +1979,7 @@ class Mapper(object):
                         depth,
                         viewpoint,
                         opacity,
-                        rm_dynamic=not (dynamic_network or dynamic_render),
-                        mask=mask,
+                        rm_dynamic=not dynamic_network,
                     )
                     if flatten_w > 0 and normal is not None:
                         loss_mapping += flatten_w * self.get_loss_flattening(
@@ -2026,7 +2007,7 @@ class Mapper(object):
             combined_vis = visibility_filter_acm[0].clone()
             for v in visibility_filter_acm[1:]:
                 combined_vis = combined_vis | v
-            loss_mapping += self.scale_loss_weight * self.get_loss_flat(combined_vis)
+            # loss_mapping += self.scale_loss_weight * self.get_loss_flat(combined_vis)
             # 与 mapper_copy 一致：mapping 与 network 分开反传，deform 只受 loss_network 更新，避免重建梯度干扰动态优化
             loss_mapping.backward(retain_graph=True)
             if self.profile_mapping_time:
@@ -2056,8 +2037,6 @@ class Mapper(object):
                     == self.gaussian_update_offset
                     and i > 100
                 )
-                if rm_initdy:
-                    update_gaussian = iters - i - 10 == 0
                 if update_gaussian:
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
@@ -2144,8 +2123,13 @@ class Mapper(object):
             prune_mode = self.config["mapping"]["Training"]["prune_mode"]
             prune_coviz = 3
             self.gaussians.n_obs.fill_(0)
+            target_numel = self.gaussians.n_obs.numel()
             for window_idx, visibility in self.occ_aware_visibility.items():
-                self.gaussians.n_obs += visibility.cpu()
+                aligned_visibility = self._align_visibility_mask(
+                    visibility, target_numel
+                ).long()
+                self.gaussians.n_obs += aligned_visibility.cpu()
+                self.occ_aware_visibility[window_idx] = aligned_visibility
             to_prune = None
             if prune_mode == "odometry":
                 to_prune = self.gaussians.n_obs < 3
@@ -2510,7 +2494,6 @@ class Mapper(object):
                 loss += self.scale_loss_weight * self.get_loss_flat(visibility_filter)
 
             loss.backward()
-            gaussian_split = False
 
             with torch.no_grad():
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
@@ -3241,6 +3224,30 @@ class Mapper(object):
 
         return initial_depth[0].cpu().numpy()
 
+    def _align_visibility_mask(self, visibility_mask, target_numel, device=None):
+        """Align cached visibility mask length to current gaussian count."""
+        vis = visibility_mask.reshape(-1)
+        if vis.dtype != torch.bool:
+            vis = vis > 0
+        if device is not None and vis.device != device:
+            vis = vis.to(device)
+        if vis.numel() == target_numel:
+            return vis
+        if vis.numel() > target_numel:
+            return vis[:target_numel]
+        pad = torch.zeros(target_numel - vis.numel(), dtype=torch.bool, device=vis.device)
+        return torch.cat((vis, pad), dim=0)
+
+    def _get_aligned_visibility_pair(self, cur_visibility, ref_visibility):
+        target_numel = cur_visibility.numel()
+        cur_vis = self._align_visibility_mask(cur_visibility, target_numel)
+        ref_vis = self._align_visibility_mask(
+            ref_visibility,
+            target_numel,
+            device=cur_vis.device,
+        )
+        return cur_vis, ref_vis
+
     def is_keyframe(
         self,
         cur_frame_idx,
@@ -3263,13 +3270,17 @@ class Mapper(object):
         dist_check = dist > kf_translation * self.median_depth
         dist_check2 = dist > kf_min_translation * self.median_depth
 
-        union = torch.logical_or(
-            cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
-        ).count_nonzero()
-        intersection = torch.logical_and(
-            cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
-        ).count_nonzero()
-        point_ratio_2 = intersection / union
+        last_vis = occ_aware_visibility.get(last_keyframe_idx, None)
+        if last_vis is None:
+            last_vis = torch.zeros_like(cur_frame_visibility_filter)
+        cur_vis, last_vis = self._get_aligned_visibility_pair(
+            cur_frame_visibility_filter, last_vis
+        )
+        union = torch.logical_or(cur_vis, last_vis).count_nonzero()
+        intersection = torch.logical_and(cur_vis, last_vis).count_nonzero()
+        point_ratio_2 = (
+            intersection.float() / union.float() if union.item() > 0 else 0.0
+        )
         return (point_ratio_2 < kf_overlap and dist_check2) or dist_check
 
     def add_to_window(
@@ -3284,15 +3295,20 @@ class Mapper(object):
         removed_frame = None
         for i in range(N_dont_touch, len(window)):
             kf_idx = window[i]
+            if kf_idx not in occ_aware_visibility:
+                continue
             # szymkiewicz–simpson coefficient
-            intersection = torch.logical_and(
+            cur_vis, kf_vis = self._get_aligned_visibility_pair(
                 cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
-            ).count_nonzero()
-            denom = min(
-                cur_frame_visibility_filter.count_nonzero(),
-                occ_aware_visibility[kf_idx].count_nonzero(),
             )
-            point_ratio_2 = intersection / denom
+            intersection = torch.logical_and(cur_vis, kf_vis).count_nonzero()
+            denom = min(
+                cur_vis.count_nonzero(),
+                kf_vis.count_nonzero(),
+            )
+            point_ratio_2 = (
+                intersection.float() / denom.float() if denom.item() > 0 else 0.0
+            )
             cut_off = (
                 self.config["mapping"]["Training"]["kf_cutoff"]
                 if "kf_cutoff" in self.config["mapping"]["Training"]
@@ -3518,13 +3534,17 @@ class Mapper(object):
                 # When we have not filled up the keyframe window size
                 # we rely on just the covisibility thresholding, not the
                 # translation thresholds.
-                union = torch.logical_or(
-                    curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                ).count_nonzero()
-                intersection = torch.logical_and(
-                    curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                ).count_nonzero()
-                point_ratio = intersection / union
+                last_vis = self.occ_aware_visibility.get(last_keyframe_idx, None)
+                if last_vis is None:
+                    last_vis = torch.zeros_like(curr_visibility)
+                curr_vis, last_vis = self._get_aligned_visibility_pair(
+                    curr_visibility, last_vis
+                )
+                union = torch.logical_or(curr_vis, last_vis).count_nonzero()
+                intersection = torch.logical_and(curr_vis, last_vis).count_nonzero()
+                point_ratio = (
+                    intersection.float() / union.float() if union.item() > 0 else 0.0
+                )
 
                 create_kf = (
                     point_ratio < self.config["mapping"]["Training"]["kf_overlap"]

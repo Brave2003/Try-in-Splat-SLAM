@@ -437,8 +437,8 @@ class GaussianModel:
         rays_d = fov_camera.get_rays(scale=scale)
         depth_view = depth_view[: rays_d.shape[0], : rays_d.shape[1]]
         pts = (rays_d * depth_view[..., None]).reshape(-1, 3)
-        R = torch.tensor(fov_camera.R_gt).float().cuda()
-        T = torch.tensor(fov_camera.T_gt).float().cuda()
+        R = torch.as_tensor(fov_camera.R_gt, device='cuda', dtype=torch.float32)
+        T = torch.as_tensor(fov_camera.T_gt, device='cuda', dtype=torch.float32)
         pts = (pts - T) @ R.transpose(-1, -2)
         return pts
 
