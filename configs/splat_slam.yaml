@@ -73,6 +73,12 @@ mapping:
     spherical_harmonics: False # kept for reference, but not tested when True
     flow_loss: 3
     flow_loss_fine: 3
+    tensorboard: True         # True 时写入 TensorBoard
+    tb_log_every: 1           # 每多少个 mapping 迭代写一次标量
+    tb_hist_every: 1         # 每多少个 mapping 迭代写一次直方图
+    tb_log_dir: null           # null 则使用 <output>/<scene>/tensorboard
+    tb_new_run_subdir: True    # 每次运行写入独立子目录，避免多次运行数据混在一起
+    tb_run_name: null          # 可手动指定 run 名称；null 则自动生成时间戳
     flattening_loss_weight: 0  # 高斯扁平化损失权重（渲染最短轴法向量 vs 真实深度法向量）
     scale_loss_weight: 0
     flat_loss_weight: 0.1  # L_flat = (1/N)*sum_i min(s_x,s_y,s_z)，使最短轴趋近更短
