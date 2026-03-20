@@ -2313,6 +2313,33 @@ class Mapper(object):
         flow_img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         return flow_img
 
+    def _get_refine_deform_values(self, viewpoint):
+        """final_refine 复用：返回当前视角变形增量。"""
+        if self.dynamic_model and self.gaussians.deform_init:
+            return self._get_deform_d_values(
+                viewpoint,
+                use_noise=False,
+                detach_outputs=False,
+                iteration=0,
+            )
+        return 0, 0, 0, None, None
+
+    def _render_refine_viewpoint(self, viewpoint, flatten_w=0.0):
+        """final_refine 复用：获取变形量并完成渲染。"""
+        dxyz, d_rot, d_scale, d_opac, d_color = self._get_refine_deform_values(
+            viewpoint
+        )
+        render_pkg = self._render_viewpoint(
+            viewpoint,
+            dxyz,
+            d_scale,
+            d_rot,
+            d_opac,
+            d_color,
+            return_normal=(flatten_w > 0),
+        )
+        return render_pkg, dxyz, d_rot, d_scale, d_opac, d_color
+
     def final_refine(self, prune=False, iters=26000):
         """步骤1：导入指标、初始化 PSNR/SSIM/LPIPS 记录与输出目录。"""
         self.printer.print("Starting final refinement", FontColor.MAPPER)
@@ -2418,65 +2445,20 @@ class Mapper(object):
             loss = 0
             self.iteration_count += 1
             self.last_sent += 1
-
-            loss_mapping = 0
-            viewspace_point_tensor_acm = []
-            visibility_filter_acm = []
-            radii_acm = []
-            n_touched_acm = []
-
-            keyframes_opt = []
+            visibility_filter = None
+            radii = None
             for _ in range(10):
                 # 随机选择视角进行渲染
                 rand_idx = np.random.randint(0, len(random_viewpoint_stack))
                 viewpoint = random_viewpoint_stack[rand_idx]
-                # print("self.dynamic_model", self.dynamic_model)
-                print("self.gaussians.deform_init", self.gaussians.deform_init)
-                if self.dynamic_model and self.gaussians.deform_init:
-                    dxyz, d_rot, d_scale, d_opac, d_color = self._get_deform_d_values(
-                        viewpoint,
-                        use_noise=False,
-                        detach_outputs=False,
-                        iteration=0,
-                    )
-                    closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
-                    if (
-                        closest_keyframe is not None
-                        and closest_keyframe in self.viewpoints
-                    ):
-                        d_value2 = self._get_deform_d_values_for_fid(
-                            self.viewpoints[closest_keyframe].fid,
-                            self.viewpoints[closest_keyframe].camera_center,
-                            iteration=0,
-                        )
-                        d_xyz2 = d_value2["d_xyz"]
-                        d_rot2 = d_value2["d_rotation"]
-                        d_scale2 = d_value2["d_scaling"]
-                        d_opac2 = d_value2.get("d_opacity")
-                        d_color2 = d_value2.get("d_color")
-                    else:
-                        d_value2 = None
-                        d_xyz2, d_rot2, d_scale2, d_opac2, d_color2 = (
-                            0,
-                            0,
-                            0,
-                            None,
-                            None,
-                        )
-                else:
-                    dxyz, d_rot, d_scale, d_opac, d_color = 0, 0, 0, None, None
-                    d_xyz2, d_rot2, d_scale2, d_opac2, d_color2 = 0, 0, 0, None, None
-                    d_value2 = None
-
-                render_pkg = self._render_viewpoint(
-                    viewpoint,
+                (
+                    render_pkg,
                     dxyz,
-                    d_scale,
                     d_rot,
+                    d_scale,
                     d_opac,
                     d_color,
-                    return_normal=(flatten_w > 0),
-                )
+                ) = self._render_refine_viewpoint(viewpoint, flatten_w)
                 (
                     image,
                     viewspace_point_tensor,
@@ -2498,37 +2480,68 @@ class Mapper(object):
                 #     loss += flatten_w * self.get_loss_flattening(
                 #         normal, viewpoint, opacity=opacity
                 #     )
+                # ---------- final_refine 损失项（统一整理）----------
+                # 1) 光度项：L1 + DSSIM
                 if self.dynamic_model:
-                    Ll1 = l1_loss(image, gt_image)
-                    loss += (1.0 - self.opt_params.lambda_dssim) * (
-                        Ll1
-                    ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
-                    loss += 1e-4 * self.gaussians.deform.deform.arap_loss(
+                    ll1 = l1_loss(image, gt_image)
+                    loss_photo = (1.0 - self.opt_params.lambda_dssim) * ll1
+                    loss_photo += self.opt_params.lambda_dssim * (
+                        1.0 - ssim(image, gt_image)
+                    )
+                    # 动态模型额外加入形变 ARAP 正则
+                    loss_reg_arap = 1e-4 * self.gaussians.deform.deform.arap_loss(
                         t=viewpoint.fid,
                         delta_t=5 * self.gaussians.time_interval,
                         t_samp_num=8,
                     )
                 else:
-                    Ll1 = l1_loss(image, gt_image, mask=viewpoint.motion_mask)
-                    loss += (1.0 - self.opt_params.lambda_dssim) * (
-                        Ll1
-                    ) + self.opt_params.lambda_dssim * (
+                    ll1 = l1_loss(image, gt_image, mask=viewpoint.motion_mask)
+                    loss_photo = (1.0 - self.opt_params.lambda_dssim) * ll1
+                    loss_photo += self.opt_params.lambda_dssim * (
                         1.0 - ssim(image, gt_image, mask=viewpoint.motion_mask)
                     )
+                    loss_reg_arap = 0.0
                     depth_pixel_mask = (
                         viewpoint.motion_mask.view(*gt_depth.shape) * depth_pixel_mask
                     )
 
+                # 2) 深度项：像素 L1 深度 + 深度排序约束
                 l1_depth = torch.abs(
                     depth * depth_pixel_mask - gt_depth * depth_pixel_mask
                 )
-                loss += 0.1 * l1_depth.mean()
-                loss_depth = depth_loss_dpt(depth, viewpoint.depth)
+                loss_depth_l1 = 0.1 * l1_depth.mean()
                 order_mask = viewpoint.depth > 0
                 loss_order_depth = self.get_depth_order_loss(
                     depth, viewpoint.depth, order_mask
                 )
-                loss += 0.1 * loss_order_depth  # 1e-3 * loss_depth +
+                loss_depth_order = 0.1 * loss_order_depth
+
+                # 3) 视角几何项：后期引入多视角一致性
+                loss_multi_view = 0.0
+                if iteration > 7000 and self.dynamic_model and self.gaussians.deform_init:
+                    closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
+                    if closest_keyframe is not None and closest_keyframe in self.viewpoints:
+                        closest_viewpoint = self.viewpoints[closest_keyframe]
+                        d_xyz2, d_rot2, d_scale2, d_opac2, d_color2 = (
+                            self._get_refine_deform_values(closest_viewpoint)
+                        )
+                        loss_multi_view = self.compute_multi_view_loss(
+                            viewpoint,
+                            render_pkg,
+                            self.gaussians,
+                            self.pipeline_params,
+                            self.background,
+                            d_xyz2,
+                            d_scale2,
+                            d_rot2,
+                            d_opac2,
+                            d_color2,
+                            closest_viewpoint,
+                        )
+
+                # 4) 汇总当前视角损失
+                loss += loss_photo + loss_reg_arap + loss_depth_l1 + loss_depth_order + loss_multi_view
+
                 # 仅当开启 save_debug_visualization 且满足迭代条件时才绘制 d_mask / mask_combination
                 if (
                     getattr(self, "save_debug_visualization", False)
@@ -2540,18 +2553,6 @@ class Mapper(object):
                 else:
                     self.visualize_mask = False
                     self.visualize_mask_combination = False
-                # if iteration > 7000:
-                #     if closest_keyframe is not None and closest_keyframe in self.viewpoints:
-                #         loss += self.compute_multi_view_loss(viewpoint, render_pkg, self.gaussians,
-                #                                              self.pipeline_params, self.background,
-                #                                              d_xyz2, d_scale2, d_rot2, d_opac2,
-                #                                              d_color2,
-                #                                              self.viewpoints[closest_keyframe])
-
-                viewspace_point_tensor_acm.append(viewspace_point_tensor.detach())
-                visibility_filter_acm.append(visibility_filter.detach())
-                radii_acm.append(radii.detach())
-                n_touched_acm.append(n_touched.detach())
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
@@ -2562,20 +2563,18 @@ class Mapper(object):
             loss.backward()
 
             with torch.no_grad():
-                self.gaussians.max_radii2D[visibility_filter] = torch.max(
-                    self.gaussians.max_radii2D[visibility_filter],
-                    radii[visibility_filter],
-                )
-
+                if visibility_filter is not None and radii is not None:
+                    self.gaussians.max_radii2D[visibility_filter] = torch.max(
+                        self.gaussians.max_radii2D[visibility_filter],
+                        radii[visibility_filter],
+                    )
+                    
                 self.gaussians.optimizer.step()
-
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
-
                 self.gaussians.update_learning_rate(self.iteration_count)
-
                 self.keyframe_optimizers.step()
-
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+                
                 if self.dynamic_model and self.gaussians.deform_init:
                     self.gaussians.deform.optimizer.step()
                     self.gaussians.deform.optimizer.zero_grad(set_to_none=True)
@@ -2602,25 +2601,8 @@ class Mapper(object):
                             ) = self.frame_reader[kf_idx]
                             gt_img = gt_img.squeeze().cuda()
                             gt_depth = gt_depth_data.cpu().numpy()
-                            if self.dynamic_model and self.gaussians.deform_init:
-                                dxyz, d_rot, d_scale, d_opac, d_color = (
-                                    self._get_deform_d_values(
-                                        frame,
-                                        use_noise=False,
-                                        detach_outputs=False,
-                                        iteration=0,
-                                    )
-                                )
-                            else:
-                                dxyz, d_rot, d_scale, d_opac, d_color = (
-                                    0,
-                                    0,
-                                    0,
-                                    None,
-                                    None,
-                                )
-                            render_pkg = self._render_viewpoint(
-                                frame, dxyz, d_scale, d_rot, d_opac, d_color
+                            render_pkg, _, _, _, _, _ = self._render_refine_viewpoint(
+                                frame, flatten_w=0.0
                             )
                             rendered_img = render_pkg["render"].detach()
 
@@ -2705,26 +2687,14 @@ class Mapper(object):
                             self.keyframe_idxs, self.video_idxs
                         ):
                             frame = self.cameras[video_idx]
-                            if self.dynamic_model and self.gaussians.deform_init:
-                                dxyz, d_rot, d_scale, d_opac, d_color = (
-                                    self._get_deform_d_values(
-                                        frame,
-                                        use_noise=False,
-                                        detach_outputs=False,
-                                        iteration=0,
-                                    )
-                                )
-                            else:
-                                dxyz, d_rot, d_scale, d_opac, d_color = (
-                                    0,
-                                    0,
-                                    0,
-                                    None,
-                                    None,
-                                )
-                            render_pkg = self._render_viewpoint(
-                                frame, dxyz, d_scale, d_rot, d_opac, d_color
-                            )
+                            (
+                                render_pkg,
+                                dxyz,
+                                d_rot,
+                                d_scale,
+                                d_opac,
+                                d_color,
+                            ) = self._render_refine_viewpoint(frame, flatten_w=0.0)
                             rendered_depth = render_pkg["depth"]
                             depth_vis = rendered_depth[0].detach().cpu().numpy()
                             depth_vis = (depth_vis - depth_vis.min()) / (
@@ -2779,23 +2749,11 @@ class Mapper(object):
                                         closest_viewpoint = self.viewpoints[
                                             closest_keyframe
                                         ]
-                                        d_xyz1, d_rot1, d_scale1, _, _ = (
-                                            self._get_deform_d_values(
-                                                frame,
-                                                use_noise=False,
-                                                detach_outputs=False,
-                                                iteration=0,
+                                        d_xyz1, d_rot1, d_scale1 = dxyz, d_rot, d_scale
+                                        d_xyz2, d_rot2, d_scale2, _, _ = (
+                                            self._get_refine_deform_values(
+                                                closest_viewpoint
                                             )
-                                        )
-                                        d_value2 = self._get_deform_d_values_for_fid(
-                                            closest_viewpoint.fid,
-                                            closest_viewpoint.camera_center,
-                                            iteration=0,
-                                        )
-                                        d_xyz2, d_rot2, d_scale2 = (
-                                            d_value2["d_xyz"],
-                                            d_value2["d_rotation"],
-                                            d_value2["d_scaling"],
                                         )
                                         flow_pkg = render_flow(
                                             pc=self.gaussians,
