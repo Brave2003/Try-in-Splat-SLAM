@@ -2011,8 +2011,7 @@ class Mapper(object):
                     loss_order_depth = self.get_depth_order_loss(
                         depth, viewpoint.depth, order_mask
                     )
-                    l = (
-                        get_loss_mapping(
+                    loss_depth_and_image = get_loss_mapping(
                             self.config["mapping"],
                             image,
                             depth,
@@ -2021,10 +2020,17 @@ class Mapper(object):
                             rm_dynamic=not dynamic_network,
                             dynamic=dynamic,
                         )
-                        + 0.1 * loss_order_depth
+                    loss_normal = self.get_loss_normal(depth, viewpoint)
+                    loss_mapping += (
+                        loss_depth_and_image
+                        + self.config["mapping"]["depth_order_loss_weight"] * loss_order_depth
+                        + self.config["mapping"]["normal_loss_weight"] * loss_normal
                     )
-                    loss_mapping += l
-                    loss_network += l
+                    loss_network += (
+                        loss_depth_and_image
+                        + self.config["mapping"]["depth_order_loss_weight"] * loss_order_depth
+                        + self.config["mapping"]["normal_loss_weight"] * loss_normal
+                    )
                     
                     # if flatten_w > 0 and normal is not None:
                     #     loss_mapping += flatten_w * self.get_loss_flattening(

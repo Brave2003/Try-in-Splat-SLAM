@@ -200,6 +200,8 @@ Please change the `input_folder` path in the scene specific config files to poin
 
 使用 [GeoWizard](https://github.com/fuxiao0719/GeoWizard.git) 生成法向量（normal map）。先 clone GeoWizard 并按其 README 配好环境，然后用本仓库脚本在你的数据集目录上跑指定的 GeoWizard 推理脚本，输出会保存在数据集目录下的一个子目录里。
 
+> 生成部分很慢，最好修改脚本改成多线程
+
 ```bash
 # 1) clone GeoWizard（只需一次）
 git clone https://github.com/fuxiao0719/GeoWizard.git
