@@ -31,6 +31,7 @@ from src.utils.datasets import get_dataset, load_mono_depth
 from src.utils.common import as_intrinsics_matrix, setup_seed
 import matplotlib.pyplot as plt
 from src.utils.Printer import Printer, FontColor
+from src.utils.tensorboard_aspect import TensorboardLoggingAspect
 from thirdparty.glorie_slam.depth_video import DepthVideo
 from thirdparty.gaussian_splatting.gaussian_renderer import render, render_flow
 from thirdparty.gaussian_splatting.utils.general_utils import (
@@ -155,6 +156,7 @@ class Mapper(object):
         self.dtype = torch.float32
         self.iteration_count = 0
         self.last_sent = 0
+        self.map_call_count = 0
         self.occ_aware_visibility = {}
         self.viewpoints = {}
         self.current_window = []
@@ -210,6 +212,10 @@ class Mapper(object):
     def set_pipe(self, pipe):
         self.pipe = pipe
 
+    def __del__(self):
+        if hasattr(self, "tb_aspect") and self.tb_aspect is not None:
+            self.tb_aspect.close()
+
     def set_hyperparams(self):
         """步骤：从配置读取映射超参（初始化/稠密化/窗口/保存路径等）。"""
         c = self.config["mapping"]["Training"]
@@ -228,6 +234,8 @@ class Mapper(object):
         self.size_threshold = c["size_threshold"]
         self.window_size = c["window_size"]
         self.flattening_loss_weight = c.get("flattening_loss_weight", 0.1)
+        self.depth_order_loss_weight = c.get("depth_order_loss_weight", 0.15)
+        self.normal_loss_weight = c.get("normal_loss_weight", 0.04)
         # 扁平化与法向相关权重：
         # - scale_loss_weight：PGSR 风格的 min(sx,sy,sz) 扁平约束（默认 100，与 PGSR 一致）
         # - flattening_loss_weight：法向先验损失权重（默认 5，可按需要调大/调小）
@@ -240,14 +248,15 @@ class Mapper(object):
         self.save_debug_visualization = self.config.get(
             "save_debug_visualization", False
         )
-        # initialize_network 阶段：显式约束变形≈0，使 MLP 初始化为恒等变换，避免动态变化过大
-        self.init_deform_reg_weight = c.get("init_deform_reg_weight", 10.0)
-        # initialize_network 阶段将 deform 学习率乘以此系数，避免步长过大偏离 initial_map 结果（默认 0.1）
-        self.init_network_deform_lr_scale = c.get("init_network_deform_lr_scale", 0.1)
-        # initialize_network 前若干步仅优化零变形正则，再接入重建损失（默认 20）
-        self.init_network_reg_warmup = c.get("init_network_reg_warmup", 20)
+        
         # 为 True 时在 map() 中统计各阶段耗时并定期打印，用于分析瓶颈
         self.profile_mapping_time = c.get("profile_mapping_time", False)
+        self.tb_aspect = TensorboardLoggingAspect(
+            training_cfg=c,
+            save_dir=self.save_dir,
+            printer=self.printer,
+            font_color=FontColor.MAPPER,
+        )
 
     # --------------- 2. 初始化与关键帧 ---------------
     def add_next_kf(
@@ -274,6 +283,7 @@ class Mapper(object):
 
     def reset(self):
         self.iteration_count = 0
+        self.map_call_count = 0
         self.occ_aware_visibility = {}
         self.viewpoints = {}
         self.current_window = []
@@ -1867,6 +1877,11 @@ class Mapper(object):
         if len(current_window) == 0:
             return
         import numpy as np
+        if not prune:
+            self.map_call_count += 1
+            map_namespace = f"mapping/map_call_{self.map_call_count:05d}"
+        current_window_log_set = set(current_window)
+
         key_opt = []
         if len(current_window) > self.window_size:
             key_opt = self.viewpoints[current_window[0]].keyframe_selection_overlap(
@@ -1884,7 +1899,6 @@ class Mapper(object):
 
         flow_weights = self.config["mapping"]["Training"]["flow_loss"]
         delta = self.config["mapping"]["Training"].get("delta", 5)
-        frames_to_optimize = self.config["mapping"]["Training"]["pose_window"]
         from src.utils.Printer import get_msg_prefix
 
         prefix = get_msg_prefix(FontColor.MAPPER)
@@ -1916,6 +1930,17 @@ class Mapper(object):
             self.last_sent += 1
             loss_mapping = 0.0
             loss_network = 0.0
+
+            per_frame_groups = {
+                "loss_mapping_total": {},
+                "loss_depth_and_image": {},
+                "loss_order_weighted": {},
+                "loss_normal_weighted": {},
+                "loss_multi_view": {},
+                "loss_flow": {},
+                "loss_reg": {},
+            }
+            
             if i < iters / 2:
                 dynamic = True
                 flow_weights = self.config["mapping"]["Training"]["flow_loss"]
@@ -1990,6 +2015,15 @@ class Mapper(object):
                 
                 
                 if dynamic_network and self.gaussians.deform_init:
+                    frame_key = f"frame_{kf_idx}"
+                    if kf_idx in current_window_log_set:
+                        per_frame_groups["loss_flow"][frame_key] = torch.zeros(
+                            (), device=depth.device, dtype=torch.float32
+                        )
+                        per_frame_groups["loss_multi_view"][frame_key] = torch.zeros(
+                            (), device=depth.device, dtype=torch.float32
+                        )
+
                     closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
                     d_value2 = None
                     if (
@@ -2007,12 +2041,16 @@ class Mapper(object):
                             flow_weights,
                         )
                         loss_network += flow_loss_delta
+                        if kf_idx in current_window_log_set:
+                            per_frame_groups["loss_flow"][frame_key] = (
+                                flow_loss_delta.detach()
+                            )
+                    
                     order_mask = viewpoint.depth > 0
                     loss_order_depth = self.get_depth_order_loss(
                         depth, viewpoint.depth, order_mask
                     )
-                    l = (
-                        get_loss_mapping(
+                    loss_depth_and_image = get_loss_mapping(
                             self.config["mapping"],
                             image,
                             depth,
@@ -2021,12 +2059,31 @@ class Mapper(object):
                             rm_dynamic=not dynamic_network,
                             dynamic=dynamic,
                         )
-                        + 0.1 * loss_order_depth
+                    loss_normal = self.get_loss_normal(depth, viewpoint)
+
+                    loss_order_weighted = (
+                        self.depth_order_loss_weight * loss_order_depth
                     )
-                    loss_mapping += l
-                    loss_network += l
+                    loss_normal_weighted = self.normal_loss_weight * loss_normal
+                    frame_loss_mapping = (
+                        loss_depth_and_image
+                        + loss_order_weighted
+                        + loss_normal_weighted
+                    )
+                    
+                    loss_mapping += frame_loss_mapping
+                    
+                    # loss_network += (
+                    #     loss_depth_and_image
+                    #     + self.depth_order_loss_weight * loss_order_depth
+                    #     + self.normal_loss_weight * loss_normal
+                    # )
                     
                     # if flatten_w > 0 and normal is not None:
+                    #     loss_mapping += flatten_w * self.get_loss_flattening(
+                    #         normal, viewpoint, opacity=opacity
+                    #     )
+                    
                     #     loss_mapping += flatten_w * self.get_loss_flattening(
                     #         normal, viewpoint, opacity=opacity
                     #     )
@@ -2035,7 +2092,7 @@ class Mapper(object):
                         and closest_keyframe in self.viewpoints
                         and not dynamic
                     ):
-                        loss_mapping += self.compute_multi_view_loss(
+                        loss_multi_view = self.compute_multi_view_loss(
                             viewpoint,
                             render_pkg,
                             self.gaussians,
@@ -2048,9 +2105,34 @@ class Mapper(object):
                             d_value2["d_color"],
                             self.viewpoints[closest_keyframe],
                         )
-                    loss_network += self._add_deform_regularization_losses(
+                        loss_mapping += loss_multi_view
+                        frame_loss_mapping += loss_multi_view
+                        if kf_idx in current_window_log_set:
+                            per_frame_groups["loss_multi_view"][frame_key] = (
+                                loss_multi_view.detach()
+                            )
+
+                    if kf_idx in current_window_log_set:
+                        per_frame_groups["loss_mapping_total"][frame_key] = (
+                            frame_loss_mapping.detach()
+                        )
+                        per_frame_groups["loss_depth_and_image"][frame_key] = (
+                            loss_depth_and_image.detach()
+                        )
+                        per_frame_groups["loss_order_weighted"][frame_key] = (
+                            loss_order_weighted.detach()
+                        )
+                        per_frame_groups["loss_normal_weighted"][frame_key] = (
+                            loss_normal_weighted.detach()
+                        )
+                    reg_loss_delta = self._add_deform_regularization_losses(
                         viewpoint, delta=delta
                     )
+                    loss_network += reg_loss_delta
+                    if kf_idx in current_window_log_set:
+                        per_frame_groups["loss_reg"][frame_key] = (
+                            reg_loss_delta.detach()
+                        )
                 
                 if self.profile_mapping_time:
                     torch.cuda.synchronize()
@@ -2076,6 +2158,38 @@ class Mapper(object):
                 combined_vis = combined_vis | v
             # loss_mapping += self.scale_loss_weight * self.get_loss_flat(combined_vis)
             # 与 mapper_copy 一致：mapping 与 network 分开反传，deform 只受 loss_network 更新，避免重建梯度干扰动态优化
+
+            gauss_count = int(self.gaussians.get_xyz.shape[0])
+            visible_ratio = float(combined_vis.float().mean().item())
+            mean_radii = []
+            for r, v in zip(radii_acm, visibility_filter_acm):
+                if v.any():
+                    mean_radii.append(r[v].float().mean())
+                else:
+                    mean_radii.append(
+                        torch.zeros((), device=r.device, dtype=torch.float32)
+                    )
+
+            stats = {
+                "loss_isotropic": isotropic_loss.mean().detach(),
+                "gaussian_count": gauss_count,
+                "visible_ratio": visible_ratio,
+                "mean_radius2d": torch.stack(mean_radii).mean().detach(),
+            }
+            if not prune:
+                self.tb_aspect.log_mapping_stats(
+                    step=i,
+                    stats=stats,
+                    gaussians=self.gaussians,
+                    namespace=map_namespace,
+                )
+                for metric_name, scalar_dict in per_frame_groups.items():
+                    self.tb_aspect.log_scalar_group(
+                        step=i,
+                        main_tag=f"{map_namespace}/per_frame/{metric_name}",
+                        scalar_dict=scalar_dict,
+                    )
+
             loss_mapping.backward(retain_graph=True)
             if self.profile_mapping_time:
                 torch.cuda.synchronize()
@@ -2425,7 +2539,7 @@ class Mapper(object):
                 rand_idx = np.random.randint(0, len(random_viewpoint_stack))
                 viewpoint = random_viewpoint_stack[rand_idx]
                 # print("self.dynamic_model", self.dynamic_model)
-                print("self.gaussians.deform_init", self.gaussians.deform_init)
+                # print("self.gaussians.deform_init", self.gaussians.deform_init)
                 if self.dynamic_model and self.gaussians.deform_init:
                     dxyz, d_rot, d_scale, d_opac, d_color = self._get_deform_d_values(
                         viewpoint,
