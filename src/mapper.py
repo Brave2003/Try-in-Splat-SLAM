@@ -1867,6 +1867,20 @@ class Mapper(object):
         if len(current_window) == 0:
             return
         import numpy as np
+        key_opt = []
+        if len(current_window) > self.window_size:
+            key_opt = self.viewpoints[current_window[0]].keyframe_selection_overlap(
+                stream, self.viewpoints, self.viewpoints[current_window[2]].uid
+            )
+        key_opt = current_window[:3] + key_opt
+        viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in key_opt]
+        random_viewpoint_stack = []
+        frames_to_optimize = self.config["mapping"]["Training"]["pose_window"]
+        current_window_set = set(key_opt)
+        for cam_idx, viewpoint in self.viewpoints.items():
+            if cam_idx in current_window_set:
+                continue
+            random_viewpoint_stack.append(viewpoint)
 
         flow_weights = self.config["mapping"]["Training"]["flow_loss"]
         delta = self.config["mapping"]["Training"].get("delta", 5)
@@ -1911,19 +1925,14 @@ class Mapper(object):
                     "flow_loss_fine", self.config["mapping"]["Training"]["flow_loss"]
                 )
 
-            num_views = min(frames_to_optimize, len(current_window))
-            optimize_window = list(current_window[:num_views])
-            all_keyframes = list(self.viewpoints.keys())
-            current_window_set = set(current_window)
-            if len(all_keyframes) >= len(current_window) + 2:
-                outside_candidates = [
-                    kf for kf in all_keyframes if kf not in current_window_set
-                ]
-                if len(outside_candidates) >= 2:
-                    random_kfs = np.random.choice(
-                        outside_candidates, size=2, replace=False
-                    ).tolist()
-                    optimize_window.extend(random_kfs)
+            num_views = min(frames_to_optimize, len(viewpoint_stack))
+            optimize_window = [vp.uid for vp in viewpoint_stack[:num_views]]
+            
+            if len(random_viewpoint_stack) >= 2:
+                random_kfs = np.random.choice(
+                    [vp.uid for vp in random_viewpoint_stack], size=2, replace=False
+                ).tolist()
+                optimize_window.extend(random_kfs)
 
             viewspace_point_tensor_acm = []
             visibility_filter_acm = []
@@ -2024,7 +2033,7 @@ class Mapper(object):
                     if (
                         closest_keyframe is not None
                         and closest_keyframe in self.viewpoints
-                        and i > iters * 0.8
+                        and not dynamic
                     ):
                         loss_mapping += self.compute_multi_view_loss(
                             viewpoint,
@@ -2124,7 +2133,7 @@ class Mapper(object):
                     gaussian_split = True
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
-                for kf in keyframes_opt:
+                for kf in keyframes_opt[:num_views]:
                     if kf not in self.viewpoints:
                         continue
                     vp = self.viewpoints[kf]
@@ -2415,7 +2424,7 @@ class Mapper(object):
                 # 随机选择视角进行渲染
                 rand_idx = np.random.randint(0, len(random_viewpoint_stack))
                 viewpoint = random_viewpoint_stack[rand_idx]
-                print("self.dynamic_model", self.dynamic_model)
+                # print("self.dynamic_model", self.dynamic_model)
                 print("self.gaussians.deform_init", self.gaussians.deform_init)
                 if self.dynamic_model and self.gaussians.deform_init:
                     dxyz, d_rot, d_scale, d_opac, d_color = self._get_deform_d_values(
@@ -3080,6 +3089,40 @@ class Mapper(object):
                 return scaling.new_tensor(0.0)
         min_scale = scaling.min(dim=1).values  # (N,) 每点最短轴
         return min_scale.mean()
+
+    def get_loss_normal(self, depth_mean, viewpoint):
+        prior_normal = viewpoint.normal.cuda()
+        prior_normal = prior_normal.reshape(3, *depth_mean.shape[-2:]).permute(
+            1, 2, 0
+        )
+        prior_normal_normalized = torch.nn.functional.normalize(
+            prior_normal, dim=-1
+        )
+
+        normal_mean, _ = self.depth_to_normal(
+            viewpoint, depth_mean, world_frame=False
+        )
+        normal_error = 1 - (prior_normal_normalized * normal_mean).sum(dim=-1)
+        normal_error[prior_normal.norm(dim=-1) < 0.2] = 0
+        return normal_error.mean()
+
+    def depth_to_normal(self, view, depth, world_frame=False):
+        """
+        view: view camera
+        depth: depthmap
+        """
+
+        points = self.depths_to_points(view, depth, world_frame).reshape(
+            *depth.shape[1:], 3
+        )
+        normal_map = torch.zeros_like(points)
+        dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
+        dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
+        normal_map[1:-1, 1:-1, :] = torch.nn.functional.normalize(
+            torch.cross(dx, dy, dim=-1), dim=-1
+        )
+
+        return normal_map, points
 
     def get_loss_flattening(
         self, normal, viewpoint, opacity=None, opacity_threshold=0.95
