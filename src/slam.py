@@ -25,7 +25,7 @@ from thirdparty.glorie_slam.trajectory_filler import PoseTrajectoryFiller
 from src.utils.common import setup_seed,update_cam
 from src.utils.Printer import Printer,FontColor
 from src.utils.eval_traj import kf_traj_eval,full_traj_eval
-from src.utils.eval_utils import eval_rendering
+from src.utils.eval_utils import eval_rendering, save_gaussians
 from src.utils.datasets import BaseDataset
 from src.tracker import Tracker
 from src.mapper import Mapper
@@ -175,6 +175,9 @@ class SLAM:
         if not self.only_tracking:
             if self.cfg["tracking"]["backend"]["final_ba"]:
                 self.mapper.final_refine(iters=self.cfg["mapping"]["final_refine_iters"])
+
+            # Always persist final gaussian model for reproducible result inspection.
+            save_gaussians(self.mapper.gaussians, self.save_dir, iteration="after_refine", final=True)
 
             _prepare_traj_and_eval_rendering(
                 self, global_scale, r_a, t_a,

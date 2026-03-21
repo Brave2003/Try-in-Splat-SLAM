@@ -99,21 +99,32 @@ def eval_rendering(
                                              time_interval=gaussians.time_interval)
             dxyz = d_values['d_xyz']
             d_rot, d_scale = d_values['d_rotation'], d_values['d_scaling']
+            d_opac, d_color = d_values.get('d_opacity'), d_values.get('d_color')
             # print("eval using deform network")
         else:
-            dxyz, d_rot, d_scale = 0, 0, 0
-        rendering_pkg = render(frame, gaussians, pipe, background,dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot)
+            dxyz, d_rot, d_scale = 0, None, 0
+            d_opac, d_color = None, None
+        rendering_pkg = render(
+            frame,
+            gaussians,
+            pipe,
+            background,
+            dynamic=False,
+            dx=dxyz,
+            ds=d_scale,
+            dr=d_rot,
+            do=d_opac,
+            dc=d_color,
+        )
         rendering = rendering_pkg["render"].detach()
-        output_dir = os.path.join("output", "render_image")
+        output_dir = os.path.join(save_dir, iteration, "render_image")
         os.makedirs(output_dir, exist_ok=True)
-        image1 = rendering .permute(1, 2, 0).cpu().numpy()
-        image1_normalized = (image1 - image1.min()) / (
-                image1.max() - image1.min()) * 255
-        depth_normalized = image1_normalized.astype(np.uint8)
-        cv2_image = cv2.cvtColor(depth_normalized, cv2.COLOR_RGB2BGR)
+        image1 = rendering.permute(1, 2, 0).cpu().numpy()
+        image1_uint8 = (np.clip(image1, 0.0, 1.0) * 255).astype(np.uint8)
+        cv2_image = cv2.cvtColor(image1_uint8, cv2.COLOR_RGB2BGR)
         cv2.imwrite(os.path.join(output_dir, f"image_{kf_idx:04d}.png"), cv2_image)
         depth = rendering_pkg["depth"].detach()
-        output_dir = os.path.join("output", "sitting2_xyz_depth")
+        output_dir = os.path.join(save_dir, iteration, "render_depth")
         os.makedirs(output_dir, exist_ok=True)
 
         depth1 = depth.permute(1, 2, 0).cpu().numpy()
