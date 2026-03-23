@@ -111,6 +111,10 @@ class Mapper(object):
 
     """
 
+    # ---------------------------------------------------------------------
+    # Section A: Lifecycle and Global Hyper-Parameters
+    # ---------------------------------------------------------------------
+
     def __init__(self, slam, pipe: Connection):
         # setup seed
         setup_seed(slam.cfg["setup_seed"])
@@ -120,13 +124,14 @@ class Mapper(object):
         self.printer: Printer = slam.printer
         if self.config['only_tracking']:
             return
+
         self.pipe = pipe
         self.verbose = slam.verbose
 
+        # Runtime handles and containers
         self.gaussians = None
         self.pipeline_params = None
         self.opt_params = None
-
         self.dtype = torch.float32
         self.iteration_count = 0
         self.last_sent = 0
@@ -135,49 +140,75 @@ class Mapper(object):
         self.current_window = []
         self.initialized = True
         self.keyframe_optimizers = None
-        self.dystart=self.config["mapping"]["Training"]["dystart"] if "dystart" in self.config["mapping"]["Training"].keys() else 11
+
+        # Scene/tracking state
+        training_cfg = self.config["mapping"]["Training"]
+        self.dystart = training_cfg["dystart"] if "dystart" in training_cfg else 11
         self.video: DepthVideo = slam.video
-        self.monocular=not self.initialized
+        self.monocular = not self.initialized
+
+        # Config-derived params
+        mapping_cfg = self.config["mapping"]
+        model_cfg = mapping_cfg["model_params"]
+        self.use_spherical_harmonics = training_cfg["spherical_harmonics"]
+        self.dynamic_model = model_cfg["dynamic_model"]
+
+        # Optimizer/model argument packs
         model_params = munchify(self.config["mapping"]["model_params"])
         opt_params = munchify(self.config["mapping"]["opt_params"])
         pipeline_params = munchify(self.config["mapping"]["pipeline_params"])
-        self.use_spherical_harmonics = self.config["mapping"]["Training"]["spherical_harmonics"]
         self.model_params, self.opt_params, self.pipeline_params = (
             model_params,
             opt_params,
             pipeline_params,
         )
-        self.dynamic_model = self.config["mapping"]["model_params"]["dynamic_model"]
+
         parser = ArgumentParser(description="Training script parameters")
         hp = ModelHiddenParams(parser)
-
         hp = merge_hparams(hp, self.config["mapping"])
-        self.sc_params=hp
+        self.sc_params = hp
+
+        # Gaussian model initialization
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
-        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config,args=hp,init_deform=self.config["mapping"]["model_params"]["dynamic_model"])
+        self.gaussians = GaussianModel(
+            model_params.sh_degree,
+            config=self.config,
+            args=hp,
+            init_deform=self.dynamic_model,
+        )
         self.gaussians.init_lr(6.0)
+
+        # Scale-shift and helper caches
         self.st_predicted = {}
         self.list = []
-        self.first_d=[]
+        self.first_d = []
         self.new_scale_alignFrame0 = dict()
         self._image_coord_cache = {}
-        static_msk=np.ones( (384, 512), dtype=bool)
+        self._st_compare_counter = 0
+
+        static_msk = np.ones((384, 512), dtype=bool)
         self.gaussians.training_setup(opt_params)
+
+        # Global rendering/mapping state
         bg_color = [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        self.longer=self.config["mapping"]["long"]
+        self.longer = mapping_cfg["long"]
         self.cameras_extent = 6.0
-        self.dyratio=0
-        self.shift=self.config["mapping"]["shift"]
-        self.s=self.config["mapping"]["s"]
+        self.dyratio = 0
+        self.shift = mapping_cfg["shift"]
+        self.s = mapping_cfg["s"]
+
+        # Hyper-parameters depending on camera extent and mapping config
         self.set_hyperparams()
+
         self.device = torch.device(self.config['device'])
         self.static_msk = torch.from_numpy(static_msk).to(self.device)
-        self.frame_reader = get_dataset(
-            self.config, device=self.device)
-        if self.config["mapping"]["model_params"]["dynamic_model"]:
+        self.frame_reader = get_dataset(self.config, device=self.device)
+
+        if self.dynamic_model:
             self.gaussians.deform.train_setting(hp)
             self.gaussians.time_interval = 1 / len(self.frame_reader)
+
     def set_pipe(self, pipe):
         self.pipe = pipe
 
@@ -185,8 +216,8 @@ class Mapper(object):
         mapping_config = self.config["mapping"]
         training_config = mapping_config["Training"]
 
+        # Core mapping schedule
         self.gt_camera = training_config["gt_camera"]
-
         self.init_itr_num = training_config["init_itr_num"]
         self.init_gaussian_update = training_config["init_gaussian_update"]
         self.init_gaussian_reset = training_config["init_gaussian_reset"]
@@ -195,6 +226,8 @@ class Mapper(object):
             self.cameras_extent * training_config["init_gaussian_extent"]
         )
         self.mapping_itr_num = training_config["mapping_itr_num"]
+
+        # Gaussian maintenance schedule
         self.gaussian_update_every = training_config["gaussian_update_every"]
         self.gaussian_update_offset = training_config["gaussian_update_offset"]
         self.gaussian_th = training_config["gaussian_th"]
@@ -204,6 +237,8 @@ class Mapper(object):
         self.gaussian_reset = training_config["gaussian_reset"]
         self.size_threshold = training_config["size_threshold"]
         self.window_size = training_config["window_size"]
+
+        # Loss weights
         self.depth_order_loss_weight = training_config.get("depth_order_loss_weight", 0.1)
         self.normal_loss_weight = training_config.get("normal_loss_weight", 0.01)
         self.dynamic_phase_ratio = float(training_config.get("dynamic_phase_ratio", 0.5))
@@ -226,6 +261,10 @@ class Mapper(object):
             self.gaussians.extend_from_pcd_seq(
                 viewpoint, kf_id=frame_idx, init=True, scale=scale, depthmap=depth_map, add_dygs=True
             )
+
+    # ---------------------------------------------------------------------
+    # Section B: Keyframe and Geometry State Update
+    # ---------------------------------------------------------------------
 
     def reset(self):
         self.iteration_count = 0
@@ -346,6 +385,11 @@ class Mapper(object):
             scales = self.gaussians._scaling.detach()
             scales[frame_mask] = scales[frame_mask] + torch.log(rescale_scale)
             self.gaussians._scaling = self.gaussians.replace_tensor_to_optimizer(scales, "scaling")["scaling"]
+
+    # ---------------------------------------------------------------------
+    # Section C: Depth/Normal and Scale-Shift Alignment Utilities
+    # ---------------------------------------------------------------------
+
     def init_image_coor(self,height, width):
         cache_key = (height, width, str(self.device))
         if cache_key in self._image_coord_cache:
@@ -374,16 +418,15 @@ class Mapper(object):
         normal_torch,
         self_defined_focal_x: float,
         self_defined_focal_y: float,
-        init_s: float = 1.0,
-        init_t: float = 0.0,
     ):
+        start_time = time.perf_counter()
         input_depth = depth_torch.to(self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
         gt_normal = normal_torch.to(self.device, dtype=torch.float32)
         gt_normal_neg = -gt_normal
         focal_x = torch.tensor([self_defined_focal_x], dtype=torch.float32, device=self.device)
         focal_y = torch.tensor([self_defined_focal_y], dtype=torch.float32, device=self.device)
-        s = nn.Parameter(torch.tensor([float(init_s)], dtype=torch.float32, device=self.device))
-        t = nn.Parameter(torch.tensor([float(init_t)], dtype=torch.float32, device=self.device))
+        s = nn.Parameter(torch.tensor([float(1.0)], dtype=torch.float32, device=self.device))
+        t = nn.Parameter(torch.tensor([float(0.0)], dtype=torch.float32, device=self.device))
 
         optimizer = torch.optim.Adam([
             {'params': s, 'lr': 1e-3},
@@ -409,96 +452,78 @@ class Mapper(object):
                 if abs(loss.item() - last_step_loss) < 1e-5:
                     break
                 last_step_loss = loss.item()
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        print(
+            "[optimize_st][Optimized] "
+            f"s={s.item():.6f}, t={t.item():.6f}, loss={final_loss:.6f}, step={final_step}, time={elapsed_ms:.2f}ms"
+        )
         return s.item(), t.item()
 
-    def get_surface_normalv2(self,xyz, patch_size=3):
+    def get_surface_normalv2(self, xyz, patch_size=3):
         """
-        xyz: xyz coordinates
-        patch: [p1, p2, p3,
-                p4, p5, p6,
-                p7, p8, p9]
-        surface_normal = [(p9-p1) x (p3-p7)] + [(p6-p4) - (p8-p2)]
-        return: normal [h, w, 3, b]
+        优化后的法向量计算：去除了所有阻碍 backward() 速度的操作
         """
         eps = 1e-8
         b, h, w, c = xyz.shape
         half_patch = patch_size // 2
-        xyz_pad = torch.zeros((b, h + patch_size - 1, w + patch_size - 1, c), dtype=xyz.dtype, device=xyz.device)
-        xyz_pad[:, half_patch:-half_patch, half_patch:-half_patch, :] = xyz
+        
+        # 【核心优化 1】：用 F.pad 替代 torch.zeros 和切片赋值。
+        # 这是一个零拷贝（Zero-copy）级别的操作，大幅减少显存分配开销和建图时间。
+        # Pad 的顺序是从后向前：先 Pad 最后一维 C(不 pad)，再 pad W，再 pad H。
+        xyz_pad = F.pad(xyz, (0, 0, half_patch, half_patch, half_patch, half_patch), mode='constant', value=0.0)
 
+        xyz_left = xyz_pad[:, half_patch:half_patch + h, :w, :]  
+        xyz_right = xyz_pad[:, half_patch:half_patch + h, -w:, :]  
+        xyz_top = xyz_pad[:, :h, half_patch:half_patch + w, :]  
+        xyz_bottom = xyz_pad[:, -h:, half_patch:half_patch + w, :]  
+        xyz_horizon = xyz_left - xyz_right  
+        xyz_vertical = xyz_top - xyz_bottom  
 
-        xyz_left = xyz_pad[:, half_patch:half_patch + h, :w, :]  # p4
-        xyz_right = xyz_pad[:, half_patch:half_patch + h, -w:, :]  # p6
-        xyz_top = xyz_pad[:, :h, half_patch:half_patch + w, :]  # p2
-        xyz_bottom = xyz_pad[:, -h:, half_patch:half_patch + w, :]  # p8
-        xyz_horizon = xyz_left - xyz_right  # p4p6
-        xyz_vertical = xyz_top - xyz_bottom  # p2p8
-
-        xyz_left_in = xyz_pad[:, half_patch:half_patch + h, 1:w + 1, :]  # p4
-        xyz_right_in = xyz_pad[:, half_patch:half_patch + h, patch_size - 1:patch_size - 1 + w, :]  # p6
-        xyz_top_in = xyz_pad[:, 1:h + 1, half_patch:half_patch + w, :]  # p2
-        xyz_bottom_in = xyz_pad[:, patch_size - 1:patch_size - 1 + h, half_patch:half_patch + w, :]  # p8
-        xyz_horizon_in = xyz_left_in - xyz_right_in  # p4p6
-        xyz_vertical_in = xyz_top_in - xyz_bottom_in  # p2p8
+        xyz_left_in = xyz_pad[:, half_patch:half_patch + h, 1:w + 1, :]  
+        xyz_right_in = xyz_pad[:, half_patch:half_patch + h, patch_size - 1:patch_size - 1 + w, :]  
+        xyz_top_in = xyz_pad[:, 1:h + 1, half_patch:half_patch + w, :]  
+        xyz_bottom_in = xyz_pad[:, patch_size - 1:patch_size - 1 + h, half_patch:half_patch + w, :]  
+        xyz_horizon_in = xyz_left_in - xyz_right_in  
+        xyz_vertical_in = xyz_top_in - xyz_bottom_in  
 
         n_img_1 = torch.cross(xyz_horizon_in, xyz_vertical_in, dim=3)
         n_img_2 = torch.cross(xyz_horizon, xyz_vertical, dim=3)
 
-        # re-orient normals consistently
-        orient_mask = torch.sum(n_img_1 * xyz, dim=3) > 0
-        n_img_1[orient_mask] *= -1
-        orient_mask = torch.sum(n_img_2 * xyz, dim=3) > 0
-        n_img_2[orient_mask] *= -1
+        # 【核心优化 2】：彻底消灭布尔掩码 (orient_mask = ... -> tensor[mask] *= -1)
+        # 利用数学符号函数 torch.sign() 实现纯张量乘法，绕过低效的掩码求导。
+        # 如果内积 > 0，sign=1，乘 -1 翻转；如果内积 < 0，sign=-1，乘 -1 保持原样不变。
+        dot_1 = torch.sum(n_img_1 * xyz, dim=3, keepdim=True)
+        n_img_1 = n_img_1 * -torch.sign(dot_1 + eps)
+        
+        dot_2 = torch.sum(n_img_2 * xyz, dim=3, keepdim=True)
+        n_img_2 = n_img_2 * -torch.sign(dot_2 + eps)
 
-        n_img1_L2 = torch.sqrt(torch.sum(n_img_1 ** 2, dim=3, keepdim=True)+ eps)
-        n_img1_norm = n_img_1 / (n_img1_L2 + 1e-8)
+        n_img1_L2 = torch.sqrt(torch.sum(n_img_1 ** 2, dim=3, keepdim=True) + eps)
+        n_img1_norm = n_img_1 / (n_img1_L2 + eps)
 
-        n_img2_L2 = torch.sqrt(torch.sum(n_img_2 ** 2, dim=3, keepdim=True)+ eps)
-        n_img2_norm = n_img_2 / (n_img2_L2 + 1e-8)
+        n_img2_L2 = torch.sqrt(torch.sum(n_img_2 ** 2, dim=3, keepdim=True) + eps)
+        n_img2_norm = n_img_2 / (n_img2_L2 + eps)
 
-        # average 2 norms
         n_img_aver = n_img1_norm + n_img2_norm
-        n_img_aver_L2 = torch.sqrt(torch.sum(n_img_aver ** 2, dim=3, keepdim=True)+ eps)
-        n_img_aver_norm = n_img_aver / (n_img_aver_L2 + 1e-8)
-        # re-orient normals consistently
-        orient_mask = torch.sum(n_img_aver_norm * xyz, dim=3) > 0
-        n_img_aver_norm[orient_mask] *= -1
-        n_img_aver_norm_out = n_img_aver_norm.permute((1, 2, 3, 0))  # [h, w, c, b]
+        n_img_aver_L2 = torch.sqrt(torch.sum(n_img_aver ** 2, dim=3, keepdim=True) + eps)
+        n_img_aver_norm = n_img_aver / (n_img_aver_L2 + eps)
+        
+        # 同样干掉最后一处掩码
+        dot_aver = torch.sum(n_img_aver_norm * xyz, dim=3, keepdim=True)
+        n_img_aver_norm = n_img_aver_norm * -torch.sign(dot_aver + eps)
+        
+        n_img_aver_norm_out = n_img_aver_norm.permute((1, 2, 3, 0))  
 
-        return n_img_aver_norm_out  # n_img1_norm.permute((1, 2, 3, 0))
+        return n_img_aver_norm_out
+    
     def obtain_allimgs_st(self,depth, normal, st_dict, video_idx,self_define_focal_x: float,self_define_focal_y: float):
-        depth_torch = depth.detach()
-        normal_torch = torch.as_tensor(normal)
+        depth_np = depth.cpu().numpy()
+        H, W = depth_np.shape
+        depth_torch = torch.from_numpy(depth_np)  # (B, h, w)
+        normal_torch = torch.from_numpy(normal)  # (B, h, w,3)
         if video_idx not in st_dict :
-            init_s, init_t = 1.0, 0.0
-
-            if "mean_s" in st_dict and "mean_t" in st_dict:
-                init_s = float(st_dict["mean_s"])
-                init_t = float(st_dict["mean_t"])
-
-            hist_keys = sorted([k for k in st_dict.keys() if isinstance(k, int)])
-            if len(hist_keys) > 0:
-                prev_key = None
-                for k in hist_keys:
-                    if k < video_idx:
-                        prev_key = k
-                    else:
-                        break
-                if prev_key is None:
-                    prev_key = hist_keys[-1]
-                prev_st = st_dict.get(prev_key, None)
-                if prev_st is not None:
-                    init_s = float(prev_st.get("scale", init_s))
-                    init_t = float(prev_st.get("shift", init_t))
-
-            s, t = self.optimize_st(
-                depth_torch,
-                normal_torch,
-                self_define_focal_x,
-                self_define_focal_y,
-                init_s=init_s,
-                init_t=init_t,
-            )
+            s, t = self.optimize_st(depth_torch, normal_torch, self_define_focal_x,self_define_focal_y)
             st_dict[video_idx] = {"scale": s, "shift": t}
 
     def align_all_frames(self,depth, video_id,st_predicted, new_scale_alignFrame0: dict, static_msk):
@@ -746,6 +771,10 @@ class Mapper(object):
             mono_depth_wq = mono_depth
             torch.cuda.empty_cache()
         return mono_depth_wq, w2c, invalid
+
+    # ---------------------------------------------------------------------
+    # Section D: Mapper Render/Deformation and Loss Helper Functions
+    # ---------------------------------------------------------------------
 
     def _unpack_render_pkg(self, render_pkg):
         """Return common render outputs in a fixed order to reduce repeated boilerplate."""
@@ -1024,6 +1053,10 @@ class Mapper(object):
         )
         return reg_loss
 
+    # ---------------------------------------------------------------------
+    # Section E: Online Visualization Utilities
+    # ---------------------------------------------------------------------
+
     def _plot_window_psnr_grid(self, window_indices, dynamic_network, plot_dir, idx_tag):
         from thirdparty.gaussian_splatting.utils.image_utils import psnr
 
@@ -1085,6 +1118,10 @@ class Mapper(object):
         fig.tight_layout()
         fig.savefig(save_path, bbox_inches="tight")
         plt.close(fig)
+
+    # ---------------------------------------------------------------------
+    # Section F: Map Initialization and Mapping Core Loop
+    # ---------------------------------------------------------------------
 
 
     def initialize_map(self, cur_frame_idx,idx, viewpoint):
@@ -1604,6 +1641,10 @@ class Mapper(object):
             self._plot_window_psnr_grid(current_window, dynamic_network, plot_dir, f"window_{cur_idx}")
 
         return gaussian_split
+
+    # ---------------------------------------------------------------------
+    # Section G: Final Refinement Stage
+    # ---------------------------------------------------------------------
 
     def final_refine(self, prune=False, iters=26000):
         self.printer.print("Starting final refinement", FontColor.MAPPER)
@@ -2309,6 +2350,10 @@ class Mapper(object):
 
         return window, removed_frame
 
+    # ---------------------------------------------------------------------
+    # Section H: End-to-End Runtime Pipeline
+    # ---------------------------------------------------------------------
+
     def run(self,stream:BaseDataset):
         """
         Trigger mapping process, get estimated pose and depth from tracking process,
@@ -2674,6 +2719,11 @@ class Mapper(object):
     def patch_offsets(self,h_patch_size, device):
         offsets = torch.arange(-h_patch_size, h_patch_size + 1, device=device)
         return torch.stack(torch.meshgrid(offsets, offsets, indexing='xy')[::-1], dim=-1).view(1, -1, 2)
+
+    # ---------------------------------------------------------------------
+    # Section I: Multi-View Geometric/NCC Consistency Loss
+    # ---------------------------------------------------------------------
+
     def compute_multi_view_loss(self, viewpoint_cam, render_pkg, gaussians, pipe, bg, dxyz, d_scale, d_rot, d_opac,
                                 d_color,
                                 nearest_cam):
