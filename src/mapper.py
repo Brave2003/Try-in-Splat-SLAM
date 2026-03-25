@@ -403,6 +403,7 @@ class Mapper(object):
         v_v0 = y - height / 2.0
         self._image_coord_cache[cache_key] = (u_u0, v_v0)
         return u_u0, v_v0
+    
     def depth_to_xyz(self,depth, focal_x,focal_y):
         b, c, h, w = depth.shape
         u_u0, v_v0 = self.init_image_coor(h, w)
@@ -522,7 +523,7 @@ class Mapper(object):
         n_img_aver_norm_out = n_img_aver_norm.permute((1, 2, 3, 0))  
 
         return n_img_aver_norm_out
-    
+        
     def obtain_allimgs_st(self,depth, normal, st_dict, video_idx,self_define_focal_x: float,self_define_focal_y: float):
         depth_torch = depth.detach().to("cpu")
         normal_torch = torch.from_numpy(normal) if isinstance(normal, np.ndarray) else normal.detach().to("cpu")
@@ -694,6 +695,61 @@ class Mapper(object):
         normal_error[prior_normal.norm(dim=-1) < 0.2] = 0
         return normal_error.mean()
 
+    def get_render_normal_loss(self, gt_normal, render_normal):
+        """
+        计算 Ground Truth 法向量与 3DGS 渲染得到的法向量之间的损失
+        """
+        gt_normal = gt_normal.squeeze(0)
+        if gt_normal is None or render_normal is None:
+            return torch.tensor(0.0, device=render_normal.device)
+
+        # 把 gt_normal reshape 成与 render_normal 一致的 [3, H, W]
+        if gt_normal.dim() == 1:
+            gt_normal = gt_normal.reshape(3, render_normal.shape[1], render_normal.shape[2])
+            
+        # 很多时候数据集法向可能是 HWC 或是平铺的，稳妥起见确保形状对齐
+        if gt_normal.shape != render_normal.shape:
+            gt_normal = torch.nn.functional.interpolate(gt_normal.unsqueeze(0), size=render_normal.shape[-2:], mode="nearest").squeeze(0)
+
+        # 归一化 (在通道维度 dim=0 上做 L2 归一化)
+        gt_norm = torch.nn.functional.normalize(gt_normal, p=2, dim=0)
+        render_norm = torch.nn.functional.normalize(render_normal, p=2, dim=0)
+
+        # 基于余弦相似度的方向损失 (1 - cos(theta)) 
+        cos_similarity = (gt_norm * render_norm).sum(dim=0)
+        loss_cos = 1.0 - cos_similarity
+
+        l1_loss = torch.abs(gt_norm - render_norm).sum(dim=0)
+
+        # 将两种损失结合 (这里使用 0.8 * cos + 0.2 * L1)
+        loss_map = loss_cos + 0.2 * l1_loss
+
+        # 构建 Mask 去除无效区域
+        valid_mask = gt_normal.norm(p=2, dim=0) > 0.1
+        
+        if valid_mask.sum() > 0:
+            return loss_map[valid_mask].mean()
+        else:
+            return loss_map.mean()
+
+    def get_flat_loss(self):
+        """
+        高斯扁平化损失 (Flatten Loss):
+        约束 3DGS 在一个方向（通常是 scale 的最小值）尽可能小，
+        使得高斯球变成类似于 '薄片' (splats) 的形状，这有利于表面重建的平滑和法向量的准确。
+        """
+        # 获取当前所有高斯球的尺度 (scaling)。注意：通常 scaling 存储的是指数对数或其他激活前的形式，
+        # 所以我们需要用对应的激活函数获取实际的缩放系数。
+        scales = self.gaussians.get_scaling
+        
+        # 找到每个高斯球三个轴的缩放比例中最小的那一个（即厚度方向）
+        min_scales, _ = torch.min(scales, dim=-1)
+        
+        # 使其最小尺度趋于 0，通常用 L1 loss
+        flat_loss = torch.mean(min_scales)
+        
+        return flat_loss
+
     def depth_to_normal(self,view, depth, world_frame=False):
         """
             view: view camera
@@ -822,6 +878,7 @@ class Mapper(object):
             render_pkg["depth"],
             render_pkg["opacity"],
             render_pkg["n_touched"],
+            render_pkg.get("normal", None),
         )
 
     def _mapper_bar_desc(self, label):
@@ -850,7 +907,7 @@ class Mapper(object):
 
         return 0, None, 0, None, None
 
-    def _render_with_deform(self, viewpoint, dxyz=0, d_rot=None, d_scale=0, d_opac=None, d_color=None):
+    def _render_with_deform(self, viewpoint, dxyz=0, d_rot=None, d_scale=0, d_opac=None, d_color=None, return_normal=False):
         return render(
             viewpoint,
             self.gaussians,
@@ -862,6 +919,7 @@ class Mapper(object):
             dr=d_rot,
             do=d_opac,
             dc=d_color,
+            return_normal=return_normal,
         )
 
     def _get_nearest_view_deform(self, viewpoint):
@@ -1030,9 +1088,12 @@ class Mapper(object):
             rm_dynamic=not dynamic_network,
             dynamic=dynamic,
         ) + self.depth_order_loss_weight * loss_order_depth
-        loss_mapping += self.normal_loss_weight * self.get_loss_normal(depth, viewpoint)
+        # loss_mapping += self.normal_loss_weight * self.get_loss_normal(depth, viewpoint)
 
         enable_multi_view = not dynamic
+        
+        loss_mapping += self.config["mapping"]["Training"]["render_normal_loss_weight"] * self.get_render_normal_loss(viewpoint.normal, render_pkg["normal"])
+        loss_mapping += self.config["mapping"]["Training"]["flat_loss_weight"] * self.get_flat_loss()
 
         if (
             # False and
@@ -1170,7 +1231,7 @@ class Mapper(object):
             leave=True,
         ):
             self.iteration_count += 1
-            render_pkg = self._render_with_deform(viewpoint)
+            render_pkg = self._render_with_deform(viewpoint, return_normal=True)
             (
                 image,
                 viewspace_point_tensor,
@@ -1179,10 +1240,13 @@ class Mapper(object):
                 depth,
                 opacity,
                 n_touched,
+                normal
             ) = self._unpack_render_pkg(render_pkg)
             loss_init = get_loss_mapping(
                 self.config["mapping"], image, depth, viewpoint, opacity, initialization=True,rm_dynamic=not (self.dystart==cur_frame_idx)
             )
+            loss_init += self.config["mapping"]["Training"]["render_normal_loss_weight"] * self.get_render_normal_loss(viewpoint.normal, normal)
+            loss_init += self.config["mapping"]["Training"]["flat_loss_weight"] * self.get_flat_loss()
             loss_init.backward()
 
             with torch.no_grad():
@@ -1278,6 +1342,7 @@ class Mapper(object):
                 dxyz=dxyz,
                 d_rot=d_rot,
                 d_scale=d_scale,
+                return_normal=True,
             )
             (
                 image,
@@ -1287,11 +1352,14 @@ class Mapper(object):
                 depth,
                 opacity,
                 n_touched,
+                normal,
             ) = self._unpack_render_pkg(render_pkg)
 
             loss_init = get_loss_mapping(
                 self.config["mapping"], image, depth, viewpoint, opacity, initialization=True
             )
+            loss_init += self.config["mapping"]["Training"]["render_normal_loss_weight"] * self.get_render_normal_loss(viewpoint.normal, normal)
+            loss_init += self.config["mapping"]["Training"]["flat_loss_weight"] * self.get_flat_loss()
             # loss_init += self.gaussians.deform.reg_loss
 
             # scaling = self.gaussians.get_scaling
@@ -1417,10 +1485,11 @@ class Mapper(object):
                     dr=d_rot,
                     do=d_opac,
                     dc=d_color,
+                    return_normal=True,
                 )
 
                 (image, viewspace_point_tensor, visibility_filter,
-                radii, depth, opacity, n_touched) = (
+                radii, depth, opacity, n_touched, normal) = (
                     self._unpack_render_pkg(render_pkg)
                 )
                 if dynamic_network and self.gaussians.deform_init:
@@ -1473,7 +1542,7 @@ class Mapper(object):
                     dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot, do=d_opac, dc=d_color,
                 )
                 (image, viewspace_point_tensor, visibility_filter,
-                radii, depth, opacity, n_touched) = (   
+                radii, depth, opacity, n_touched, normal) = (   
                     self._unpack_render_pkg(render_pkg)
                 )
 
@@ -1777,6 +1846,7 @@ class Mapper(object):
                     depth,
                     opacity,
                     n_touched,
+                    normal,
                 ) = self._unpack_render_pkg(render_pkg)
 
                 image = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
