@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 import copy
+from types import SimpleNamespace
 from thirdparty.gaussian_splatting.utils.graphics_utils import focal2fov
 import torchvision.transforms as transforms
 from ultralytics import YOLO
@@ -195,6 +196,18 @@ class BaseDataset(Dataset):
             "yolo_pretrained", "pretrained/yolo11l-seg.pt"
         )
 
+        # DSINE 在线法向估计配置
+        data_cfg = cfg.get("data", {})
+        self.use_dsine_normal = cfg.get(
+            "use_dsine_normal", data_cfg.get("use_dsine_normal", False)
+        )
+        self.dsine_pretrained = data_cfg.get("dsine_pretrained", "pretrained/dsine.pt")
+        self.dsine_architecture = data_cfg.get("dsine_architecture", "v02")
+        self.dsine_num_iter_test = int(data_cfg.get("dsine_num_iter_test", 5))
+        self.dsine_model = None
+        self.dsine_ready = False
+        self.dsine_disabled_reason = None
+
     # def yolo_model(self):
     #     if self._yolo_model is not None:
     #         #raise AttributeError("YOLO模型未加载，请先调用load_yolo()")
@@ -211,6 +224,119 @@ class BaseDataset(Dataset):
         # 加载并分配设备
         self.yolo_model = YOLO(model_path).to(self.device)
         # print(f"YOLO已加载至设备：{self.yolo_model.device}")
+
+    def _load_dsine(self):
+        if self.dsine_ready:
+            return True
+        if self.dsine_disabled_reason is not None:
+            return False
+
+        ckpt_path = self.dsine_pretrained
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.join(os.getcwd(), ckpt_path)
+        if not os.path.isfile(ckpt_path):
+            self.dsine_disabled_reason = f"DSINE checkpoint not found: {ckpt_path}"
+            print(self.dsine_disabled_reason)
+            return False
+
+        try:
+            if self.dsine_architecture == "v02_kappa":
+                from thirdparty.DSINE.models.dsine.v02_kappa import DSINE_v02_kappa as DSINE
+            elif self.dsine_architecture == "v02":
+                from thirdparty.DSINE.models.dsine.v02 import DSINE_v02 as DSINE
+            elif self.dsine_architecture == "v01":
+                from thirdparty.DSINE.models.dsine.v01 import DSINE_v01 as DSINE
+            elif self.dsine_architecture == "v00":
+                from thirdparty.DSINE.models.dsine.v00 import DSINE_v00 as DSINE
+            else:
+                raise ValueError(f"Unsupported DSINE architecture: {self.dsine_architecture}")
+
+            args = SimpleNamespace(
+                NNET_architecture=self.dsine_architecture,
+                NNET_output_dim=4 if self.dsine_architecture == "v02_kappa" else 3,
+                NNET_output_type="R",
+                NNET_feature_dim=64,
+                NNET_hidden_dim=64,
+                NNET_encoder_B=5,
+                NNET_decoder_NF=2048,
+                NNET_decoder_BN=False,
+                NNET_decoder_down=8,
+                NNET_learned_upsampling=True,
+                NRN_prop_ps=5,
+                NRN_num_iter_train=5,
+                NRN_num_iter_test=self.dsine_num_iter_test,
+                NRN_ray_relu=True,
+            )
+
+            model = DSINE(args).to(self.device)
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+            cleaned = {}
+            for k, v in state_dict.items():
+                cleaned[k.replace("module.", "")] = v
+            model.load_state_dict(cleaned, strict=True)
+            self.dsine_model = model.eval()
+            self.dsine_ready = True
+            # print(f"DSINE loaded from {ckpt_path}")
+            return True
+        except Exception as e:
+            self.dsine_disabled_reason = f"Failed to init DSINE: {e}"
+            print(self.dsine_disabled_reason)
+            self.dsine_model = None
+            self.dsine_ready = False
+            return False
+
+    @staticmethod
+    def _get_pad_lrtb(h, w):
+        if w % 32 == 0:
+            l, r = 0, 0
+        else:
+            new_w = 32 * ((w // 32) + 1)
+            l = (new_w - w) // 2
+            r = (new_w - w) - l
+
+        if h % 32 == 0:
+            t, b = 0, 0
+        else:
+            new_h = 32 * ((h // 32) + 1)
+            t = (new_h - h) // 2
+            b = (new_h - h) - t
+        return l, r, t, b
+
+    @torch.no_grad()
+    def _predict_dsine_normal(self, rgb_1x3xhxw):
+        if not self._load_dsine():
+            return None
+
+        try:
+            inp = rgb_1x3xhxw.to(self.device)
+            _, _, h, w = inp.shape
+            l, r, t, b = self._get_pad_lrtb(h, w)
+
+            if l + r + t + b > 0:
+                inp = F.pad(inp, (l, r, t, b), mode="constant", value=0.0)
+
+            mean = torch.tensor([0.485, 0.456, 0.406], device=inp.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=inp.device).view(1, 3, 1, 1)
+            inp = (inp - mean) / std
+
+            intrins = torch.tensor(
+                [[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]],
+                dtype=torch.float32,
+                device=inp.device,
+            ).unsqueeze(0)
+            intrins[:, 0, 2] += l
+            intrins[:, 1, 2] += t
+
+            pred_norm = self.dsine_model(inp, intrins=intrins, mode="test")[-1]
+            pred_norm = pred_norm[:, :, t : t + h, l : l + w]
+
+            # 对齐项目里 normal 的通道定义
+            pred_norm = -pred_norm
+            return pred_norm.detach().cpu().float()
+        except Exception as e:
+            print(f"Failed DSINE normal inference: {e}")
+            return None
 
     def __len__(self):
         return self.n_img
@@ -502,33 +628,79 @@ class BaseDataset(Dataset):
             color_data = color_data[:, :, edge:-edge, :]
             depth_data = depth_data[edge:-edge, :]
 
-        if self.normal_paths:
+        normal_input = None
+
+        if self.use_dsine_normal:
+            normal_input = self._predict_dsine_normal(color_data).to(self.device)
+
+        if normal_input is None and self.normal_paths:
             try:
                 normal_path = self.normal_paths[index]
-                normal_data= np.load(normal_path)
-                normal_data = cv2.cvtColor(normal_data, cv2.COLOR_BGR2RGB)
-                normal_data = cv2.resize(normal_data, (self.W_out_with_edge, self.H_out_with_edge))
-                normal_data= torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
-                normal_data=normal_data.unsqueeze(dim=0)
-                if self.W_edge > 0:
-                    edge = self.W_edge
-                    normal_data = normal_data[:, :, :, edge:-edge]
+                if normal_path is not None and os.path.isfile(normal_path):
+                    normal_data = np.load(normal_path).astype(np.float32)
 
-                if self.H_edge > 0:
-                    edge = self.H_edge
-                    normal_data = normal_data[:,  :,edge:-edge, :]
-                #normal_input  = torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
+                    # Convert CHW to HWC when needed.
+                    if (
+                        normal_data.ndim == 3
+                        and normal_data.shape[0] == 3
+                        and normal_data.shape[-1] != 3
+                    ):
+                        normal_data = np.transpose(normal_data, (1, 2, 0))
+                    if normal_data.ndim != 3 or normal_data.shape[2] != 3:
+                        raise ValueError(f"Unexpected normal shape: {normal_data.shape}")
 
-                normal_input  = normal_data * 2.0 - 1.0
-                # print("norm",normal_input.shape)
+                    # Keep previous behavior of BGR->RGB channel order conversion.
+                    normal_data = normal_data[..., ::-1].copy()
+                    normal_data = cv2.resize(
+                        normal_data,
+                        (self.W_out_with_edge, self.H_out_with_edge),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+
+                    # Auto decode normal map range.
+                    normal_min = float(normal_data.min())
+                    normal_max = float(normal_data.max())
+                    if normal_min >= 0.0 and normal_max > 1.5:
+                        # [0, 255] -> [-1, 1]
+                        normal_data = normal_data / 127.5 - 1.0
+                    elif normal_min >= 0.0 and normal_max <= 1.5:
+                        # [0, 1] -> [-1, 1]
+                        normal_data = normal_data * 2.0 - 1.0
+                    # Else assume already in [-1, 1].
+
+                    # Re-normalize vectors after resize / decoding.
+                    normal_norm = np.linalg.norm(normal_data, axis=2, keepdims=True)
+                    normal_data = np.where(
+                        normal_norm > 1e-6,
+                        normal_data / np.clip(normal_norm, 1e-6, None),
+                        0.0,
+                    )
+
+                    normal_data = (
+                        torch.from_numpy(normal_data)
+                        .float()
+                        .permute(2, 0, 1)
+                        .unsqueeze(dim=0)
+                    )
+                    # 对齐深度计算的法向量
+                    normal_data = -normal_data[:, [2, 1, 0], :, :]
+                    if self.W_edge > 0:
+                        edge = self.W_edge
+                        normal_data = normal_data[:, :, :, edge:-edge]
+
+                    if self.H_edge > 0:
+                        edge = self.H_edge
+                        normal_data = normal_data[:, :, edge:-edge, :]
+
+                    normal_input = normal_data
             except Exception as e:
                 print(f"Failed to load normal map: {e}")
-        # if depth_data_fullsize is not None:
-        #     normal_input = self.depth_to_normal(depth_data)
-        # else:
-        #     normal_input = torch.zeros(
-        #         3, self.H_out, self.W_out, device=self.device, dtype=torch.float32
-        #     )
+
+        if normal_input is None and depth_data is not None:
+            normal_input = self.depth_to_normal(depth_data).unsqueeze(0).cpu().float()
+
+        if normal_input is None:
+            normal_input = torch.zeros((1, 3, self.H_out, self.W_out), dtype=torch.float32)
 
         # --- 4. 掩码：优先使用前端保存的 motion_mask 图片，否则默认全静态 ---
 
