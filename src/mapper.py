@@ -422,27 +422,33 @@ class Mapper(object):
         start_time = time.perf_counter()
         input_depth = depth_torch.to(self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
         gt_normal = normal_torch.to(self.device, dtype=torch.float32)
-        gt_normal_neg = -gt_normal
+
+        if gt_normal.shape[-2:] != input_depth.shape[-2:]:
+            gt_normal = F.interpolate(gt_normal, size=input_depth.shape[-2:], mode="nearest")
+        gt_normal = F.normalize(gt_normal, dim=1)
+
         focal_x = torch.tensor([self_defined_focal_x], dtype=torch.float32, device=self.device)
         focal_y = torch.tensor([self_defined_focal_y], dtype=torch.float32, device=self.device)
+        
         s = nn.Parameter(torch.tensor([float(1.0)], dtype=torch.float32, device=self.device))
-        t = nn.Parameter(torch.tensor([float(0.0)], dtype=torch.float32, device=self.device))
+        # t = nn.Parameter(torch.tensor([float(0.0)], dtype=torch.float32, device=self.device))
 
         optimizer = torch.optim.Adam([
             {'params': s, 'lr': 1e-3},
-            {'params': t, 'lr': 1e-3},
+            # {'params': t, 'lr': 1e-3},
         ])
         last_step_loss = 100000.
         for step in range(500):
             optimizer.zero_grad(set_to_none=True)
-            scaled_depth = s * input_depth + t
+            scaled_depth = s * input_depth + 1.0
             # depth = s*input_depth+t
             depth_filter = nn.functional.avg_pool2d(scaled_depth, kernel_size=3, stride=1, padding=1)
             depth_filter = nn.functional.avg_pool2d(depth_filter, kernel_size=3, stride=1, padding=1)
             xyz = self.depth_to_xyz(depth_filter, focal_x,focal_y)
             xyz_i = xyz[0, :][None, :, :, :]
             pre_normal = self.get_surface_normalv2(xyz_i).permute((3, 2, 0, 1))
-            similarity = torch.nn.functional.cosine_similarity(pre_normal, gt_normal_neg, dim=1)
+            
+            similarity = torch.nn.functional.cosine_similarity(pre_normal, gt_normal, dim=1)
             # if similarity
             loss = torch.nanmean(1 - similarity)
 
@@ -456,9 +462,9 @@ class Mapper(object):
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         print(
             "[optimize_st][Optimized] "
-            f"s={s.item():.6f}, t={t.item():.6f}, loss={final_loss:.6f}, step={final_step}, time={elapsed_ms:.2f}ms"
+            f"s={s.item():.6f}, t={1.0:.6f}, loss={loss.item():.6f}, step={step}, time={elapsed_ms:.2f}ms"
         )
-        return s.item(), t.item()
+        return s.item(), 1.0
 
     def get_surface_normalv2(self, xyz, patch_size=3):
         """
@@ -518,13 +524,35 @@ class Mapper(object):
         return n_img_aver_norm_out
     
     def obtain_allimgs_st(self,depth, normal, st_dict, video_idx,self_define_focal_x: float,self_define_focal_y: float):
-        depth_np = depth.cpu().numpy()
-        H, W = depth_np.shape
-        depth_torch = torch.from_numpy(depth_np)  # (B, h, w)
-        normal_torch = torch.from_numpy(normal)  # (B, h, w,3)
-        if video_idx not in st_dict :
-            s, t = self.optimize_st(depth_torch, normal_torch, self_define_focal_x,self_define_focal_y)
+        depth_torch = depth.detach().to("cpu")
+        normal_torch = torch.from_numpy(normal) if isinstance(normal, np.ndarray) else normal.detach().to("cpu")
+        if video_idx not in st_dict:
+            s, t = self.optimize_st(depth_torch, normal_torch, self_define_focal_x, self_define_focal_y)
             st_dict[video_idx] = {"scale": s, "shift": t}
+
+        self._update_st_running_mean()
+
+    def _update_st_running_mean(self):
+        scales = []
+        shifts = []
+        for k, v in self.st_predicted.items():
+            if not isinstance(k, int) or not isinstance(v, dict):
+                continue
+
+            s = v.get("scale", None)
+            t = v.get("shift", None)
+            if s is None or t is None:
+                continue
+
+            s = float(s)
+            t = float(t)
+            if np.isfinite(s) and np.isfinite(t):
+                scales.append(s)
+                shifts.append(t)
+
+        if len(scales) > 0:
+            self.st_predicted["mean_s"] = float(np.mean(scales))
+            self.st_predicted["mean_t"] = float(np.mean(shifts))
 
     def align_all_frames(self,depth, video_id,st_predicted, new_scale_alignFrame0: dict, static_msk):
         # depth_dirs = glob(os.path.join(base_dir,'GeoWizardOut/depth_npy/*.npy'))
@@ -712,6 +740,8 @@ class Mapper(object):
             print(f"valid depth number: {valid_depth_mask.sum().item()}, "
                 f"valid depth ratio: {(valid_depth_mask.sum() / (valid_depth_mask.shape[0] * valid_depth_mask.shape[1])).item()}")
 
+        mono_depth_wq = mono_depth
+
         if valid_depth_mask.sum() < 100:
             invalid = True
             print(
@@ -757,13 +787,19 @@ class Mapper(object):
             if video_idx == 11 and len(self.first_d)  == 0:
                 self.first_d.append(motion_mask)
             refer_mask=self.first_d[0]
-            self.obtain_allimgs_st(mono_depth, normal, self.st_predicted, video_idx, 535.4, 539.2)
-            mean_s = 0
-            mean_t = 0
+
+            intrinsics = self.frame_reader.get_intrinsic()
+            if torch.is_tensor(intrinsics):
+                intrinsics = intrinsics.detach().cpu().tolist()
+            fx, fy = float(intrinsics[0]), float(intrinsics[1])
+
+            self.obtain_allimgs_st(mono_depth, normal, self.st_predicted, video_idx, fx, fy)
             invalid = 0
 
-            self.st_predicted["mean_s"] = 0.8
-            self.st_predicted["mean_t"] = 0.15
+            if "mean_s" not in self.st_predicted or "mean_t" not in self.st_predicted:
+                self.st_predicted["mean_s"] = 1.0
+                self.st_predicted["mean_t"] = 0.0
+
             self.static_msk = motion_mask*refer_mask
             self.align_all_frames(mono_depth, video_idx, self.st_predicted, self.new_scale_alignFrame0, self.static_msk)
             mono_depth = self.export_scaled_pcd(self.st_predicted, self.new_scale_alignFrame0, mono_depth, video_idx,
@@ -1300,11 +1336,11 @@ class Mapper(object):
         random_viewpoint_stack = []  
         frames_to_optimize = self.config["mapping"]["Training"]["pose_window"]
         optimized_pose_viewpoints = []
-        for cam_idx in range(min(frames_to_optimize, len(current_window))):
-            kf_idx = current_window[cam_idx]
-            if kf_idx == 0:
+        for cam_idx in range(min(frames_to_optimize, len(viewpoint_stack))):
+            viewpoint = viewpoint_stack[cam_idx]
+            if viewpoint.uid == 0:
                 continue
-            optimized_pose_viewpoints.append(self.viewpoints[kf_idx])
+            optimized_pose_viewpoints.append(viewpoint)
         current_window_set = set(key_opt)
         for cam_idx, viewpoint in self.viewpoints.items():
             if cam_idx in current_window_set:
@@ -2743,7 +2779,7 @@ class Mapper(object):
         gt_image, gt_image_gray = viewpoint_cam.get_image()
         # 初始化损失
         total_loss = 0.0
-
+    
         try:
             ## 计算几何一致性掩码和损失
             # 检查是否有动态掩码，如果两个视角都没有动态掩码，则跳过多视角损失计算
@@ -3090,7 +3126,8 @@ class Mapper(object):
                 ref_to_neareast_r = nearest_cam.R_gt.transpose(-1, -2) @ viewpoint_cam.R_gt
                 ref_to_neareast_t = -ref_to_neareast_r @ viewpoint_cam.T_gt + nearest_cam.T_gt
             ## 计算单应性矩阵
-            normal_mean, _ = self.depth_to_normal(viewpoint_cam, render_pkg['depth'], world_frame=False)
+            # normal_mean, _ = self.depth_to_normal(viewpoint_cam, render_pkg['depth'], world_frame=False)
+            normal_mean = viewpoint_cam.normal.squeeze(0).permute(1, 2, 0)
             # normal_mean, _ = self.depth_to_normal(viewpoint_cam, viewpoint_cam.depth.to("cuda").unsqueeze(0), world_frame=False)
             ref_local_n = normal_mean.permute(1, 2, 0)
             ref_local_n = ref_local_n.reshape(-1, 3)[valid_indices]
