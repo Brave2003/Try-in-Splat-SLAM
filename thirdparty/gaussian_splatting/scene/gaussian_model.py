@@ -288,7 +288,8 @@ class GaussianModel:
         rots[:, 0] = 1
         # 小改动：若 viewpoint 有预计算的法向图，将世界点投影到图像采样法向，仅用其初始化旋转以加速法向收敛
         normal_map = getattr(cam, "normal", None)
-        if normal_map is not None and False:
+        if normal_map is not None:
+            normal_map = normal_map.squeeze(0)
             R_w2c = (
                 cam.R
                 if torch.is_tensor(cam.R)
