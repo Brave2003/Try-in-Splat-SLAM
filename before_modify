@@ -32,6 +32,7 @@ from src.utils.datasets import get_dataset, load_mono_depth
 from src.utils.common import as_intrinsics_matrix, setup_seed
 import matplotlib.pyplot as plt
 from src.utils.Printer import Printer, FontColor
+from lietorch import SE3, SO3
 from thirdparty.glorie_slam.depth_video import DepthVideo
 from thirdparty.gaussian_splatting.gaussian_renderer import render,render_flow
 from thirdparty.gaussian_splatting.utils.general_utils import rotation_matrix_to_quaternion, quaternion_multiply
@@ -46,34 +47,22 @@ from thirdparty.monogs.utils.camera_utils import Camera
 from argparse import ArgumentParser
 from arguments import ModelHiddenParams
 def vis_render_process(gaussians, pipeline_params, background, viewpoint, cur_frame_idx, save_dir, out_dir="map",
-                    mask=None, dynamic=False):
+                       mask=None, dynamic=False):
     with torch.no_grad():
         if dynamic:
             time_input = gaussians.deform.deform.expand_time(viewpoint.fid)
             d_values = gaussians.deform.step(gaussians.get_dygs_xyz.detach(), time_input,
-                                            iteration=0, feature=None,
-                                            motion_mask=gaussians.motion_mask,
-                                            camera_center=viewpoint.camera_center,
-                                            time_interval=gaussians.time_interval)
+                                             iteration=0, feature=None,
+                                             motion_mask=gaussians.motion_mask,
+                                             camera_center=viewpoint.camera_center,
+                                             time_interval=gaussians.time_interval)
             dxyz = d_values['d_xyz']
             d_rot, d_scale = d_values['d_rotation'], d_values['d_scaling']
-            d_opac = d_values.get('d_opacity')
-            d_color = d_values.get('d_color')
             # print("scale: ", d_scale)
         else:
-            dxyz, d_rot, d_scale = 0, None, 0
-            d_opac, d_color = None, None
+            dxyz, d_rot, d_scale = 0, 0, 0
         render_pkg = render(
-            viewpoint,
-            gaussians,
-            pipeline_params,
-            background,
-            dynamic=False,
-            dx=dxyz,
-            ds=d_scale,
-            dr=d_rot,
-            do=d_opac,
-            dc=d_color,
+            viewpoint, gaussians, pipeline_params, background
         )
 
         viz_im = torch.clip(render_pkg["render"].permute(1, 2, 0).detach().cpu(), 0, 1)
@@ -110,10 +99,6 @@ class Mapper(object):
 
     """
 
-    # ---------------------------------------------------------------------
-    # Section A: Lifecycle and Global Hyper-Parameters
-    # ---------------------------------------------------------------------
-
     def __init__(self, slam, pipe: Connection):
         # setup seed
         setup_seed(slam.cfg["setup_seed"])
@@ -123,14 +108,13 @@ class Mapper(object):
         self.printer: Printer = slam.printer
         if self.config['only_tracking']:
             return
-
         self.pipe = pipe
         self.verbose = slam.verbose
 
-        # Runtime handles and containers
         self.gaussians = None
         self.pipeline_params = None
         self.opt_params = None
+
         self.dtype = torch.float32
         self.iteration_count = 0
         self.last_sent = 0
@@ -139,154 +123,78 @@ class Mapper(object):
         self.current_window = []
         self.initialized = True
         self.keyframe_optimizers = None
-        self._last_dynamic_gaussians = None
-
-        # Scene/tracking state
-        training_cfg = self.config["mapping"]["Training"]
-        self.dystart = training_cfg["dystart"] if "dystart" in training_cfg else 11
+        self.dystart=self.config["mapping"]["Training"]["dystart"] if "dystart" in self.config["mapping"]["Training"].keys() else 11
         self.video: DepthVideo = slam.video
-        self.monocular = not self.initialized
-
-        # Config-derived params
-        mapping_cfg = self.config["mapping"]
-        model_cfg = mapping_cfg["model_params"]
-        self.use_spherical_harmonics = training_cfg["spherical_harmonics"]
-        self.dynamic_model = model_cfg["dynamic_model"]
-
-        # Optimizer/model argument packs
+        self.monocular=not self.initialized
         model_params = munchify(self.config["mapping"]["model_params"])
         opt_params = munchify(self.config["mapping"]["opt_params"])
         pipeline_params = munchify(self.config["mapping"]["pipeline_params"])
+        self.use_spherical_harmonics = self.config["mapping"]["Training"]["spherical_harmonics"]
         self.model_params, self.opt_params, self.pipeline_params = (
             model_params,
             opt_params,
             pipeline_params,
         )
-        self.use_normal = mapping_cfg.get("use_normal", False)
-
+        self.dynamic_model = self.config["mapping"]["model_params"]["dynamic_model"]
         parser = ArgumentParser(description="Training script parameters")
         hp = ModelHiddenParams(parser)
+
         hp = merge_hparams(hp, self.config["mapping"])
-        self.sc_params = hp
-
-        # Gaussian model initialization
+        self.sc_params=hp
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
-        self.gaussians = GaussianModel(
-            model_params.sh_degree,
-            config=self.config,
-            args=hp,
-            init_deform=self.dynamic_model,
-        )
+        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config,args=hp,init_deform=self.config["mapping"]["model_params"]["dynamic_model"])
         self.gaussians.init_lr(6.0)
-
-        # Scale-shift and helper caches
         self.st_predicted = {}
         self.list = []
-        self.first_d = []
+        self.first_d=[]
         self.new_scale_alignFrame0 = dict()
-        self._image_coord_cache = {}
-        self._st_compare_counter = 0
-
-        static_msk = np.ones((384, 512), dtype=bool)
+        static_msk=np.ones( (384, 512), dtype=bool)
         self.gaussians.training_setup(opt_params)
-
-        # Global rendering/mapping state
         bg_color = [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        self.longer = mapping_cfg["long"]
+        self.longer=self.config["mapping"]["long"]
         self.cameras_extent = 6.0
-        self.dyratio = 0
-        self.shift = mapping_cfg["shift"]
-        self.s = mapping_cfg["s"]
-
-        # Hyper-parameters depending on camera extent and mapping config
+        self.dyratio=0
+        self.shift=self.config["mapping"]["shift"]
+        self.s=self.config["mapping"]["s"]
         self.set_hyperparams()
-
         self.device = torch.device(self.config['device'])
         self.static_msk = torch.from_numpy(static_msk).to(self.device)
-        self.frame_reader = get_dataset(self.config, device=self.device)
-
-        if self.dynamic_model:
+        self.frame_reader = get_dataset(
+            self.config, device=self.device)
+        if self.config["mapping"]["model_params"]["dynamic_model"]:
             self.gaussians.deform.train_setting(hp)
             self.gaussians.time_interval = 1 / len(self.frame_reader)
-
     def set_pipe(self, pipe):
         self.pipe = pipe
 
     def set_hyperparams(self):
         mapping_config = self.config["mapping"]
-        training_config = mapping_config["Training"]
 
-        # Core mapping schedule
-        self.gt_camera = training_config["gt_camera"]
-        self.init_itr_num = training_config["init_itr_num"]
-        self.init_gaussian_update = training_config["init_gaussian_update"]
-        self.init_gaussian_reset = training_config["init_gaussian_reset"]
-        self.init_gaussian_th = training_config["init_gaussian_th"]
-        self.dynamic_init_gaussian_th = float(
-            training_config.get("dynamic_init_gaussian_th", self.init_gaussian_th)
-        )
+        self.gt_camera = mapping_config["Training"]["gt_camera"]
+
+        self.init_itr_num = mapping_config["Training"]["init_itr_num"]
+        self.init_gaussian_update = mapping_config["Training"]["init_gaussian_update"]
+        self.init_gaussian_reset = mapping_config["Training"]["init_gaussian_reset"]
+        self.init_gaussian_th = mapping_config["Training"]["init_gaussian_th"]
         self.init_gaussian_extent = (
-            self.cameras_extent * training_config["init_gaussian_extent"]
+                self.cameras_extent * mapping_config["Training"]["init_gaussian_extent"]
         )
-        self.mapping_itr_num = training_config["mapping_itr_num"]
-
-        # Gaussian maintenance schedule
-        self.gaussian_update_every = training_config["gaussian_update_every"]
-        self.gaussian_update_offset = training_config["gaussian_update_offset"]
-        self.gaussian_th = training_config["gaussian_th"]
-        self.dynamic_gaussian_th = float(
-            training_config.get("dynamic_gaussian_th", self.gaussian_th)
-        )
+        self.mapping_itr_num = mapping_config["Training"]["mapping_itr_num"]
+        self.gaussian_update_every = mapping_config["Training"]["gaussian_update_every"]
+        self.gaussian_update_offset = mapping_config["Training"]["gaussian_update_offset"]
+        self.gaussian_th = mapping_config["Training"]["gaussian_th"]
         self.gaussian_extent = (
-            self.cameras_extent * training_config["gaussian_extent"]
+                self.cameras_extent * mapping_config["Training"]["gaussian_extent"]
         )
-        self.gaussian_reset = training_config["gaussian_reset"]
-        self.size_threshold = training_config["size_threshold"]
-        self.window_size = training_config["window_size"]
-        self.prune_coviz = int(training_config.get("prune_coviz", 3))
-        self.dynamic_prune_coviz = int(training_config.get("dynamic_prune_coviz", 1))
-        self.keep_dynamic_gaussians = bool(
-            training_config.get("keep_dynamic_gaussians", True)
-        )
-
-        # Loss weights
-        self.depth_order_loss_weight = training_config.get("depth_order_loss_weight", 0.1)
-        self.normal_loss_weight = training_config.get("normal_loss_weight", 0.01)
-        self.dynamic_phase_ratio = float(training_config.get("dynamic_phase_ratio", 0.5))
-        self.dynamic_transition_ratio = float(training_config.get("dynamic_transition_ratio", 0.2))
-        self.flow_loss_start = float(training_config.get("flow_loss", 0.0))
-        self.flow_loss_end = float(training_config.get("flow_loss_fine", self.flow_loss_start))
+        self.gaussian_reset = mapping_config["Training"]["gaussian_reset"]
+        self.size_threshold = mapping_config["Training"]["size_threshold"]
+        self.window_size = mapping_config["Training"]["window_size"]
 
         self.save_dir = self.config['data']['output'] + '/' + self.config['scene']
 
         self.move_points = self.config['mapping']['move_points']
         self.online_plotting = self.config['mapping']['online_plotting']
-        self.node_traj_vis = mapping_config.get("node_traj_vis", False)
-        self.node_traj_vis_every = int(mapping_config.get("node_traj_vis_every", 1))
-        self.node_traj_t_samples = int(
-            mapping_config.get("dynamic_traj_t_samples", mapping_config.get("node_traj_t_samples", 12))
-        )
-        self.node_traj_max_nodes = int(
-            mapping_config.get("dynamic_traj_max_points", mapping_config.get("node_traj_max_nodes", 96))
-        )
-        self.node_traj_final_vis = bool(mapping_config.get("node_traj_final_vis", True))
-        self.node_traj_final_t_samples = int(
-            mapping_config.get("node_traj_final_t_samples", 0)
-        )
-        self.node_traj_video_fps = int(mapping_config.get("node_traj_video_fps", 12))
-        self.node_traj_video_tail = int(mapping_config.get("node_traj_video_tail", 16))
-        self.node_traj_gif = bool(mapping_config.get("node_traj_gif", True))
-        self.node_traj_gif_fps = int(
-            mapping_config.get("node_traj_gif_fps", mapping_config.get("node_traj_video_fps", 12))
-        )
-        self.node_traj_gif_max_frames = int(mapping_config.get("node_traj_gif_max_frames", 0))
-        self.node_traj_subset_seed = int(mapping_config.get("node_traj_subset_seed", -1))
-        self.node_traj_3d_margin = float(mapping_config.get("node_traj_3d_margin", 0.18))
-        self.node_traj_3d_elev = float(mapping_config.get("node_traj_3d_elev", 22.0))
-        self.node_traj_3d_azim_start = float(mapping_config.get("node_traj_3d_azim_start", -58.0))
-        self.node_traj_3d_azim_spin = float(mapping_config.get("node_traj_3d_azim_spin", 48.0))
-        self.st_flat_keep_percent = float(mapping_config.get("st_flat_keep_percent", 80.0))
 
     def add_next_kf(self, frame_idx,idx, viewpoint, init=False, scale=2.0, depth_map=None):
         # This function computes the new Gaussians to be added given a new keyframe
@@ -298,10 +206,6 @@ class Mapper(object):
             self.gaussians.extend_from_pcd_seq(
                 viewpoint, kf_id=frame_idx, init=True, scale=scale, depthmap=depth_map, add_dygs=True
             )
-
-    # ---------------------------------------------------------------------
-    # Section B: Keyframe and Geometry State Update
-    # ---------------------------------------------------------------------
 
     def reset(self):
         self.iteration_count = 0
@@ -344,28 +248,16 @@ class Mapper(object):
         else:
             # Update pose and depth by projecting points into the pixel space to find updated correspondences.
             # This strategy also adjusts the scale of the gaussians to account for the distance change from the camera
+
             depth = depth.to(self.device)
-            while depth.dim() > 2:
-                if depth.shape[0] == 1:
-                    depth = depth.squeeze(0)
-                else:
-                    self.printer.print(
-                        f"Skip update_mapping_points[{frame_idx}] due to invalid depth shape: {tuple(depth.shape)}",
-                        FontColor.MAPPER,
-                    )
-                    return
             frame_idxs = self.gaussians.unique_kfIDs  # idx which anchored the set of points
             frame_mask = (frame_idxs == frame_idx)  # global variable
             if frame_mask.sum() == 0:
                 return
-            if depth.dim() != 2:
-                self.printer.print(
-                    f"Skip update_mapping_points[{frame_idx}] due to invalid depth shape: {tuple(depth.shape)}",
-                    FontColor.MAPPER,
-                )
-                return
+
             # Retrieve current set of points to be deformed
             means = self.gaussians.get_xyz.detach()[frame_mask]
+
             # Project the current means into the old camera to get the pixel locations
             pix_ones = torch.ones(means.shape[0], 1).cuda().float()
             pts4 = torch.cat((means, pix_ones), dim=1)
@@ -378,6 +270,7 @@ class Mapper(object):
             # Assign these pixels the depth of the closest border pixel
             pixel_locations[:, 0] = torch.clamp(pixel_locations[:, 0], min=0, max=width - 1)
             pixel_locations[:, 1] = torch.clamp(pixel_locations[:, 1], min=0, max=height - 1)
+
             # Extract the depth at those pixel locations from the new depth
             depth = depth[pixel_locations[:, 1], pixel_locations[:, 0]]
             pixel_locations = pixel_locations.to(depth_old.device)
@@ -390,58 +283,64 @@ class Mapper(object):
             pts4 = torch.cat((means, pix_ones), dim=1)
             means_cam = (w2c_old @ pts4.T).T[:, :3]
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+           
             means_cam = means_cam.to(device)
             depth = depth.to(device)
             depth_old = depth_old.to(device)  
             rescale_scale = (1 + 1 / (means_cam[:, 2]) * (depth - depth_old)).unsqueeze(-1)  # shift
+   
             rigid_mask = torch.logical_or(depth == 0, depth_old == 0)
             rescale_scale[rigid_mask] = 1
             if (rescale_scale <= 0.0).sum() > 0:
                 rescale_scale[rescale_scale <= 0.0] = 1
+
             rescale_mean = rescale_scale.repeat(1, 3)
             means_cam = rescale_mean * means_cam
+
             # Transform back means_cam to the world space
             pts4 = torch.cat((means_cam, pix_ones), dim=1)
             means = (torch.linalg.inv(w2c_old) @ pts4.T).T[:, :3]
+
             # Then move the points to their new location according to the new pose
             # The global transformation can be computed by composing the old pose
             # with the new pose
             transformation = torch.linalg.inv(torch.linalg.inv(w2c_old) @ w2c)
             pts4 = torch.cat((means, pix_ones), dim=1)
             means = (transformation @ pts4.T).T[:, :3]
+
             # reassign the new means of the frame mask to the self.gaussian object
             global_means = self.gaussians.get_xyz.detach()
             global_means[frame_mask] = means
+            # print("mean nans: ", global_means.isnan().sum()/global_means.numel())
             self.gaussians._xyz = self.gaussians.replace_tensor_to_optimizer(global_means, "xyz")["xyz"]
+
             # update the rotation of the gaussians
             rots = self.gaussians.get_rotation.detach()
             # Convert transformation to quaternion
             transformation = rotation_matrix_to_quaternion(transformation.unsqueeze(0))
             rots[frame_mask] = quaternion_multiply(transformation.expand_as(rots[frame_mask]), rots[frame_mask])
             self.gaussians._rotation = self.gaussians.replace_tensor_to_optimizer(rots, "rotation")["rotation"]
+
             # Update the scale of the Gaussians
             scales = self.gaussians._scaling.detach()
             scales[frame_mask] = scales[frame_mask] + torch.log(rescale_scale)
             self.gaussians._scaling = self.gaussians.replace_tensor_to_optimizer(scales, "scaling")["scaling"]
-
-    # ---------------------------------------------------------------------
-    # Section C: Depth/Normal and Scale-Shift Alignment Utilities
-    # ---------------------------------------------------------------------
-
     def init_image_coor(self,height, width):
-        cache_key = (height, width, str(self.device))
-        if cache_key in self._image_coord_cache:
-            return self._image_coord_cache[cache_key]
-
-        x_row = torch.arange(width, dtype=torch.float32, device=self.device)
-        y_col = torch.arange(height, dtype=torch.float32, device=self.device)
-        x = x_row.repeat(height, 1).unsqueeze(0)
-        y = y_col.view(height, 1).repeat(1, width).unsqueeze(0)
+        x_row = np.arange(0, width)
+        x = np.tile(x_row, (height, 1))
+        x = x[np.newaxis, :, :]
+        x = x.astype(np.float32)
+        x = torch.from_numpy(x.copy()).cuda()
         u_u0 = x - width / 2.0
+
+        y_col = np.arange(0, height)  # y_col = np.arange(0, height)
+        y = np.tile(y_col, (width, 1)).T
+        y = y[np.newaxis, :, :]
+        y = y.astype(np.float32)
+        y = torch.from_numpy(y.copy()).cuda()
         v_v0 = y - height / 2.0
-        self._image_coord_cache[cache_key] = (u_u0, v_v0)
         return u_u0, v_v0
-    
     def depth_to_xyz(self,depth, focal_x,focal_y):
         b, c, h, w = depth.shape
         u_u0, v_v0 = self.init_image_coor(h, w)
@@ -451,47 +350,33 @@ class Mapper(object):
         pw = torch.cat([x, y, z], 1).permute(0, 2, 3, 1)  # [b, h, w, c]
         # print(pw.shape)
         return pw
-    def optimize_st(
-        self,
-        depth_torch,
-        normal_torch,
-        self_defined_focal_x: float,
-        self_defined_focal_y: float,
-    ):
-        start_time = time.perf_counter()
-        input_depth = depth_torch.to(self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        gt_normal = normal_torch.to(self.device, dtype=torch.float32)
+    def optimize_st(self,depth_torch, normal_torch, self_defined_focal_x: float,self_defined_focal_y: float):
+        input_depth = depth_torch.cuda()
+        input_depth = input_depth.unsqueeze(0).unsqueeze(0)
+        gt_normal = normal_torch.cuda()
+        focal_x = torch.Tensor([self_defined_focal_x, ]).cuda()
+        focal_y=torch.Tensor([self_defined_focal_y, ]).cuda()
+        s = nn.Parameter(torch.Tensor([1.]).cuda().requires_grad_(True))
+        t = nn.Parameter(torch.Tensor([0.0]).cuda().requires_grad_(True))
 
-        if gt_normal.shape[-2:] != input_depth.shape[-2:]:
-            gt_normal = F.interpolate(gt_normal, size=input_depth.shape[-2:], mode="nearest")
-        gt_normal = F.normalize(gt_normal, dim=1)
+        optimizer = torch.optim.Adam([
+            {'params': s, 'lr': 1e-3},
+            {'params': t, 'lr': 1e-3},
 
-        focal_x = torch.tensor([self_defined_focal_x], dtype=torch.float32, device=self.device)
-        focal_y = torch.tensor([self_defined_focal_y], dtype=torch.float32, device=self.device)
-        
-        s = nn.Parameter(torch.tensor([1.0], dtype=torch.float32, device=self.device))
-        t = nn.Parameter(torch.tensor([0.0], dtype=torch.float32, device=self.device))
-
-        optimizer = torch.optim.Adam(
-            [
-                {"params": s, "lr": 1e-3},
-                {"params": t, "lr": 1e-3},
-            ]
-        )
-        last_step_loss = 100000.0
+        ])
+        last_step_loss = 100000.
         for step in range(500):
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             scaled_depth = s * input_depth + t
+            # depth = s*input_depth+t
             depth_filter = nn.functional.avg_pool2d(scaled_depth, kernel_size=3, stride=1, padding=1)
             depth_filter = nn.functional.avg_pool2d(depth_filter, kernel_size=3, stride=1, padding=1)
-            xyz = self.depth_to_xyz(depth_filter, focal_x, focal_y)
+            xyz = self.depth_to_xyz(depth_filter, focal_x,focal_y)
             xyz_i = xyz[0, :][None, :, :, :]
             pre_normal = self.get_surface_normalv2(xyz_i).permute((3, 2, 0, 1))
-            # 与单目深度先验法向约定对齐（同 before_modify）
             similarity = torch.nn.functional.cosine_similarity(pre_normal, -gt_normal, dim=1)
-            loss_map = 1.0 - similarity
-            loss_normal = torch.nanmean(loss_map)
-            loss = loss_normal
+            # if similarity
+            loss = torch.nanmean(1 - similarity)
 
             loss.backward()
             optimizer.step()
@@ -499,177 +384,144 @@ class Mapper(object):
                 if abs(loss.item() - last_step_loss) < 1e-5:
                     break
                 last_step_loss = loss.item()
-
-        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-        print(
-            "[optimize_st][Optimized] "
-            f"s={s.item():.6f}, t={t.item():.6f}, loss={loss.item():.6f}, step={step}, time={elapsed_ms:.2f}ms"
-        )
+        del scaled_depth, depth_filter, xyz, pre_normal
+        torch.cuda.empty_cache()
         return s.item(), t.item()
 
-    def get_surface_normalv2(self, xyz, patch_size=3):
+    def get_surface_normalv2(self,xyz, patch_size=3):
         """
-        优化后的法向量计算：去除了所有阻碍 backward() 速度的操作
+        xyz: xyz coordinates
+        patch: [p1, p2, p3,
+                p4, p5, p6,
+                p7, p8, p9]
+        surface_normal = [(p9-p1) x (p3-p7)] + [(p6-p4) - (p8-p2)]
+        return: normal [h, w, 3, b]
         """
         eps = 1e-8
         b, h, w, c = xyz.shape
         half_patch = patch_size // 2
-        
-        # 【核心优化 1】：用 F.pad 替代 torch.zeros 和切片赋值。
-        # 这是一个零拷贝（Zero-copy）级别的操作，大幅减少显存分配开销和建图时间。
-        # Pad 的顺序是从后向前：先 Pad 最后一维 C(不 pad)，再 pad W，再 pad H。
-        xyz_pad = F.pad(xyz, (0, 0, half_patch, half_patch, half_patch, half_patch), mode='constant', value=0.0)
+        xyz_pad = torch.zeros((b, h + patch_size - 1, w + patch_size - 1, c), dtype=xyz.dtype, device=xyz.device)
+        xyz_pad[:, half_patch:-half_patch, half_patch:-half_patch, :] = xyz
 
-        xyz_left = xyz_pad[:, half_patch:half_patch + h, :w, :]  
-        xyz_right = xyz_pad[:, half_patch:half_patch + h, -w:, :]  
-        xyz_top = xyz_pad[:, :h, half_patch:half_patch + w, :]  
-        xyz_bottom = xyz_pad[:, -h:, half_patch:half_patch + w, :]  
-        xyz_horizon = xyz_left - xyz_right  
-        xyz_vertical = xyz_top - xyz_bottom  
 
-        xyz_left_in = xyz_pad[:, half_patch:half_patch + h, 1:w + 1, :]  
-        xyz_right_in = xyz_pad[:, half_patch:half_patch + h, patch_size - 1:patch_size - 1 + w, :]  
-        xyz_top_in = xyz_pad[:, 1:h + 1, half_patch:half_patch + w, :]  
-        xyz_bottom_in = xyz_pad[:, patch_size - 1:patch_size - 1 + h, half_patch:half_patch + w, :]  
-        xyz_horizon_in = xyz_left_in - xyz_right_in  
-        xyz_vertical_in = xyz_top_in - xyz_bottom_in  
+        xyz_left = xyz_pad[:, half_patch:half_patch + h, :w, :]  # p4
+        xyz_right = xyz_pad[:, half_patch:half_patch + h, -w:, :]  # p6
+        xyz_top = xyz_pad[:, :h, half_patch:half_patch + w, :]  # p2
+        xyz_bottom = xyz_pad[:, -h:, half_patch:half_patch + w, :]  # p8
+        xyz_horizon = xyz_left - xyz_right  # p4p6
+        xyz_vertical = xyz_top - xyz_bottom  # p2p8
+
+        xyz_left_in = xyz_pad[:, half_patch:half_patch + h, 1:w + 1, :]  # p4
+        xyz_right_in = xyz_pad[:, half_patch:half_patch + h, patch_size - 1:patch_size - 1 + w, :]  # p6
+        xyz_top_in = xyz_pad[:, 1:h + 1, half_patch:half_patch + w, :]  # p2
+        xyz_bottom_in = xyz_pad[:, patch_size - 1:patch_size - 1 + h, half_patch:half_patch + w, :]  # p8
+        xyz_horizon_in = xyz_left_in - xyz_right_in  # p4p6
+        xyz_vertical_in = xyz_top_in - xyz_bottom_in  # p2p8
 
         n_img_1 = torch.cross(xyz_horizon_in, xyz_vertical_in, dim=3)
         n_img_2 = torch.cross(xyz_horizon, xyz_vertical, dim=3)
 
-        # 【核心优化 2】：彻底消灭布尔掩码 (orient_mask = ... -> tensor[mask] *= -1)
-        # 利用数学符号函数 torch.sign() 实现纯张量乘法，绕过低效的掩码求导。
-        # 如果内积 > 0，sign=1，乘 -1 翻转；如果内积 < 0，sign=-1，乘 -1 保持原样不变。
-        dot_1 = torch.sum(n_img_1 * xyz, dim=3, keepdim=True)
-        n_img_1 = n_img_1 * -torch.sign(dot_1 + eps)
-        
-        dot_2 = torch.sum(n_img_2 * xyz, dim=3, keepdim=True)
-        n_img_2 = n_img_2 * -torch.sign(dot_2 + eps)
+        # re-orient normals consistently
+        orient_mask = torch.sum(n_img_1 * xyz, dim=3) > 0
+        n_img_1[orient_mask] *= -1
+        orient_mask = torch.sum(n_img_2 * xyz, dim=3) > 0
+        n_img_2[orient_mask] *= -1
 
-        n_img1_L2 = torch.sqrt(torch.sum(n_img_1 ** 2, dim=3, keepdim=True) + eps)
-        n_img1_norm = n_img_1 / (n_img1_L2 + eps)
+        n_img1_L2 = torch.sqrt(torch.sum(n_img_1 ** 2, dim=3, keepdim=True)+ eps)
+        n_img1_norm = n_img_1 / (n_img1_L2 + 1e-8)
 
-        n_img2_L2 = torch.sqrt(torch.sum(n_img_2 ** 2, dim=3, keepdim=True) + eps)
-        n_img2_norm = n_img_2 / (n_img2_L2 + eps)
+        n_img2_L2 = torch.sqrt(torch.sum(n_img_2 ** 2, dim=3, keepdim=True)+ eps)
+        n_img2_norm = n_img_2 / (n_img2_L2 + 1e-8)
 
+        # average 2 norms
         n_img_aver = n_img1_norm + n_img2_norm
-        n_img_aver_L2 = torch.sqrt(torch.sum(n_img_aver ** 2, dim=3, keepdim=True) + eps)
-        n_img_aver_norm = n_img_aver / (n_img_aver_L2 + eps)
-        
-        # 同样干掉最后一处掩码
-        dot_aver = torch.sum(n_img_aver_norm * xyz, dim=3, keepdim=True)
-        n_img_aver_norm = n_img_aver_norm * -torch.sign(dot_aver + eps)
-        
-        n_img_aver_norm_out = n_img_aver_norm.permute((1, 2, 3, 0))  
+        n_img_aver_L2 = torch.sqrt(torch.sum(n_img_aver ** 2, dim=3, keepdim=True)+ eps)
+        n_img_aver_norm = n_img_aver / (n_img_aver_L2 + 1e-8)
+        # re-orient normals consistently
+        orient_mask = torch.sum(n_img_aver_norm * xyz, dim=3) > 0
+        n_img_aver_norm[orient_mask] *= -1
+        n_img_aver_norm_out = n_img_aver_norm.permute((1, 2, 3, 0))  # [h, w, c, b]
 
-        return n_img_aver_norm_out
-        
+        return n_img_aver_norm_out  # n_img1_norm.permute((1, 2, 3, 0))
     def obtain_allimgs_st(self,depth, normal, st_dict, video_idx,self_define_focal_x: float,self_define_focal_y: float):
-        depth_torch = depth.detach().to("cpu")
-        normal_torch = torch.from_numpy(normal) if isinstance(normal, np.ndarray) else normal.detach().to("cpu")
-        video_idx = int(video_idx)
-
-        if video_idx not in st_dict:
-            s, t = self.optimize_st(depth_torch, normal_torch, self_define_focal_x, self_define_focal_y)
-            st_dict[video_idx] = {"scale": float(s), "shift": float(t)}
-
-        self._update_st_running_mean()
-
-    def _update_st_running_mean(self):
-        scales = []
-        shifts = []
-        for k, v in self.st_predicted.items():
-            if not isinstance(k, int) or not isinstance(v, dict):
-                continue
-
-            s = v.get("scale", None)
-            t = v.get("shift", None)
-            if s is None or t is None:
-                continue
-
-            s = float(s)
-            t = float(t)
-            if np.isfinite(s) and np.isfinite(t):
-                scales.append(s)
-                shifts.append(t)
-
-        if len(scales) > 0:
-            self.st_predicted["mean_s"] = float(np.mean(scales))
-            self.st_predicted["mean_t"] = float(np.mean(shifts))
+        depth_np = depth.cpu().numpy()
+        H, W = depth_np.shape
+        depth_torch = torch.from_numpy(depth_np)  # (B, h, w)
+        normal_torch = torch.from_numpy(normal)  # (B, h, w,3)
+        if video_idx not in st_dict :
+            s, t = self.optimize_st(depth_torch, normal_torch, self_define_focal_x,self_define_focal_y)
+            st_dict[video_idx] = {"scale": s, "shift": t}
+            print(".==========.", s, t)
 
     def align_all_frames(self,depth, video_id,st_predicted, new_scale_alignFrame0: dict, static_msk):
         # depth_dirs = glob(os.path.join(base_dir,'GeoWizardOut/depth_npy/*.npy'))
-        ref_kf = self.dystart
-        if video_id == ref_kf and len(self.list) == 0:
-            self.list.append(depth.detach().clone())
-        if len(self.list) == 0:
-            new_scale_alignFrame0[video_id] = 1.0
-            return new_scale_alignFrame0
+        if video_id==11 and len(self.list) == 0:
+           self.list.append(depth)
         reference_depth = self.list[0] 
-        reference_depth = reference_depth.to(depth.device)
+
+        reference_depth = reference_depth.cpu().numpy()
         # masked_reference_depth = reference_depth
-        reference_s = float(st_predicted[ref_kf]["scale"])
-        if st_predicted[ref_kf]["shift"] < 0:
-            reference_t = -1.1 * float(st_predicted[ref_kf]["shift"])  # 0.9
+        reference_s = st_predicted[11]["scale"]
+        if st_predicted[11]["shift"]<0:
+            reference_t = -1.1*st_predicted[11]["shift"]#0.9
         else:
-            reference_t = float(st_predicted[ref_kf]["shift"])
+            reference_t = st_predicted[11]["shift"]
 
         scaled_refer_depth_nomsk = reference_s * reference_depth + reference_t
         h, w = scaled_refer_depth_nomsk.shape
-        resized_static_msk = F.interpolate(
-            static_msk.to(depth.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0),
-            size=(h, w),
-            mode="nearest",
-        ).squeeze(0).squeeze(0) > 0.5
+        static_msk = static_msk.cpu().numpy()
+        static_msk = np.array(Image.fromarray(static_msk).resize((w, h))) > 0
 
-        scaled_refer_depth = scaled_refer_depth_nomsk[resized_static_msk]
+        scaled_refer_depth = scaled_refer_depth_nomsk[static_msk]
         del reference_t,reference_s
-        Y = scaled_refer_depth
+
+        Y = torch.from_numpy(scaled_refer_depth).unsqueeze(-1)
 
         depth = depth
-        cur_s = float(st_predicted[video_id]["scale"])
+        cur_s = st_predicted[video_id]["scale"]
 
         if self.longer:
-            cur_t = max(float(st_predicted[video_id]["shift"]),0)
+           cur_t = max(st_predicted[video_id]["shift"],0)
         else:
-            if st_predicted[video_id]["shift"] < 0:
-                cur_t = -float(st_predicted[video_id]["shift"])
-            else:
-                cur_t = float(st_predicted[video_id]["shift"])
-        if np.isnan(cur_s) or np.isnan(cur_t):
-            cur_s = float(st_predicted["mean_s"])
-            cur_t = float(st_predicted["mean_t"])
+           if st_predicted[video_id]["shift"] < 0:
+              cur_t = -st_predicted[video_id]["shift"]
+           else:
+              cur_t = st_predicted[video_id]["shift"]
+        cur_masked_depth = depth[static_msk]
+        if not np.isnan(cur_s) or not np.isnan(cur_t):
+            pass  
+        else:
+            cur_s = st_predicted["mean_s"]
+            cur_t = st_predicted["mean_t"]
+        scaled_cur_depth = cur_masked_depth * cur_s + cur_t
+        # print()
+        scaled_cur_depth=scaled_cur_depth.cpu().numpy()
+        ##### Solving using
+        A = torch.from_numpy(scaled_cur_depth).unsqueeze(-1)
 
-        cur_masked_depth = depth[resized_static_msk]
-        scaled_cur_depth = cur_masked_depth * cur_s + 0
-
-        if scaled_cur_depth.numel() == 0 or Y.numel() == 0:
+        res = torch.linalg.lstsq(A, Y)
+        if res.solution.item()==0:
             new_scale_alignFrame0[video_id] = 1.0
         else:
-            # Faster and equivalent to single-variable least squares: argmin_a ||a*A - Y||_2^2
-            denom = torch.dot(scaled_cur_depth, scaled_cur_depth)
-            if torch.abs(denom) < 1e-12:
-                solved_scale = 1.0
-            else:
-                solved_scale = (torch.dot(scaled_cur_depth, Y) / denom).item()
+            new_scale_alignFrame0[video_id] = res.solution.item()
 
-            if solved_scale == 0:
-                new_scale_alignFrame0[video_id] = 1.0
-            else:
-                new_scale_alignFrame0[video_id] = solved_scale
+            previous_value = new_scale_alignFrame0[11]
 
-            previous_value = new_scale_alignFrame0.get(ref_kf, None)
-
-            if previous_value is not None and self.longer:
-
+            if previous_value is not None  and self.longer:
+   
                 current_value = new_scale_alignFrame0[video_id]
 
                 if current_value is None or current_value > previous_value*self.s or current_value*self.s<previous_value :
                     new_scale_alignFrame0[video_id] = previous_value
-        # print("S,T,align_scale:", cur_s, cur_t, new_scale_alignFrame0[video_id])
-        del cur_s,cur_t
+                    print(f"new，video_id={video_id} is: {new_scale_alignFrame0[video_id]}")
+                else:
+                    print(f"old，video_id={video_id} is: {current_value}")
+            else:
+                print("no last key")
+        print("S,T,align_scale:", cur_s, cur_t, new_scale_alignFrame0[video_id])
+        del cur_s,cur_t,res
         return new_scale_alignFrame0
-
+        pass
     def export_scaled_pcd(self,st_predicted, new_scale_alignFrame0, depth, video_id,mean_st=False, ):
 
         # import open3d as o3d
@@ -728,106 +580,6 @@ class Mapper(object):
 
         loss = torch.mean(torch.abs(torch.tanh(alpha * render_diff) - gt_oder))
         return loss
-
-    def get_loss_normal(self,depth_mean, viewpoint):
-        prior_normal = viewpoint.normal.cuda()
-        prior_normal = prior_normal.reshape(3, *depth_mean.shape[-2:]).permute(1, 2, 0)
-        prior_normal_normalized = torch.nn.functional.normalize(prior_normal, dim=-1)
-
-        normal_mean, _ = self.depth_to_normal(viewpoint, depth_mean, world_frame=False)
-        normal_error = 1 - (prior_normal_normalized * normal_mean).sum(dim=-1)
-        normal_error[prior_normal.norm(dim=-1) < 0.2] = 0
-        return normal_error.mean()
-
-    def get_render_normal_loss(self, gt_normal, render_normal):
-        """
-        计算 Ground Truth 法向量与 3DGS 渲染得到的法向量之间的损失
-        """
-        gt_normal = gt_normal.squeeze(0)
-        if gt_normal is None or render_normal is None:
-            return torch.tensor(0.0, device=render_normal.device)
-
-        # 把 gt_normal reshape 成与 render_normal 一致的 [3, H, W]
-        if gt_normal.dim() == 1:
-            gt_normal = gt_normal.reshape(3, render_normal.shape[1], render_normal.shape[2])
-            
-        # 很多时候数据集法向可能是 HWC 或是平铺的，稳妥起见确保形状对齐
-        if gt_normal.shape != render_normal.shape:
-            gt_normal = torch.nn.functional.interpolate(gt_normal.unsqueeze(0), size=render_normal.shape[-2:], mode="nearest").squeeze(0)
-
-        # 归一化 (在通道维度 dim=0 上做 L2 归一化)
-        gt_norm = torch.nn.functional.normalize(gt_normal, p=2, dim=0)
-        render_norm = torch.nn.functional.normalize(render_normal, p=2, dim=0)
-
-        # 基于余弦相似度的方向损失 (1 - cos(theta)) 
-        cos_similarity = (gt_norm * render_norm).sum(dim=0)
-        loss_cos = 1.0 - cos_similarity
-
-        l1_loss = torch.abs(gt_norm - render_norm).sum(dim=0)
-
-        # 将两种损失结合 (这里使用 0.8 * cos + 0.2 * L1)
-        loss_map = loss_cos + 0.2 * l1_loss
-
-        # 构建 Mask 去除无效区域
-        valid_mask = gt_normal.norm(p=2, dim=0) > 0.1
-        
-        if valid_mask.sum() > 0:
-            return loss_map[valid_mask].mean()
-        else:
-            return loss_map.mean()
-
-    def get_flat_loss(self):
-        """
-        高斯扁平化损失 (Flatten Loss):
-        约束 3DGS 在一个方向（通常是 scale 的最小值）尽可能小，
-        使得高斯球变成类似于 '薄片' (splats) 的形状，这有利于表面重建的平滑和法向量的准确。
-        """
-        # 获取当前所有高斯球的尺度 (scaling)。注意：通常 scaling 存储的是指数对数或其他激活前的形式，
-        # 所以我们需要用对应的激活函数获取实际的缩放系数。
-        scales = self.gaussians.get_scaling
-        
-        # 找到每个高斯球三个轴的缩放比例中最小的那一个（即厚度方向）
-        min_scales, _ = torch.min(scales, dim=-1)
-        
-        # 使其最小尺度趋于 0，通常用 L1 loss
-        flat_loss = torch.mean(min_scales)
-        
-        return flat_loss
-
-    def depth_to_normal(self,view, depth, world_frame=False):
-        """
-            view: view camera
-            depth: depthmap
-        """
-
-        points = self.depths_to_points(view, depth, world_frame).reshape(*depth.shape[1:], 3)
-        normal_map = torch.zeros_like(points)
-        dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
-        dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
-        normal_map[1:-1, 1:-1, :] = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
-
-
-        return normal_map, points
-
-    def depths_to_points(self,view, depthmap, world_frame):
-        import math
-        W, H = view.image_width, view.image_height
-        fx = W / (2 * math.tan(view.FoVx / 2.))
-        fy = H / (2 * math.tan(view.FoVy / 2.))
-        intrins = torch.tensor([[fx, 0., W / 2.], [0., fy, H / 2.], [0., 0., 1.0]]).float().cuda()
-        grid_x, grid_y = torch.meshgrid(torch.arange(W, device='cuda').float() + 0.5,
-                                        torch.arange(H, device='cuda').float() + 0.5, indexing='xy')
-        points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3)
-        if world_frame:
-            c2w = (view.world_view_transform.T).inverse()
-            rays_d = points @ intrins.inverse().T @ c2w[:3, :3].T
-            rays_o = c2w[:3, 3]
-            points = depthmap.reshape(-1, 1) * rays_d + rays_o
-        else:
-            rays_d = points @ intrins.inverse().T
-            points = depthmap.reshape(-1, 1) * rays_d
-        return points
-
     def get_w2c_and_depth(self, video_idx, idx, mono_depth,motion_mask, depth_gt,normal,mono, static_mask,print_info=False, init=False):
 
 
@@ -838,9 +590,7 @@ class Mapper(object):
 
         if print_info:
             print(f"valid depth number: {valid_depth_mask.sum().item()}, "
-                f"valid depth ratio: {(valid_depth_mask.sum() / (valid_depth_mask.shape[0] * valid_depth_mask.shape[1])).item()}")
-
-        mono_depth_wq = mono_depth
+                  f"valid depth ratio: {(valid_depth_mask.sum() / (valid_depth_mask.shape[0] * valid_depth_mask.shape[1])).item()}")
 
         if valid_depth_mask.sum() < 100:
             invalid = True
@@ -862,17 +612,17 @@ class Mapper(object):
             padded_binary_image = np.pad(binary_image, pad_width=iterations, mode='constant', constant_values=1)
             structure = np.ones((3, 3), dtype=int) 
 
-    
+       
             eroded_padded_image = binary_erosion(padded_binary_image,
-                                                structure=structure,
-                                                iterations=iterations)
+                                                 structure=structure,
+                                                 iterations=iterations)
             eroded_image = eroded_padded_image[iterations:-iterations, iterations:-iterations]
 
 
             mono_depth[eroded_image == 0] = 0
-    
+      
             if (mono_depth == 0).sum() > 0:
-    
+       
                 mono_depth = torch.from_numpy(
                     cv2.inpaint(mono_depth,
                                 (mono_depth == 0).astype(np.uint8),
@@ -884,1194 +634,30 @@ class Mapper(object):
             normal = normal.cpu().numpy()
             depth_gt = torch.from_numpy(depth_gt).to(self.device)
 
-
-            if video_idx == self.dystart and len(self.first_d) == 0:
+            if video_idx == 11 and len(self.first_d)  == 0:
                 self.first_d.append(motion_mask)
-            if len(self.first_d) == 0:
-                print("[Warning] self.first_d is empty, fallback to motion_mask. This may indicate a logic bug.")
-                refer_mask = motion_mask
-            else:
-                refer_mask = self.first_d[0]
-
-            intrinsics = self.frame_reader.get_intrinsic()
-            if torch.is_tensor(intrinsics):
-                intrinsics = intrinsics.detach().cpu().tolist()
-            fx, fy = float(intrinsics[0]), float(intrinsics[1])
-
-            self.obtain_allimgs_st(mono_depth, normal, self.st_predicted, video_idx, fx, fy)
+            refer_mask=self.first_d[0]
+            self.obtain_allimgs_st(mono_depth, normal, self.st_predicted, video_idx, 535.4, 539.2)
+            mean_s = 0
+            mean_t = 0
             invalid = 0
-            # 与 before_modify 一致：覆盖 running mean，供 align_all_frames 在 s/t 异常时回退
+
             self.st_predicted["mean_s"] = 0.8
             self.st_predicted["mean_t"] = 0.15
-
             self.static_msk = motion_mask*refer_mask
             self.align_all_frames(mono_depth, video_idx, self.st_predicted, self.new_scale_alignFrame0, self.static_msk)
             mono_depth = self.export_scaled_pcd(self.st_predicted, self.new_scale_alignFrame0, mono_depth, video_idx,
-                                                mean_st=False )
+                                                 mean_st=False )
             mono_depth_wq = mono_depth
             torch.cuda.empty_cache()
         return mono_depth_wq, w2c, invalid
 
-    # ---------------------------------------------------------------------
-    # Section D: Mapper Render/Deformation and Loss Helper Functions
-    # ---------------------------------------------------------------------
-
-    def _unpack_render_pkg(self, render_pkg):
-        """Return common render outputs in a fixed order to reduce repeated boilerplate."""
-        return (
-            render_pkg["render"],
-            render_pkg["viewspace_points"],
-            render_pkg["visibility_filter"],
-            render_pkg["radii"],
-            render_pkg["depth"],
-            render_pkg["opacity"],
-            render_pkg["n_touched"],
-            render_pkg.get("normal", None),
-        )
-
-    def _mapper_bar_desc(self, label):
-        """Match tqdm label style with Printer's [MAPPER] colored prefix."""
-        return f"{FontColor.MAPPER}[MAPPER] {Style.RESET_ALL}{label}"
-
-    def _is_reference_viewpoint(self, viewpoint):
-        """Use first mapped frame as optimization anchor."""
-        if viewpoint is None:
-            return False
-        if len(self.video_idxs) > 0:
-            return int(viewpoint.uid) == int(self.video_idxs[0])
-        return int(viewpoint.uid) == 0
-
-    def _get_deform_render_inputs(self, viewpoint, dynamic_network):
-        if dynamic_network and self.gaussians.deform_init:
-            time_input = self.gaussians.deform.deform.expand_time(viewpoint.fid)
-            d_values = self.gaussians.deform.step(
-                self.gaussians.get_dygs_xyz.detach(),
-                time_input,
-                iteration=0,
-                feature=None,
-                motion_mask=self.gaussians.motion_mask,
-                camera_center=viewpoint.camera_center,
-                time_interval=self.gaussians.time_interval,
-            )
-            return (
-                d_values["d_xyz"],
-                d_values["d_rotation"],
-                d_values["d_scaling"],
-                d_values["d_opacity"],
-                d_values["d_color"],
-            )
-
-        return 0, None, 0, None, None
-
-    def _render_with_deform(self, viewpoint, dxyz=0, d_rot=None, d_scale=0, d_opac=None, d_color=None, return_normal=False):
-        return render(
-            viewpoint,
-            self.gaussians,
-            self.pipeline_params,
-            self.background,
-            dynamic=False,
-            dx=dxyz,
-            ds=d_scale,
-            dr=d_rot,
-            do=d_opac,
-            dc=d_color,
-            return_normal=return_normal,
-        )
-
-    def _get_nearest_view_deform(self, viewpoint):
-        closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
-        if closest_keyframe is None:
-            return None, None
-
-        time_input = self.gaussians.deform.deform.expand_time(
-            self.viewpoints[closest_keyframe].fid
-        )
-        d_value2 = self.gaussians.deform.step(
-            self.gaussians.get_dygs_xyz.detach(),
-            time_input,
-            iteration=0,
-            feature=None,
-            motion_mask=self.gaussians.motion_mask,
-            camera_center=self.viewpoints[closest_keyframe].camera_center,
-            time_interval=self.gaussians.time_interval,
-        )
-        return closest_keyframe, d_value2
-
-    def _sync_refine_keyframes(self):
-        for keyframe_idx, frame_idx in zip(self.video_idxs, self.keyframe_idxs):
-            _, _, depth_gtd, _, motion_mask, normal, mono, static_msk = self.frame_reader[frame_idx]
-            depth_gt_numpy = depth_gtd.cpu().numpy()
-            intrinsics = as_intrinsics_matrix(self.frame_reader.get_intrinsic()).to(self.device)
-            mono_depth = load_mono_depth(frame_idx, self.save_dir).to(self.device)
-
-            depth_temp, w2c_temp, invalid = self.get_w2c_and_depth(
-                keyframe_idx,
-                frame_idx,
-                mono_depth,
-                motion_mask,
-                depth_gt_numpy,
-                normal,
-                mono,
-                static_msk,
-                init=False,
-            )
-
-            w2c_old = torch.cat((self.cameras[keyframe_idx].R, self.cameras[keyframe_idx].T.unsqueeze(-1)), dim=1)
-            w2c_old = torch.cat((w2c_old, torch.tensor([[0, 0, 0, 1]], device="cuda")), dim=0)
-
-            self.cameras[keyframe_idx].update_RT(w2c_temp[:3, :3], w2c_temp[:3, 3])
-            self.cameras[keyframe_idx].depth = depth_temp.cpu().numpy()
-
-            if keyframe_idx in self.viewpoints:
-                self.viewpoints[keyframe_idx].update_RT(w2c_temp[:3, :3], w2c_temp[:3, 3])
-                self.viewpoints[keyframe_idx].depth = depth_temp.cpu().numpy()
-
-            if self.move_points and self.is_kf[keyframe_idx]:
-                if invalid:
-                    self.update_mapping_points(
-                        keyframe_idx,
-                        w2c_temp,
-                        w2c_old,
-                        depth_temp,
-                        self.depth_dict[keyframe_idx],
-                        intrinsics,
-                        method="rigid",
-                    )
-                else:
-                    self.update_mapping_points(
-                        keyframe_idx,
-                        w2c_temp,
-                        w2c_old,
-                        depth_temp,
-                        self.depth_dict[keyframe_idx],
-                        intrinsics,
-                    )
-                    self.depth_dict[keyframe_idx] = depth_temp
-
-    def _compute_flow_pair_loss(self, viewpoint, idx1, dxyz, d_rot, d_scale, flow_weights):
-        flow_loss = torch.tensor(0.0, device=self.background.device)
-        closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
-        if closest_keyframe is None:
-            return flow_loss, None, None
-
-        flow, flow_back, _, _, _ = viewpoint.generate_flow(
-            viewpoint.original_image.cuda(),
-            idx1,
-            self.viewpoints[closest_keyframe].original_image.cuda(),
-        )
-
-        time_input = self.gaussians.deform.deform.expand_time(
-            self.viewpoints[closest_keyframe].fid
-        )
-        d_value2 = self.gaussians.deform.step(
-            self.gaussians.get_dygs_xyz.detach(),
-            time_input,
-            iteration=0,
-            feature=None,
-            motion_mask=self.gaussians.motion_mask,
-            camera_center=self.viewpoints[closest_keyframe].camera_center,
-            time_interval=self.gaussians.time_interval,
-        )
-        d_xyz2 = d_value2["d_xyz"]
-
-        render_pkg2 = render_flow(
-            pc=self.gaussians,
-            viewpoint_camera1=viewpoint,
-            viewpoint_camera2=self.viewpoints[closest_keyframe],
-            d_xyz1=dxyz,
-            d_xyz2=d_xyz2,
-            d_rotation1=d_rot,
-            d_scaling1=d_scale,
-            scale_const=None,
-        )
-        coor1to2_motion = render_pkg2["render"][:2].permute(1, 2, 0)
-        dynamic_mask = (
-            (~viewpoint.motion_mask)
-            .unsqueeze(0)
-            .permute(1, 2, 0)
-            .repeat(1, 1, 2)
-            .detach()
-        )
-        flow_loss += flow_weights * l1_loss(
-            flow_back * dynamic_mask,
-            coor1to2_motion * dynamic_mask,
-        )
-
-        render_pkg_back = render_flow(
-            pc=self.gaussians,
-            viewpoint_camera1=self.viewpoints[closest_keyframe],
-            viewpoint_camera2=viewpoint,
-            d_xyz1=d_xyz2,
-            d_xyz2=dxyz,
-            d_rotation1=d_value2["d_rotation"],
-            d_scaling1=d_value2["d_scaling"],
-        )
-        coor2to1_motion = render_pkg_back["render"][:2].permute(1, 2, 0)
-        dynamic_mask = (
-            (~self.viewpoints[closest_keyframe].motion_mask)
-            .unsqueeze(0)
-            .permute(1, 2, 0)
-            .repeat(1, 1, 2)
-            .detach()
-        )
-        flow_loss += flow_weights * l1_loss(
-            flow * dynamic_mask,
-            coor2to1_motion * dynamic_mask,
-        )
-
-        return flow_loss, closest_keyframe, d_value2
-
-    def _compute_dynamic_mapping_loss(
-        self,
-        viewpoint,
-        image,
-        depth,
-        opacity,
-        render_pkg,
-        dynamic,
-        dynamic_network,
-        closest_keyframe,
-        d_value2,
-    ):
-        order_mask = viewpoint.depth > 0
-        loss_order_depth = self.get_depth_order_loss(depth, viewpoint.depth, order_mask)
-        loss_mapping = get_loss_mapping(
-            self.config["mapping"],
-            image,
-            depth,
-            viewpoint,
-            opacity,
-            rm_dynamic=not dynamic_network,
-            dynamic=dynamic,
-        ) + self.depth_order_loss_weight * loss_order_depth
-        loss_mapping += self.normal_loss_weight * self.get_loss_normal(depth, viewpoint)
-
-        enable_multi_view = not dynamic
-        
-        if self.use_normal:
-            render_normal = render_pkg.get("normal", None)
-            if render_normal is not None:
-                loss_mapping += self.config["mapping"]["Training"]["render_normal_loss_weight"] * self.get_render_normal_loss(viewpoint.normal, render_normal)
-                loss_mapping += self.config["mapping"]["Training"]["flat_loss_weight"] * self.get_flat_loss()
-
-        if (
-            # False and
-            self.config["mapping"]["Training"]["multi_loss_weight"] and
-            enable_multi_view
-            and closest_keyframe is not None
-            and closest_keyframe in self.viewpoints
-            and d_value2 is not None
-        ):
-            loss_mapping += self.config["mapping"]["Training"]["multi_loss_weight"] * self.compute_multi_view_loss(
-                viewpoint,
-                render_pkg,
-                self.gaussians,
-                self.pipeline_params,
-                self.background,
-                d_value2["d_xyz"],
-                d_value2["d_scaling"],
-                d_value2["d_rotation"],
-                d_value2["d_opacity"],
-                d_value2["d_color"],
-                self.viewpoints[closest_keyframe],
-            )
-
-        return loss_mapping
-
-    def _compute_deform_reg_loss(self, viewpoint, delta, strong_reg):
-        reg_loss = torch.tensor(0.0, device=self.background.device)
-        if strong_reg:
-            reg_loss += 1e-3 * self.gaussians.deform.deform.arap_loss(
-                t=viewpoint.fid,
-                delta_t=delta * self.gaussians.time_interval,
-                t_samp_num=4,
-            )
-            reg_loss += 1e-5 * self.gaussians.deform.deform.acc_loss(
-                t=viewpoint.fid,
-                delta_t=5 * self.gaussians.time_interval,
-            )
-            reg_loss += 1e-3 * self.gaussians.deform.deform.elastic_loss(
-                t=viewpoint.fid,
-                delta_t=5 * self.gaussians.time_interval,
-            )
-            return reg_loss
-
-        reg_loss += 1e-4 * self.gaussians.deform.deform.elastic_loss(
-            t=viewpoint.fid,
-            delta_t=5 * self.gaussians.time_interval,
-        )
-        reg_loss += 1e-6 * self.gaussians.deform.deform.acc_loss(
-            t=viewpoint.fid,
-            delta_t=5 * self.gaussians.time_interval,
-        )
-        reg_loss += 1e-4 * self.gaussians.deform.deform.arap_loss(
-            t=viewpoint.fid,
-            delta_t=5 * self.gaussians.time_interval,
-        )
-        return reg_loss
-
-    def _collect_window_psnr(self, window_indices, dynamic_network):
-        from thirdparty.gaussian_splatting.utils.image_utils import psnr
-
-        valid_indices = [int(kf_idx) for kf_idx in window_indices if int(kf_idx) in self.viewpoints]
-        valid_indices = sorted(valid_indices)
-        if len(valid_indices) == 0:
-            return float("nan"), []
-
-        psnr_items = []
-        with torch.no_grad():
-            for kf_idx in valid_indices:
-                viewpoint = self.viewpoints[kf_idx]
-                dxyz, d_rot, d_scale, d_opac, d_color = self._get_deform_render_inputs(
-                    viewpoint,
-                    dynamic_network,
-                )
-                render_pkg = render(
-                    viewpoint,
-                    self.gaussians,
-                    self.pipeline_params,
-                    self.background,
-                    dynamic=False,
-                    dx=dxyz,
-                    ds=d_scale,
-                    dr=d_rot,
-                    do=d_opac,
-                    dc=d_color,
-                )
-                image = torch.clamp(render_pkg["render"].detach(), 0.0, 1.0)
-                gt_image = viewpoint.original_image
-
-                if hasattr(self, "video_idxs") and len(self.video_idxs) > 0 and viewpoint.uid != self.video_idxs[0]:
-                    image = (torch.exp(viewpoint.exposure_a.detach())) * image + viewpoint.exposure_b.detach()
-                    image = torch.clamp(image, 0.0, 1.0)
-
-                mask = gt_image > 0
-                if mask.any():
-                    psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0)).item()
-                    psnr_items.append((int(viewpoint.uid), float(psnr_score)))
-
-        if len(psnr_items) == 0:
-            return float("nan"), []
-
-        avg_psnr = float(np.mean([x[1] for x in psnr_items]))
-        return avg_psnr, psnr_items
-
-    def _log_window_optimization_stats(self, stage_tag, window_indices, dynamic_network):
-        avg_psnr, psnr_items = self._collect_window_psnr(window_indices, dynamic_network)
-
-        total_gaussians = int(self.gaussians.get_xyz.shape[0])
-        dynamic_gaussians = 0
-        if hasattr(self.gaussians, "dygs") and torch.is_tensor(self.gaussians.dygs) and self.gaussians.dygs.numel() > 0:
-            dynamic_gaussians = int(self.gaussians.dygs.long().sum().item())
-
-        valid_indices = [int(kf_idx) for kf_idx in window_indices if int(kf_idx) in self.viewpoints]
-        valid_indices = sorted(valid_indices)
-        if len(valid_indices) > 0:
-            window_desc = f"len={len(valid_indices)}, range=[{valid_indices[0]}->{valid_indices[-1]}]"
-        else:
-            window_desc = "len=0"
-
-        if len(psnr_items) > 0:
-            psnr_detail = ", ".join([f"{uid}:{score:.2f}" for uid, score in psnr_items])
-            msg = (
-                f"[{stage_tag}] window({window_desc}) | avg_psnr={avg_psnr:.2f} | "
-                f"psnr[{psnr_detail}] | gaussians={total_gaussians} | dynamic_gaussians={dynamic_gaussians}"
-            )
-        else:
-            msg = (
-                f"[{stage_tag}] window({window_desc}) | avg_psnr=N/A | "
-                f"gaussians={total_gaussians} | dynamic_gaussians={dynamic_gaussians}"
-            )
-
-        self.printer.print(msg, FontColor.MAPPER)
-
-        if self.keep_dynamic_gaussians:
-            if self._last_dynamic_gaussians is not None and dynamic_gaussians < self._last_dynamic_gaussians:
-                warn_msg = (
-                    f"[{stage_tag}] dynamic_gaussians decreased: "
-                    f"{self._last_dynamic_gaussians} -> {dynamic_gaussians}. "
-                    "Check dygs flags or additional prune paths."
-                )
-                self.printer.print(warn_msg, FontColor.MAPPER)
-            self._last_dynamic_gaussians = dynamic_gaussians
-
-    # ---------------------------------------------------------------------
-    # Section E: Online Visualization Utilities
-    # ---------------------------------------------------------------------
-
-    @staticmethod
-    def _chw01_to_rgb_uint8_hwc(img_t):
-        """CHW float [0,1] tensor -> HWC uint8 RGB (dataset/render are RGB, not OpenCV BGR)."""
-        arr = img_t.detach().cpu().clamp(0.0, 1.0).numpy().transpose(1, 2, 0)
-        return np.clip(arr * 255.0 + 0.5, 0, 255).astype(np.uint8)
-
-    def _depth_l1_diff_for_online_plot(self, pred_depth, gt_depth):
-        """Aligned abs depth diff (masked) and mean L1 on valid gt depth; avoids numpy/torch mix & div-by-zero."""
-        d = pred_depth.detach().cpu().float()
-        if d.dim() == 2:
-            d = d.unsqueeze(0)
-        gt = torch.as_tensor(np.asarray(gt_depth), dtype=torch.float32)
-        if gt.dim() == 2:
-            gt = gt.unsqueeze(0)
-        diff = torch.abs(d - gt)
-        valid = gt > 0
-        denom = valid.float().sum().clamp(min=1.0)
-        depth_l1 = (diff * valid.float()).sum() / denom
-        return diff * valid.float(), depth_l1
-
-    def _plot_window_psnr_grid(self, window_indices, dynamic_network, plot_dir, idx_tag):
-        from thirdparty.gaussian_splatting.utils.image_utils import psnr
-
-        valid_indices = [int(kf_idx) for kf_idx in window_indices if int(kf_idx) in self.viewpoints]
-        valid_indices = sorted(valid_indices)
-        if len(valid_indices) == 0:
-            return
-
-        rows, cols = 2, 4
-        max_slots = rows * cols
-        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
-        axes = np.array(axes, ndmin=2).reshape(rows, cols)
-
-        for axis in axes.flat:
-            axis.axis("off")
-
-        with torch.no_grad():
-            for plot_idx, kf_idx in enumerate(valid_indices[:max_slots]):
-                row = plot_idx // cols
-                col = plot_idx % cols
-                axis = axes[row, col]
-                viewpoint = self.viewpoints[kf_idx]
-
-                dxyz, d_rot, d_scale, d_opac, d_color = self._get_deform_render_inputs(
-                    viewpoint,
-                    dynamic_network,
-                )
-                render_pkg = render(
-                    viewpoint,
-                    self.gaussians,
-                    self.pipeline_params,
-                    self.background,
-                    dynamic=False,
-                    dx=dxyz,
-                    ds=d_scale,
-                    dr=d_rot,
-                    do=d_opac,
-                    dc=d_color,
-                )
-                image = torch.clamp(render_pkg["render"].detach(), 0.0, 1.0)
-                gt_image = viewpoint.original_image
-
-                if hasattr(self, "video_idxs") and len(self.video_idxs) > 0 and viewpoint.uid != self.video_idxs[0]:
-                    image = (torch.exp(viewpoint.exposure_a.detach())) * image + viewpoint.exposure_b.detach()
-                    image = torch.clamp(image, 0.0, 1.0)
-
-                mask = gt_image > 0
-                if mask.any():
-                    psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0)).item()
-                    title = f"uid {viewpoint.uid} | PSNR {psnr_score:.2f}"
-                else:
-                    title = f"uid {viewpoint.uid} | PSNR N/A"
-
-                axis.imshow(image.cpu().permute(1, 2, 0))
-                axis.set_title(title)
-
-        window_plot_dir = os.path.join(plot_dir, "window_psnr")
-        os.makedirs(window_plot_dir, exist_ok=True)
-        save_path = os.path.join(window_plot_dir, f"{idx_tag}.png")
-        fig.tight_layout()
-        fig.savefig(save_path, bbox_inches="tight")
-        plt.close(fig)
-
-    def _normal_to_rgb(self, normal_map):
-        """Convert normal map to RGB visualization in [0, 1]."""
-        if normal_map is None:
-            return None
-
-        nm = normal_map.detach()
-        if nm.dim() == 4:
-            nm = nm.squeeze(0)
-
-        if nm.dim() == 3 and nm.shape[0] == 3:
-            nm = nm.permute(1, 2, 0)
-        elif nm.dim() == 3 and nm.shape[-1] == 3:
-            pass
-        else:
-            return None
-
-        nm = torch.nn.functional.normalize(nm, dim=-1)
-        rgb = (nm + 1.0) * 0.5
-        return torch.clamp(rgb, 0.0, 1.0)
-
-    def _plot_window_normal_grid(self, window_indices, dynamic_network, plot_dir, idx_tag):
-        valid_indices = [int(kf_idx) for kf_idx in window_indices if int(kf_idx) in self.viewpoints]
-        valid_indices = sorted(valid_indices)
-        if len(valid_indices) == 0:
-            return
-
-        cols = min(4, len(valid_indices))
-        rows = (len(valid_indices) + cols - 1) // cols
-        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
-        axes = np.array(axes, ndmin=2).reshape(rows, cols)
-
-        for axis in axes.flat:
-            axis.axis("off")
-
-        with torch.no_grad():
-            for plot_idx, kf_idx in enumerate(valid_indices):
-                row = plot_idx // cols
-                col = plot_idx % cols
-                axis = axes[row, col]
-                viewpoint = self.viewpoints[kf_idx]
-
-                dxyz, d_rot, d_scale, d_opac, d_color = self._get_deform_render_inputs(
-                    viewpoint,
-                    dynamic_network,
-                )
-                render_pkg = self._render_with_deform(
-                    viewpoint,
-                    dxyz=dxyz,
-                    d_rot=d_rot,
-                    d_scale=d_scale,
-                    d_opac=d_opac,
-                    d_color=d_color,
-                    return_normal=self.use_normal,
-                )
-                render_normal = render_pkg.get("normal", None)
-                render_rgb = self._normal_to_rgb(render_normal)
-                if render_rgb is None:
-                    axis.set_title(f"uid {viewpoint.uid} | normal N/A")
-                    continue
-
-                title = f"uid {viewpoint.uid}"
-                gt_normal = getattr(viewpoint, "normal", None)
-                gt_rgb = self._normal_to_rgb(gt_normal)
-                if gt_rgb is not None and gt_rgb.shape == render_rgb.shape:
-                    gt_nm = torch.nn.functional.normalize(gt_rgb * 2.0 - 1.0, dim=-1)
-                    pred_nm = torch.nn.functional.normalize(render_rgb * 2.0 - 1.0, dim=-1)
-                    cos_sim = (gt_nm * pred_nm).sum(dim=-1).clamp(-1.0, 1.0)
-                    valid_mask = gt_nm.norm(dim=-1) > 0.1
-                    if valid_mask.any():
-                        ang = torch.rad2deg(torch.acos(cos_sim[valid_mask])).mean().item()
-                        title = f"uid {viewpoint.uid} | Nerr {ang:.2f}deg"
-
-                axis.imshow(render_rgb.cpu().numpy())
-                axis.set_title(title)
-
-        window_plot_dir = os.path.join(plot_dir, "window_normal")
-        os.makedirs(window_plot_dir, exist_ok=True)
-        save_path = os.path.join(window_plot_dir, f"{idx_tag}.png")
-        fig.tight_layout()
-        fig.savefig(save_path, bbox_inches="tight")
-        plt.close(fig)
-
-    def _overlay_dynamic_mask(self, axis, viewpoint, height, width, alpha=0.28):
-        motion_mask = getattr(viewpoint, "motion_mask", None)
-        if motion_mask is None:
-            return
-
-        static_mask = motion_mask.detach() if torch.is_tensor(motion_mask) else torch.from_numpy(np.asarray(motion_mask))
-        if static_mask.dim() == 3:
-            static_mask = static_mask.squeeze(0)
-        static_mask = static_mask.bool()
-
-        if static_mask.shape[0] != height or static_mask.shape[1] != width:
-            static_mask = F.interpolate(
-                static_mask.float().unsqueeze(0).unsqueeze(0),
-                size=(height, width),
-                mode="nearest",
-            ).squeeze(0).squeeze(0).bool()
-
-        dynamic_mask = ~static_mask
-        if not dynamic_mask.any():
-            return
-
-        dynamic_np = dynamic_mask.detach().cpu().numpy()
-        overlay = np.zeros((height, width, 4), dtype=np.float32)
-        # Red transparent overlay for dynamic region.
-        overlay[..., 0] = 1.0
-        overlay[..., 1] = 0.15
-        overlay[..., 2] = 0.12
-        overlay[..., 3] = dynamic_np.astype(np.float32) * float(alpha)
-        axis.imshow(overlay)
-
-    def _get_dynamic_gaussian_trajectory(self, viewpoint, t_samp_num):
-        if not self.dynamic_model or not self.gaussians.deform_init:
-            return None
-
-        deform_model = getattr(self.gaussians, "deform", None)
-        if deform_model is None or not hasattr(deform_model, "step"):
-            return None
-
-        base_xyz_all = self.gaussians.get_dygs_xyz.detach()
-        if base_xyz_all.numel() == 0:
-            return None
-
-        n_dy = base_xyz_all.shape[0]
-        if self.node_traj_max_nodes > 0 and n_dy > self.node_traj_max_nodes:
-            if self.node_traj_subset_seed >= 0:
-                g = torch.Generator(device=base_xyz_all.device)
-                g.manual_seed(int(self.node_traj_subset_seed))
-                perm = torch.randperm(n_dy, generator=g, device=base_xyz_all.device)[
-                    : self.node_traj_max_nodes
-                ]
-                sample_idx = perm.sort().values
-            else:
-                sample_idx = torch.linspace(
-                    0,
-                    n_dy - 1,
-                    steps=self.node_traj_max_nodes,
-                    device=base_xyz_all.device,
-                ).long()
-            base_xyz = base_xyz_all[sample_idx]
-        else:
-            base_xyz = base_xyz_all
-
-        t_samp_num = max(2, int(t_samp_num))
-        ts = torch.linspace(0.0, 1.0, t_samp_num, device=base_xyz.device, dtype=base_xyz.dtype)
-        sampled_motion_mask = torch.ones_like(base_xyz[:, :1])
-
-        traj_list = []
-        for t in ts:
-            time_input = self.gaussians.deform.deform.expand_time(t)
-            d_values = self.gaussians.deform.step(
-                base_xyz,
-                time_input,
-                iteration=0,
-                feature=None,
-                motion_mask=sampled_motion_mask,
-                camera_center=viewpoint.camera_center,
-                time_interval=self.gaussians.time_interval,
-            )
-            d_xyz = d_values.get("d_xyz", None)
-            if d_xyz is None:
-                cur_xyz = base_xyz
-            else:
-                cur_xyz = base_xyz + d_xyz
-            traj_list.append(cur_xyz.unsqueeze(1))
-
-        return torch.cat(traj_list, dim=1)
-
-    def _compute_dynamic_tracks_for_views(self, view_seq):
-        if len(view_seq) < 2:
-            return None
-
-        base_xyz_all = self.gaussians.get_dygs_xyz.detach()
-        if base_xyz_all.numel() == 0:
-            return None
-
-        n_dy = base_xyz_all.shape[0]
-        if self.node_traj_max_nodes > 0 and n_dy > self.node_traj_max_nodes:
-            if self.node_traj_subset_seed >= 0:
-                g = torch.Generator(device=base_xyz_all.device)
-                g.manual_seed(int(self.node_traj_subset_seed))
-                perm = torch.randperm(n_dy, generator=g, device=base_xyz_all.device)[
-                    : self.node_traj_max_nodes
-                ]
-                sample_idx = perm.sort().values
-            else:
-                sample_idx = torch.linspace(
-                    0,
-                    n_dy - 1,
-                    steps=self.node_traj_max_nodes,
-                    device=base_xyz_all.device,
-                ).long()
-            base_xyz = base_xyz_all[sample_idx]
-        else:
-            base_xyz = base_xyz_all
-
-        if base_xyz.shape[0] == 0:
-            return None
-
-        traj_world = []
-        uv_seq = []
-        valid_seq = []
-        frame_seq = []
-        dynamic_mask_seq = []
-        view_ids = []
-
-        motion_mask_sample = torch.ones_like(base_xyz[:, :1])
-        for view in view_seq:
-            time_input = self.gaussians.deform.deform.expand_time(view.fid)
-            d_values = self.gaussians.deform.step(
-                base_xyz,
-                time_input,
-                iteration=0,
-                feature=None,
-                motion_mask=motion_mask_sample,
-                camera_center=view.camera_center,
-                time_interval=self.gaussians.time_interval,
-            )
-            d_xyz = d_values.get("d_xyz", None)
-            cur_xyz = base_xyz if d_xyz is None else (base_xyz + d_xyz)
-            traj_world.append(cur_xyz)
-
-            pts4 = torch.cat(
-                [
-                    cur_xyz,
-                    torch.ones(
-                        cur_xyz.shape[0],
-                        1,
-                        device=cur_xyz.device,
-                        dtype=cur_xyz.dtype,
-                    ),
-                ],
-                dim=1,
-            )
-            pts_cam_h = pts4 @ view.world_view_transform
-            pts_cam = pts_cam_h[:, :3]
-            z = pts_cam[:, 2]
-            u = pts_cam[:, 0] * view.fx / z.clamp_min(1e-6) + view.cx
-            v = pts_cam[:, 1] * view.fy / z.clamp_min(1e-6) + view.cy
-            uv = torch.stack([u, v], dim=-1)
-
-            img = torch.clamp(view.original_image.detach(), 0.0, 1.0)
-            img_np = img.permute(1, 2, 0).cpu().numpy()
-            h, w = img_np.shape[:2]
-            in_img = (
-                (uv[:, 0] >= 0)
-                & (uv[:, 0] < w)
-                & (uv[:, 1] >= 0)
-                & (uv[:, 1] < h)
-            )
-            valid = (z > 1e-6) & in_img
-
-            dyn_mask = None
-            if hasattr(view, "motion_mask") and view.motion_mask is not None:
-                static_mask = view.motion_mask.detach() if torch.is_tensor(view.motion_mask) else torch.from_numpy(np.asarray(view.motion_mask))
-                if static_mask.dim() == 3:
-                    static_mask = static_mask.squeeze(0)
-                static_mask = static_mask.bool()
-                if static_mask.shape[0] != h or static_mask.shape[1] != w:
-                    static_mask = F.interpolate(
-                        static_mask.float().unsqueeze(0).unsqueeze(0),
-                        size=(h, w),
-                        mode="nearest",
-                    ).squeeze(0).squeeze(0).bool()
-                dyn_mask = ~static_mask
-                uv_round = uv.round().long()
-                uv_round[:, 0] = uv_round[:, 0].clamp(0, w - 1)
-                uv_round[:, 1] = uv_round[:, 1].clamp(0, h - 1)
-                valid = valid & dyn_mask[uv_round[:, 1], uv_round[:, 0]]
-
-            uv_seq.append(uv.detach().cpu().numpy())
-            valid_seq.append(valid.detach().cpu().numpy())
-            frame_seq.append(img_np)
-            dynamic_mask_seq.append(None if dyn_mask is None else dyn_mask.detach().cpu().numpy())
-            view_ids.append(int(view.uid))
-
-        if len(frame_seq) < 2:
-            return None
-
-        return {
-            "traj_world": torch.stack(traj_world, dim=1).detach().cpu().numpy(),  # [N, T, 3]
-            "uv": np.stack(uv_seq, axis=0),  # [T, N, 2]
-            "valid": np.stack(valid_seq, axis=0),  # [T, N]
-            "frames": frame_seq,
-            "dynamic_masks": dynamic_mask_seq,
-            "view_ids": np.asarray(view_ids, dtype=np.int32),
-            "num_points": int(base_xyz.shape[0]),
-        }
-
-    def _plot_window_dynamic_trajectory_2d_grid(
-        self, window_indices, dynamic_network, plot_dir, idx_tag, allow_without_online_vis=False
-    ):
-        if not (dynamic_network and self.gaussians.deform_init):
-            return
-        if not allow_without_online_vis and not self.node_traj_vis:
-            return
-
-        valid_indices = [int(kf_idx) for kf_idx in window_indices if int(kf_idx) in self.viewpoints]
-        valid_indices = sorted(valid_indices)
-        if len(valid_indices) < 2:
-            return
-
-        view_seq = [self.viewpoints[k] for k in valid_indices]
-        payload = self._compute_dynamic_tracks_for_views(view_seq)
-        if payload is None:
-            return
-
-        uv_arr = payload["uv"]
-        valid_arr = payload["valid"]
-        frame_seq = payload["frames"]
-        dynamic_mask_seq = payload["dynamic_masks"]
-        view_ids = payload["view_ids"]
-        num_points = payload["num_points"]
-
-        rows, cols = 2, 4
-        max_slots = rows * cols
-        fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
-        axes = np.array(axes, ndmin=2).reshape(rows, cols)
-        for axis in axes.flat:
-            axis.axis("off")
-
-        colors = plt.cm.turbo(np.linspace(0.0, 1.0, num_points))
-        for plot_idx in range(min(len(frame_seq), max_slots)):
-            row = plot_idx // cols
-            col = plot_idx % cols
-            axis = axes[row, col]
-
-            frame = frame_seq[plot_idx]
-            axis.imshow(frame)
-            h, w = frame.shape[:2]
-
-            dyn_mask = dynamic_mask_seq[plot_idx]
-            if dyn_mask is not None:
-                overlay = np.zeros((h, w, 4), dtype=np.float32)
-                overlay[..., 0] = 1.0
-                overlay[..., 1] = 0.15
-                overlay[..., 2] = 0.12
-                overlay[..., 3] = dyn_mask.astype(np.float32) * 0.24
-                axis.imshow(overlay)
-
-            for p_idx in range(num_points):
-                pts = []
-                for t_idx in range(plot_idx + 1):
-                    if valid_arr[t_idx, p_idx]:
-                        u, v = uv_arr[t_idx, p_idx]
-                        pts.append((float(u), float(v)))
-
-                if len(pts) >= 2:
-                    c = np.asarray(pts, dtype=np.float32)
-                    axis.plot(c[:, 0], c[:, 1], color=colors[p_idx], linewidth=0.9, alpha=0.75)
-                if len(pts) >= 1:
-                    axis.scatter(pts[-1][0], pts[-1][1], color=colors[p_idx], s=7, alpha=0.9)
-
-            axis.set_title(f"uid {view_ids[plot_idx]} | dyn tracks")
-            axis.set_xlim([0, w])
-            axis.set_ylim([h, 0])
-
-        node_plot_dir = os.path.join(plot_dir, "node_trajectory")
-        os.makedirs(node_plot_dir, exist_ok=True)
-        save_path = os.path.join(node_plot_dir, f"{idx_tag}_2d_grid.png")
-        fig.tight_layout()
-        fig.savefig(save_path, dpi=180, bbox_inches="tight")
-        plt.close(fig)
-
-    def _plot_window_dynamic_trajectory_3d(
-        self, window_indices, dynamic_network, plot_dir, idx_tag, allow_without_online_vis=False
-    ):
-        if not (dynamic_network and self.gaussians.deform_init):
-            return
-        if not allow_without_online_vis and not self.node_traj_vis:
-            return
-
-        valid_indices = [int(kf_idx) for kf_idx in window_indices if int(kf_idx) in self.viewpoints]
-        valid_indices = sorted(valid_indices)
-        if len(valid_indices) < 2:
-            return
-
-        view_seq = [self.viewpoints[k] for k in valid_indices]
-        payload = self._compute_dynamic_tracks_for_views(view_seq)
-        if payload is None:
-            return
-
-        traj_world = payload["traj_world"]
-        view_ids = payload["view_ids"]
-        num_points = payload["num_points"]
-
-        fig = plt.figure(figsize=(10, 8))
-        ax3d = fig.add_subplot(1, 1, 1, projection="3d")
-        colors = plt.cm.turbo(np.linspace(0.0, 1.0, num_points))
-
-        for p_idx in range(num_points):
-            xyz = traj_world[p_idx]
-            ax3d.plot(xyz[:, 0], xyz[:, 1], xyz[:, 2], color=colors[p_idx], linewidth=0.9, alpha=0.8)
-            ax3d.scatter(xyz[-1, 0], xyz[-1, 1], xyz[-1, 2], color=colors[p_idx], s=6, alpha=0.9)
-
-        if allow_without_online_vis:
-            all_xyz = traj_world.reshape(-1, 3)
-            cmin = all_xyz.min(axis=0)
-            cmax = all_xyz.max(axis=0)
-            center = 0.5 * (cmin + cmax)
-            span = float(np.max(cmax - cmin)) + 1e-6
-            half = 0.5 * span * (1.0 + self.node_traj_3d_margin)
-            ax3d.set_xlim(center[0] - half, center[0] + half)
-            ax3d.set_ylim(center[1] - half, center[1] + half)
-            ax3d.set_zlim(center[2] - half, center[2] + half)
-            try:
-                ax3d.set_box_aspect((1, 1, 1))
-            except Exception:
-                pass
-            ax3d.view_init(elev=self.node_traj_3d_elev, azim=self.node_traj_3d_azim_start)
-            try:
-                ax3d.dist = 10.5
-            except Exception:
-                pass
-
-        ax3d.set_title(
-            f"Dynamic Gaussian Center 3D Motion | window [{view_ids[0]}->{view_ids[-1]}] | points {num_points}"
-        )
-        ax3d.set_xlabel("X")
-        ax3d.set_ylabel("Y")
-        ax3d.set_zlabel("Z")
-
-        node_plot_dir = os.path.join(plot_dir, "node_trajectory")
-        os.makedirs(node_plot_dir, exist_ok=True)
-        save_path = os.path.join(node_plot_dir, f"{idx_tag}_3d.png")
-        fig.tight_layout()
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-
-    def _matplotlib_fig_to_rgb_uint8(self, fig, dpi=110):
-        import io
-
-        import imageio.v2 as imageio
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
-        buf.seek(0)
-        arr = imageio.imread(buf)
-        plt.close(fig)
-        return arr
-
-    def _save_node_traj_gif_2d_grid(self, payload, node_plot_dir, idx_tag, fps):
-        """按关键帧时间展开 2x4 网格：第 s 帧仅显示前 s+1 个视角上的累积轨迹，并写成 GIF。"""
-        import imageio.v2 as imageio
-
-        uv_arr = payload["uv"]
-        valid_arr = payload["valid"]
-        frame_seq = payload["frames"]
-        dynamic_mask_seq = payload["dynamic_masks"]
-        view_ids = payload["view_ids"]
-        num_points = payload["num_points"]
-        T = len(frame_seq)
-        if T < 2:
-            return
-
-        step_indices = list(range(T))
-        max_f = self.node_traj_gif_max_frames
-        if max_f > 0 and len(step_indices) > max_f:
-            step_indices = np.linspace(0, T - 1, num=max_f, dtype=int).tolist()
-
-        rows, cols = 2, 4
-        max_slots = rows * cols
-        colors = plt.cm.turbo(np.linspace(0.0, 1.0, num_points))
-        frames_rgb = []
-
-        for s in step_indices:
-            fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
-            axes = np.array(axes, ndmin=2).reshape(rows, cols)
-            for axis in axes.flat:
-                axis.axis("off")
-
-            for plot_idx in range(min(len(frame_seq), max_slots)):
-                row = plot_idx // cols
-                col = plot_idx % cols
-                axis = axes[row, col]
-                if plot_idx > s:
-                    axis.set_facecolor("#2a2a2a")
-                    axis.text(
-                        0.5,
-                        0.5,
-                        "…",
-                        transform=axis.transAxes,
-                        ha="center",
-                        va="center",
-                        color="w",
-                        fontsize=16,
-                    )
-                    continue
-
-                frame = frame_seq[plot_idx]
-                axis.imshow(frame)
-                h, w = frame.shape[:2]
-
-                dyn_mask = dynamic_mask_seq[plot_idx]
-                if dyn_mask is not None:
-                    overlay = np.zeros((h, w, 4), dtype=np.float32)
-                    overlay[..., 0] = 1.0
-                    overlay[..., 1] = 0.15
-                    overlay[..., 2] = 0.12
-                    overlay[..., 3] = dyn_mask.astype(np.float32) * 0.24
-                    axis.imshow(overlay)
-
-                for p_idx in range(num_points):
-                    pts = []
-                    for t_idx in range(plot_idx + 1):
-                        if valid_arr[t_idx, p_idx]:
-                            u, v = uv_arr[t_idx, p_idx]
-                            pts.append((float(u), float(v)))
-
-                    if len(pts) >= 2:
-                        c = np.asarray(pts, dtype=np.float32)
-                        axis.plot(
-                            c[:, 0],
-                            c[:, 1],
-                            color=colors[p_idx],
-                            linewidth=0.9,
-                            alpha=0.75,
-                        )
-                    if len(pts) >= 1:
-                        axis.scatter(
-                            pts[-1][0],
-                            pts[-1][1],
-                            color=colors[p_idx],
-                            s=7,
-                            alpha=0.9,
-                        )
-
-                axis.set_title(f"uid {view_ids[plot_idx]} | t≤{s}")
-                axis.set_xlim([0, w])
-                axis.set_ylim([h, 0])
-
-            fig.suptitle(
-                f"Dynamic tracks 2D (subset n={num_points}) | frame {s + 1}/{T}",
-                fontsize=11,
-            )
-            fig.tight_layout()
-            frames_rgb.append(self._matplotlib_fig_to_rgb_uint8(fig, dpi=110))
-
-        out_path = os.path.join(node_plot_dir, f"{idx_tag}_2d_grid.gif")
-        os.makedirs(node_plot_dir, exist_ok=True)
-        imageio.mimsave(out_path, frames_rgb, fps=max(1, int(fps)), loop=0)
-        self.printer.print(f"Saved node trajectory 2D GIF: {out_path}", FontColor.MAPPER)
-
-    def _save_node_traj_gif_3d(self, payload, node_plot_dir, idx_tag, fps):
-        """世界系下轨迹随时间生长；相机略远、立方体包围盒，方位角缓慢旋转以观察全场景与运动。"""
-        import imageio.v2 as imageio
-
-        traj_world = payload["traj_world"]
-        view_ids = payload["view_ids"]
-        num_points = payload["num_points"]
-        T = traj_world.shape[1]
-        if T < 2:
-            return
-
-        step_indices = list(range(T))
-        max_f = self.node_traj_gif_max_frames
-        if max_f > 0 and len(step_indices) > max_f:
-            step_indices = np.linspace(0, T - 1, num=max_f, dtype=int).tolist()
-
-        all_xyz = traj_world.reshape(-1, 3)
-        cmin = all_xyz.min(axis=0)
-        cmax = all_xyz.max(axis=0)
-        center = 0.5 * (cmin + cmax)
-        span = float(np.max(cmax - cmin)) + 1e-6
-        half = 0.5 * span * (1.0 + self.node_traj_3d_margin)
-
-        colors = plt.cm.turbo(np.linspace(0.0, 1.0, num_points))
-        frames_rgb = []
-
-        for s in step_indices:
-            fig = plt.figure(figsize=(11, 9))
-            ax3d = fig.add_subplot(1, 1, 1, projection="3d")
-            for p_idx in range(num_points):
-                seg = traj_world[p_idx, : s + 1, :]
-                ax3d.plot(
-                    seg[:, 0],
-                    seg[:, 1],
-                    seg[:, 2],
-                    color=colors[p_idx],
-                    linewidth=1.05,
-                    alpha=0.88,
-                )
-                ax3d.scatter(
-                    seg[-1, 0],
-                    seg[-1, 1],
-                    seg[-1, 2],
-                    color=colors[p_idx],
-                    s=10,
-                    alpha=0.95,
-                )
-
-            ax3d.set_xlim(center[0] - half, center[0] + half)
-            ax3d.set_ylim(center[1] - half, center[1] + half)
-            ax3d.set_zlim(center[2] - half, center[2] + half)
-            try:
-                ax3d.set_box_aspect((1, 1, 1))
-            except Exception:
-                pass
-            azim = self.node_traj_3d_azim_start + self.node_traj_3d_azim_spin * (
-                float(s) / float(max(T - 1, 1))
-            )
-            ax3d.view_init(elev=self.node_traj_3d_elev, azim=azim)
-            try:
-                ax3d.dist = 10.5
-            except Exception:
-                pass
-
-            ax3d.set_title(
-                f"Dynamic Gaussians 3D | [{view_ids[0]}→{view_ids[-1]}] | n={num_points} | step {s + 1}/{T}",
-                fontsize=11,
-            )
-            ax3d.set_xlabel("X")
-            ax3d.set_ylabel("Y")
-            ax3d.set_zlabel("Z")
-
-            fig.tight_layout()
-            frames_rgb.append(self._matplotlib_fig_to_rgb_uint8(fig, dpi=115))
-
-        out_path = os.path.join(node_plot_dir, f"{idx_tag}_3d.gif")
-        os.makedirs(node_plot_dir, exist_ok=True)
-        imageio.mimsave(out_path, frames_rgb, fps=max(1, int(fps)), loop=0)
-        self.printer.print(f"Saved node trajectory 3D GIF: {out_path}", FontColor.MAPPER)
-
-    def _plot_node_trajectory(
-        self,
-        viewpoint,
-        dynamic_network,
-        plot_dir,
-        idx_tag,
-        t_samp_num_override=None,
-        force_t_idx=None,
-        draw_history=True,
-    ):
-        del t_samp_num_override, force_t_idx, draw_history
-        if not (self.node_traj_vis and dynamic_network and self.gaussians.deform_init):
-            return
-        if self.node_traj_vis_every > 1 and int(viewpoint.uid) % self.node_traj_vis_every != 0:
-            return
-
-        window_indices = self.current_window if len(self.current_window) > 0 else [int(viewpoint.uid)]
-        self._plot_window_dynamic_trajectory_2d_grid(window_indices, dynamic_network, plot_dir, idx_tag)
-        self._plot_window_dynamic_trajectory_3d(window_indices, dynamic_network, plot_dir, idx_tag)
-
-    def _plot_node_trajectory_full_sequence(self):
-        if not self.node_traj_final_vis:
-            return
-        if not self.dynamic_model or not self.gaussians.deform_init:
-            return
-        if len(self.viewpoints) < 2:
-            return
-
-        view_ids = sorted(self.viewpoints.keys())
-        plot_dir = os.path.join(self.save_dir, "online_plots")
-        self._plot_window_dynamic_trajectory_2d_grid(
-            view_ids, True, plot_dir, "full_sequence", allow_without_online_vis=True
-        )
-        self._plot_window_dynamic_trajectory_3d(
-            view_ids, True, plot_dir, "full_sequence", allow_without_online_vis=True
-        )
-        if self.node_traj_gif:
-            valid_indices = [int(k) for k in view_ids if int(k) in self.viewpoints]
-            valid_indices = sorted(valid_indices)
-            view_seq = [self.viewpoints[k] for k in valid_indices]
-            payload = self._compute_dynamic_tracks_for_views(view_seq)
-            if payload is not None:
-                node_plot_dir = os.path.join(plot_dir, "node_trajectory")
-                self._save_node_traj_gif_2d_grid(
-                    payload, node_plot_dir, "full_sequence", self.node_traj_gif_fps
-                )
-                self._save_node_traj_gif_3d(
-                    payload, node_plot_dir, "full_sequence", self.node_traj_gif_fps
-                )
-
-    # ---------------------------------------------------------------------
-    # Section F: Map Initialization and Mapping Core Loop
-    # ---------------------------------------------------------------------
-
-
     def initialize_map(self, cur_frame_idx,idx, viewpoint):
-        # Mapping stage: render current view, build initialization loss, then optimize gaussians.
-        for mapping_iteration in tqdm(
-            range(self.init_itr_num),
-            desc=self._mapper_bar_desc(f"init map[{idx}]"),
-            position=0,
-            dynamic_ncols=True,
-            leave=True,
-        ):
+        for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
-            render_pkg = self._render_with_deform(viewpoint, return_normal=self.use_normal)
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background,
+            )
             (
                 image,
                 viewspace_point_tensor,
@@ -2080,14 +666,18 @@ class Mapper(object):
                 depth,
                 opacity,
                 n_touched,
-                normal
-            ) = self._unpack_render_pkg(render_pkg)
+            ) = (
+                render_pkg["render"],
+                render_pkg["viewspace_points"],
+                render_pkg["visibility_filter"],
+                render_pkg["radii"],
+                render_pkg["depth"],
+                render_pkg["opacity"],
+                render_pkg["n_touched"],
+            )
             loss_init = get_loss_mapping(
                 self.config["mapping"], image, depth, viewpoint, opacity, initialization=True,rm_dynamic=not (self.dystart==cur_frame_idx)
             )
-            if self.use_normal:
-                loss_init += self.config["mapping"]["Training"]["render_normal_loss_weight"] * self.get_render_normal_loss(viewpoint.normal, normal)
-                loss_init += self.config["mapping"]["Training"]["flat_loss_weight"] * self.get_flat_loss()
             loss_init.backward()
 
             with torch.no_grad():
@@ -2116,15 +706,17 @@ class Mapper(object):
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         vis_render_process(self.gaussians, self.pipeline_params, self.background, viewpoint,
-                        viewpoint.uid, self.save_dir, out_dir="map", mask=None, dynamic=False)
+                           viewpoint.uid, self.save_dir, out_dir="map", mask=None, dynamic=False)
         self.printer.print("Initialized map", FontColor.MAPPER)
-        stats_window = self.current_window if len(self.current_window) > 0 else [int(cur_frame_idx)]
-        self._log_window_optimization_stats("init_map", stats_window, False)
+        print(f"Guassians num:{self.gaussians.get_xyz.shape[0]}, Dynamic Gaussian num:{self.gaussians.get_dygs_xyz.shape[0]}")
+
 
         # online plotting
         if self.online_plotting:
             from thirdparty.gaussian_splatting.utils.image_utils import psnr
             from src.utils.eval_utils import plot_rgbd_silhouette
+            import cv2
+            import numpy as np
             cur_idx = self.current_window[np.array(self.current_window).argmax()]
             viewpoint = self.viewpoints[cur_idx]
             render_pkg = render(
@@ -2140,102 +732,33 @@ class Mapper(object):
             gt_image = viewpoint.original_image
             gt_depth = viewpoint.depth
 
-            if len(self.video_idxs) > 0 and viewpoint.uid != self.video_idxs[0]:
-                image = (torch.exp(viewpoint.exposure_a.detach())) * image + viewpoint.exposure_b.detach()
             image = torch.clamp(image, 0.0, 1.0)
-            gt = self._chw01_to_rgb_uint8_hwc(gt_image)
-            pred = self._chw01_to_rgb_uint8_hwc(image)
+            gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+            pred = (image.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(
+                np.uint8
+            )
+            gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
+            pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
             mask = gt_image > 0
             psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0))
-            diff_depth_l1, depth_l1 = self._depth_l1_diff_for_online_plot(depth, gt_depth)
+            diff_depth_l1 = torch.abs(depth.detach().cpu() - gt_depth)
+            diff_depth_l1 = diff_depth_l1 * (gt_depth > 0)
+            depth_l1 = diff_depth_l1.sum() / (gt_depth > 0).sum()
 
-            plot_dir = os.path.join(self.save_dir, "online_plots")
+            # Add plotting 2x3 grid here
+            plot_dir = self.save_dir + "/online_plots"
             plot_rgbd_silhouette(gt_image, gt_depth, image, depth, diff_depth_l1,
-                                psnr_score.item(), depth_l1.item(), plot_dir=plot_dir, idx=str(cur_idx),
-                                diff_rgb=np.abs(gt.astype(np.int16) - pred.astype(np.int16)).astype(np.uint8))
-            self._plot_window_psnr_grid(self.current_window, False, plot_dir, f"window_{cur_idx}")
-            self._plot_window_normal_grid(self.current_window, False, plot_dir, f"window_{cur_idx}")
+                                 psnr_score.item(), depth_l1, plot_dir=plot_dir, idx=str(cur_idx),
+                                 diff_rgb=np.abs(gt - pred))
 
         return render_pkg
-
-    def initialize_network(self, cur_frame_idx, viewpoint, update_gaussians=False):
-        if cur_frame_idx == self.dystart:
-            inited = self.gaussians.create_node_from_depth(viewpoint, self.opt_params, self.sc_params)
-            if not inited:
-                return
-        # self.gaussians.deform.deform.init(opt=self.opt_params, init_pcl=self.gaussians.get_xyz, keep_all=True, force_init=True, reset_bbox=False)
-        # self.gaussians.deform.train_setting(self.sc_params)
-
-        for mapping_iteration in tqdm(
-            range(100),
-            desc=self._mapper_bar_desc(f"init net[{cur_frame_idx}]"),
-            position=0,
-            dynamic_ncols=True,
-            leave=True,
-        ):
-            dxyz, d_rot, d_scale, _, _ = self._get_deform_render_inputs(viewpoint, True)
-            render_pkg = self._render_with_deform(
-                viewpoint,
-                dxyz=dxyz,
-                d_rot=d_rot,
-                d_scale=d_scale,
-                return_normal=self.use_normal,
-            )
-            (
-                image,
-                viewspace_point_tensor,
-                visibility_filter,
-                radii,
-                depth,
-                opacity,
-                n_touched,
-                normal,
-            ) = self._unpack_render_pkg(render_pkg)
-
-            loss_init = get_loss_mapping(
-                self.config["mapping"], image, depth, viewpoint, opacity, initialization=True
-            )
-            if self.use_normal:
-                loss_init += self.config["mapping"]["Training"]["render_normal_loss_weight"] * self.get_render_normal_loss(viewpoint.normal, normal)
-                loss_init += self.config["mapping"]["Training"]["flat_loss_weight"] * self.get_flat_loss()
-            # loss_init += self.gaussians.deform.reg_loss
-
-            # scaling = self.gaussians.get_scaling
-            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            # loss_init += 10 * isotropic_loss.mean()
-
-            loss_init.backward()
-
-            with torch.no_grad():
-                self.gaussians.deform.optimizer.step()
-                self.gaussians.deform.optimizer.zero_grad(set_to_none=True)
-                if update_gaussians:
-                    self.gaussians.optimizer.step()
-                    self.gaussians.optimizer.zero_grad(set_to_none=True)
-                else:
-                    self.gaussians.optimizer.zero_grad(set_to_none=True)
-        vis_render_process(self.gaussians, self.pipeline_params, self.background, viewpoint,
-                        viewpoint.uid, self.save_dir, out_dir="init_network", mask=None, dynamic=True)
-        stats_window = self.current_window if len(self.current_window) > 0 else [int(cur_frame_idx)]
-        self._log_window_optimization_stats("init_network", stats_window, True)
-        if self.node_traj_vis and self.dynamic_model and self.gaussians.deform_init:
-            plot_dir = os.path.join(self.save_dir, "online_plots")
-            self._plot_node_trajectory(
-                viewpoint,
-                True,
-                plot_dir,
-                f"init_network_{cur_frame_idx}",
-                t_samp_num_override=2,
-                force_t_idx=0,
-                draw_history=False,
-            )
-
     def find_closest_keyframe(self, uid):
-        """仅使用时间上更早的关键帧（与 before_modify 一致）；无则更早前帧时不做光流监督。"""
         keys = [key for key in self.viewpoints if key < uid]
         if not keys:
             return None
-        return max(keys)
+        closest_key = max(keys)
+        return closest_key
+
 
 
 
@@ -2248,7 +771,7 @@ class Mapper(object):
                 stream, self.viewpoints, self.viewpoints[current_window[2]].uid)
         key_opt = current_window[:3] + key_opt
         viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in key_opt]
-        random_viewpoint_stack = []
+        random_viewpoint_stack = []  
         frames_to_optimize = self.config["mapping"]["Training"]["pose_window"]
         current_window_set = set(key_opt)
         for cam_idx, viewpoint in self.viewpoints.items():
@@ -2256,21 +779,11 @@ class Mapper(object):
                 continue
             random_viewpoint_stack.append(viewpoint)
 
+
         flow_weights = self.config["mapping"]["Training"]["flow_loss"]
         delta = self.config["mapping"]["Training"].get("delta", 5)
 
-        iter_range = range(iters)
-        if prune:
-            iterator = iter_range
-        else:
-            iterator = tqdm(
-                iter_range,
-                desc=self._mapper_bar_desc(f"map [{idx1}]"),
-                position=0,
-                dynamic_ncols=True,
-                leave=True,
-            )
-        for i in iterator:
+        for i in range(iters):
             if i>100:
                 self.iteration_count += 1
 
@@ -2283,16 +796,13 @@ class Mapper(object):
             n_touched_acm = []
             loss_network = 0
             keyframes_opt = []
-            progress = 0.0 if iters <= 1 else float(i) / float(iters - 1)
-            # Dynamic:Static expected ratio annealing:
-            # start 2:1 (p=2/3) -> middle 1:1 (p=1/2) -> end 1:2 (p=1/3)
-            if progress < 0.5:
-                p_dynamic = (2.0 / 3.0) + ((1.0 / 2.0) - (2.0 / 3.0)) * (progress / 0.5)
+            if i < iters / 2:
+                dynamic = True
+                flow_weights =self.config["mapping"]["Training"]["flow_loss"]#30
             else:
-                p_dynamic = (1.0 / 2.0) + ((1.0 / 3.0) - (1.0 / 2.0)) * ((progress - 0.5) / 0.5)
-            dynamic = bool(torch.rand(1).item() < p_dynamic)
-
-            flow_weights = self.flow_loss_start + (self.flow_loss_end - self.flow_loss_start) * progress
+                dynamic = False
+                flow_weights =self.config["mapping"]["Training"]["flow_loss_fine"] if "flow_loss_fine" in self.config["mapping"][
+                    "Training"] else self.config["mapping"]["Training"]["flow_loss"]#30
 
             if len(current_window) == len(viewpoint_stack):
                 windows = current_window
@@ -2361,7 +871,7 @@ class Mapper(object):
                 )
 
                 (image, viewspace_point_tensor, visibility_filter,
-                radii, depth, opacity, n_touched) = (
+                 radii, depth, opacity, n_touched) = (
                     render_pkg["render"],
                     render_pkg["viewspace_points"],
                     render_pkg["visibility_filter"],
@@ -2370,6 +880,18 @@ class Mapper(object):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
+                with torch.no_grad():
+                    import numpy as np
+                    import cv2
+                    rendering = render_pkg["render"].detach()
+                    output_dir = os.path.join("output", "renderc2_image")
+                    os.makedirs(output_dir, exist_ok=True)
+                    image1 = rendering.permute(1, 2, 0).cpu().numpy()
+                    image1_normalized = (image1 - image1.min()) / (
+                            image1.max() - image1.min()) * 255
+                    depth_normalized = image1_normalized.astype(np.uint8)
+                    cv2_image = cv2.cvtColor(depth_normalized, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(output_dir, f"image_{idx1:04d}.png"), cv2_image)
                 if rm_initdy:
                     with torch.no_grad():
                         mask = viewpoint.reproject_mask(stream, self.viewpoints[0])
@@ -2411,10 +933,10 @@ class Mapper(object):
 
                         coor1to2_motion = render_pkg2["render"][:2].permute(1, 2, 0)
                         dynamic_mask = (~viewpoint.motion_mask).unsqueeze(0).permute(1, 2, 0).repeat(1, 1,
-                                                                                                    2).detach()
+                                                                                                     2).detach()
 
                         loss_network += flow_weights * l1_loss(flow_back * dynamic_mask,
-                                                            coor1to2_motion * dynamic_mask)
+                                                               coor1to2_motion * dynamic_mask)
 
                         render_pkg_back = render_flow(
                             pc=self.gaussians,
@@ -2427,20 +949,28 @@ class Mapper(object):
                         )
                         coor2to1_motion = render_pkg_back["render"][:2].permute(1, 2, 0)
                         dynamic_mask = (~self.viewpoints[closest_keyframe].motion_mask).unsqueeze(0).permute(1, 2,
-                                                                                                            0).repeat(
+                                                                                                             0).repeat(
                             1, 1, 2).detach()
                         loss_network += flow_weights * l1_loss(flow * dynamic_mask,
-                                                            coor2to1_motion * dynamic_mask)
+                                                               coor2to1_motion * dynamic_mask)
 
                     order_mask = (viewpoint.depth > 0)
+                    loss_depth = depth_loss_dpt(depth, viewpoint.depth,order_mask)
                     loss_order_depth = self.get_depth_order_loss(depth, viewpoint.depth, order_mask)
                     loss_mapping += get_loss_mapping(
                         self.config["mapping"], image, depth, viewpoint, opacity,
                         rm_dynamic=not (dynamic_network or dynamic_render),
                         dynamic=dynamic,
-                    ) + self.depth_order_loss_weight * loss_order_depth
-                    loss_mapping += self.normal_loss_weight * self.get_loss_normal(depth, viewpoint)
+                    )+0.1*loss_order_depth
+                    loss_mapping += 0.1 * self.get_loss_normal(depth, viewpoint) / 10.
 
+                    # if i > iters*0.8:
+                    #     if closest_keyframe is not None and closest_keyframe in self.viewpoints:
+                    #         loss_mapping += self.compute_multi_view_loss(viewpoint, render_pkg, self.gaussians,
+                    #                                             self.pipeline_params, self.background,
+                    #                                             d_value2["d_xyz"], d_value2['d_scaling'], d_value2['d_rotation'], d_value2['d_opacity'],
+                    #                                             d_value2["d_color"],
+                    #                                             self.viewpoints[closest_keyframe])
                 else:
                     loss_mapping += get_loss_mapping(
                         self.config["mapping"], image, depth, viewpoint, opacity,
@@ -2478,7 +1008,7 @@ class Mapper(object):
                     d_values = self.gaussians.deform.step(
                         self.gaussians.get_dygs_xyz.detach(),
                         time_input,
-                        iteration=0,
+                        iteration=0,  
                         feature=None,
                         motion_mask=self.gaussians.motion_mask,
                         camera_center=viewpoint.camera_center,
@@ -2498,10 +1028,11 @@ class Mapper(object):
                         d_values = self.gaussians.deform.step(
                             self.gaussians.get_xyz.detach(),
                             time_input + ast_noise,
+                            #feature=None,
                             motion_mask=self.gaussians.motion_mask,
                             camera_center=viewpoint.camera_center,
                             time_interval=self.gaussians.time_interval,
-                        )
+                        ) 
                         d_scale = d_values['d_scaling'].detach()
                         d_opac = d_values['d_opacity'].detach() if d_values['d_opacity'] else None
                         d_color = d_values["d_color"].detach() if d_values["d_color"] else None
@@ -2516,7 +1047,7 @@ class Mapper(object):
                     dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot, do=d_opac, dc=d_color,
                 )
                 (image, viewspace_point_tensor, visibility_filter,
-                radii, depth, opacity, n_touched) = (
+                 radii, depth, opacity, n_touched) = (
                     render_pkg["render"],
                     render_pkg["viewspace_points"],
                     render_pkg["visibility_filter"],
@@ -2533,7 +1064,7 @@ class Mapper(object):
                     mask = None
 
                 if dynamic_network and self.gaussians.deform_init:
-                    if dynamic or True:
+                    if dynamic or True:  
                         closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
                         if closest_keyframe is not None:
                             flow, flow_back, mask_fwd, mask_bwd,_ = viewpoint.generate_flow(
@@ -2564,10 +1095,10 @@ class Mapper(object):
                             )
                             coor1to2_motion = render_pkg2["render"][:2].permute(1, 2, 0)
                             dynamic_mask = (~viewpoint.motion_mask).unsqueeze(0).permute(1, 2, 0).repeat(1, 1,
-                                                                                                        2).detach()
+                                                                                                         2).detach()
 
                             loss_network += flow_weights * l1_loss(flow_back * dynamic_mask,
-                                                                coor1to2_motion * dynamic_mask)
+                                                                   coor1to2_motion * dynamic_mask)
 
 
                             render_pkg_back = render_flow(
@@ -2581,20 +1112,27 @@ class Mapper(object):
                             )
                             coor2to1_motion = render_pkg_back["render"][:2].permute(1, 2, 0)
                             dynamic_mask = (~self.viewpoints[closest_keyframe].motion_mask).unsqueeze(0).permute(1, 2,
-                                                                                                                0).repeat(
+                                                                                                                 0).repeat(
                                 1, 1, 2).detach()
                             loss_network += flow_weights * l1_loss(flow * dynamic_mask,
-                                                                coor2to1_motion * dynamic_mask)
+                                                                   coor2to1_motion * dynamic_mask)
 
                         order_mask = (viewpoint.depth > 0)
-                        loss_order_depth = self.get_depth_order_loss(depth, viewpoint.depth, order_mask)
+                        loss_order_depth=self.get_depth_order_loss(depth,viewpoint.depth,order_mask)
                         loss_mapping += get_loss_mapping(
                             self.config["mapping"], image, depth, viewpoint, opacity,
                             rm_dynamic=not (dynamic_network or dynamic_render),
                             dynamic=dynamic,
-                        ) + self.depth_order_loss_weight * loss_order_depth
-                        loss_mapping += self.normal_loss_weight * self.get_loss_normal(depth, viewpoint)
-                    else:
+                        )+0.1*loss_order_depth
+                        loss_mapping += 0.1 * self.get_loss_normal(depth, viewpoint) / 10.
+                        # if i > iters*0.8:
+                        #     if closest_keyframe is not None and closest_keyframe in self.viewpoints:
+                        #         loss_mapping += self.compute_multi_view_loss(viewpoint, render_pkg, self.gaussians,
+                        #                                             self.pipeline_params, self.background,
+                        #                                             d_value2["d_xyz"], d_value2['d_scaling'], d_value2['d_rotation'], d_value2['d_opacity'],
+                        #                                             d_value2["d_color"],
+                        #                                             self.viewpoints[closest_keyframe])
+                    else:  
                         image = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
                         gt_image = viewpoint.original_image.cuda()
                         gt_depth = torch.from_numpy(viewpoint.depth).to(device=image.device)[None]
@@ -2604,7 +1142,7 @@ class Mapper(object):
                         loss_mapping += (1.0 - self.opt_params.lambda_dssim) * Ll1 + \
                                         self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
                         loss_mapping += 0.1 * l1_depth.mean()
-                else:
+                else:  
                     loss_mapping += get_loss_mapping(
                         self.config["mapping"], image, depth, viewpoint, opacity,
                         rm_dynamic=not (dynamic_network or dynamic_render),
@@ -2612,10 +1150,10 @@ class Mapper(object):
                     )
 
                 if dynamic_network and self.gaussians.deform_init:
-
+                    
                     loss_network += 1e-4 * self.gaussians.deform.deform.elastic_loss(
-                        t=viewpoint.fid,
-                        delta_t= 5*self.gaussians.time_interval,
+                        t=viewpoint.fid,  
+                        delta_t= 5*self.gaussians.time_interval, 
                     )
 
                     loss_network+=1e-6* self.gaussians.deform.deform.acc_loss(
@@ -2627,15 +1165,19 @@ class Mapper(object):
                         delta_t=5 * self.gaussians.time_interval,
                     )
 
+
+                
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
+
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping += 10 * isotropic_loss.mean()
             loss_mapping.backward(retain_graph=True)
             gaussian_split = False
+            # Deinsifying / Pruning Gaussians
             with torch.no_grad():
                 self.occ_aware_visibility = {}
                 for idx in range((len(current_window))):
@@ -2643,6 +1185,8 @@ class Mapper(object):
                     n_touched = n_touched_acm[idx]
                     self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
 
+                # compute the visibility of the gaussians
+                # Only prune on the last iteration and when we have a full window
                 if prune:
                     if len(current_window) == self.window_size:
                         prune_mode = self.config["mapping"]["Training"]["prune_mode"]
@@ -2653,18 +1197,20 @@ class Mapper(object):
                         to_prune = None
                         if prune_mode == "odometry":
                             to_prune = self.gaussians.n_obs < 3
-                        if prune_mode == "slam":
-                            sorted_window = sorted(current_window, reverse=True)
-                            mask = self.gaussians.unique_kfIDs >= sorted_window[2]
-                            if not self.initialized:
+                            # make sure we don't split the gaussians, break here.
+                        if prune_mode == "slam":  
+                            sorted_window = sorted(current_window, reverse=True) 
+                            mask = self.gaussians.unique_kfIDs >= sorted_window[2]  
+                            if not self.initialized:  
                                 mask = self.gaussians.unique_kfIDs >= 0
-                            to_prune = torch.logical_and(
+                            to_prune = torch.logical_and(  
                                 self.gaussians.n_obs <= prune_coviz,
                                 mask,
                             )
+                            # to_prune = torch.logical_or(torch.logical_and(self.gaussians.dygs==True, (self.gaussians.n_obs >= 1).cuda()), to_prune.cuda())  ##
                         if to_prune is not None and self.monocular:
-                            self.gaussians.prune_points(to_prune.cuda())
-
+                            self.gaussians.prune_points(to_prune.cuda())  
+                            
                             for idx in range((len(current_window))):
                                 current_idx = current_window[idx]
                                 self.occ_aware_visibility[current_idx] = (self.occ_aware_visibility[current_idx][
@@ -2687,8 +1233,8 @@ class Mapper(object):
                         self.iteration_count % self.gaussian_update_every
                         == self.gaussian_update_offset and i > 100
                 )
-                if rm_initdy:
-                    update_gaussian = (iters - i - 10 == 0)
+                if rm_initdy:  
+                    update_gaussian = (iters - i - 10 == 0) 
                 if update_gaussian:
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
@@ -2696,22 +1242,30 @@ class Mapper(object):
                         self.gaussian_extent,
                         self.size_threshold,
                     )
-                    gaussian_split = True
+                    gaussian_split = True  # not used it seems
 
+                ## Opacity reset
+                # self.iteration_count is a global parameter. We use gaussian reset
+                # every 2001 iterations meaning if we use 60 per mapping frame
+                # and there are 160 keyframes in the sequence, we do resetting
+                # 4 times. Using more mapping iterations leads to more resetting
+                # which can prune away more gaussians.
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
                         not update_gaussian
-                ) and i > 100:
+                ) and i > 100: #and idx1 < 100:
                     self.printer.print("Resetting the opacity of non-visible Gaussians", FontColor.MAPPER)
                     self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                     gaussian_split = True
+                # comment for debugging
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+                # Pose update
                 for cam_idx in range(min(frames_to_optimize, len(current_window))):
                     viewpoint = viewpoint_stack[cam_idx]
-                    if self._is_reference_viewpoint(viewpoint):
+                    if viewpoint.uid == 0:
                         continue
                     update_pose(viewpoint)
-                if dynamic_network and self.gaussians.deform_init:
+                if dynamic_network and self.gaussians.deform_init :
 
                     loss_network.backward()
                     self.gaussians.deform.optimizer.step()
@@ -2723,23 +1277,17 @@ class Mapper(object):
                     self.gaussians.update_learning_rate(self.iteration_count)
                 else:
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
+        print(f"Guassians num:{self.gaussians.get_xyz.shape[0]}, Dynamic Gaussian num:{self.gaussians.get_dygs_xyz.shape[0]}")
 
         if self.online_plotting:
             from thirdparty.gaussian_splatting.utils.image_utils import psnr
             from src.utils.eval_utils import plot_rgbd_silhouette
+            import cv2
+            import numpy as np
             cur_idx = current_window[np.array(current_window).argmax()]
             viewpoint = self.viewpoints[cur_idx]
-            dxyz, d_rot, d_scale, d_opac, d_color = self._get_deform_render_inputs(
-                viewpoint, dynamic_network
-            )
-            render_pkg = self._render_with_deform(
-                viewpoint,
-                dxyz=dxyz,
-                d_rot=d_rot,
-                d_scale=d_scale,
-                d_opac=d_opac,
-                d_color=d_color,
-                return_normal=False,
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background
             )
             (
                 image,
@@ -2751,230 +1299,48 @@ class Mapper(object):
             gt_image = viewpoint.original_image
             gt_depth = viewpoint.depth
 
-            if len(self.video_idxs) > 0 and viewpoint.uid != self.video_idxs[0]:
+            if viewpoint.uid != self.video_idxs[0]:  # first mapping frame is reference for exposure
                 image = (torch.exp(viewpoint.exposure_a.detach())) * image + viewpoint.exposure_b.detach()
 
             image = torch.clamp(image, 0.0, 1.0)
-            gt = self._chw01_to_rgb_uint8_hwc(gt_image)
-            pred = self._chw01_to_rgb_uint8_hwc(image)
+            gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+
+            pred = (image.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(
+                np.uint8
+            )
+            gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
+            pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
             mask = gt_image > 0
             psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0))
-            diff_depth_l1, depth_l1 = self._depth_l1_diff_for_online_plot(depth, gt_depth)
+            diff_depth_l1 = torch.abs(depth.detach().cpu() - gt_depth)
+            diff_depth_l1 = diff_depth_l1 * (gt_depth > 0)
+            depth_l1 = diff_depth_l1.sum() / (gt_depth > 0).sum()
 
-            plot_dir = os.path.join(self.save_dir, "online_plots")
+            # Add plotting 2x3 grid here
+            plot_dir = self.save_dir + "/online_plots"
             plot_rgbd_silhouette(gt_image, gt_depth, image, depth, diff_depth_l1,
-                                psnr_score.item(), depth_l1.item(), plot_dir=plot_dir, idx=str(cur_idx),
-                                diff_rgb=np.abs(gt.astype(np.int16) - pred.astype(np.int16)).astype(np.uint8))
-            self._plot_window_psnr_grid(current_window, dynamic_network, plot_dir, f"window_{cur_idx}")
-            self._plot_window_normal_grid(current_window, dynamic_network, plot_dir, f"window_{cur_idx}")
-            window_t_samples = max(2, len(current_window))
-            self._plot_node_trajectory(
-                viewpoint,
-                dynamic_network,
-                plot_dir,
-                f"window_{cur_idx}",
-                t_samp_num_override=window_t_samples,
-                force_t_idx=window_t_samples - 1,
-                draw_history=True,
-            )
-
-        self._log_window_optimization_stats(f"map[{idx1}]", current_window, dynamic_network)
+                                 psnr_score.item(), depth_l1, plot_dir=plot_dir, idx=str(cur_idx),
+                                 diff_rgb=np.abs(gt - pred))
 
         return gaussian_split
 
-    # ---------------------------------------------------------------------
-    # Section G: Final Refinement Stage
-    # ---------------------------------------------------------------------
+    def visualize_flow(self, flow):
+        flow_uv = flow[..., :2].copy() * 5.0  # 放大5倍使弱运动可见
 
-    def _serialize_camera_state(self, camera):
-        depth = None
-        if camera.depth is not None:
-            depth = np.asarray(camera.depth, dtype=np.float32)
+        # --- 运动方向与速度的HSV编码 ---
+        magnitude = np.linalg.norm(flow_uv, axis=-1)  # 速度幅值
+        angle = np.arctan2(flow_uv[..., 1], flow_uv[..., 0])  # 运动方向 [-π, π]
 
-        return {
-            "R": camera.R.detach().cpu(),
-            "T": camera.T.detach().cpu(),
-            "depth": depth,
-            "cam_rot_delta": camera.cam_rot_delta.detach().cpu(),
-            "cam_trans_delta": camera.cam_trans_delta.detach().cpu(),
-            "exposure_a": camera.exposure_a.detach().cpu(),
-            "exposure_b": camera.exposure_b.detach().cpu(),
-        }
+        # 构建HSV图像
+        hsv = np.zeros((flow_uv.shape[0], flow_uv.shape[1], 3), dtype=np.uint8)
+        hsv[..., 0] = (angle + np.pi) / (2 * np.pi) * 180  # 色相：方向[0°, 180°]
+        hsv[..., 1] = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)  # 饱和度：速度
+        hsv[..., 2] = 255  # 亮度：固定最大值
 
-    def _apply_camera_state(self, camera, state):
-        camera.update_RT(
-            state["R"].to(self.device, dtype=torch.float32),
-            state["T"].to(self.device, dtype=torch.float32),
-        )
-        if state.get("depth", None) is not None:
-            camera.depth = np.asarray(state["depth"], dtype=np.float32)
-
-        if hasattr(camera, "cam_rot_delta") and state.get("cam_rot_delta", None) is not None:
-            camera.cam_rot_delta.data.copy_(state["cam_rot_delta"].to(camera.cam_rot_delta.device))
-        if hasattr(camera, "cam_trans_delta") and state.get("cam_trans_delta", None) is not None:
-            camera.cam_trans_delta.data.copy_(state["cam_trans_delta"].to(camera.cam_trans_delta.device))
-        if hasattr(camera, "exposure_a") and state.get("exposure_a", None) is not None:
-            camera.exposure_a.data.copy_(state["exposure_a"].to(camera.exposure_a.device))
-        if hasattr(camera, "exposure_b") and state.get("exposure_b", None) is not None:
-            camera.exposure_b.data.copy_(state["exposure_b"].to(camera.exposure_b.device))
-
-    def _build_final_refine_optimizer(self):
-        opt_params = []
-        frames_to_optimize = self.config["mapping"]["Training"]["pose_window"]
-
-        for cam_rank, cam_idx in enumerate(sorted(self.viewpoints.keys())):
-            viewpoint = self.viewpoints[cam_idx]
-            if (not self._is_reference_viewpoint(viewpoint)) and cam_rank < frames_to_optimize:
-                opt_params.append(
-                    {
-                        "params": [viewpoint.cam_rot_delta],
-                        "lr": self.config["mapping"]["Training"]["lr"]["cam_rot_delta"] * 0.5,
-                        "name": "rot_{}".format(viewpoint.uid),
-                    }
-                )
-                opt_params.append(
-                    {
-                        "params": [viewpoint.cam_trans_delta],
-                        "lr": self.config["mapping"]["Training"]["lr"]["cam_trans_delta"] * 0.5,
-                        "name": "trans_{}".format(viewpoint.uid),
-                    }
-                )
-
-            if not self._is_reference_viewpoint(viewpoint):
-                opt_params.append(
-                    {
-                        "params": [viewpoint.exposure_a],
-                        "lr": 0.01,
-                        "name": "exposure_a_{}".format(viewpoint.uid),
-                    }
-                )
-                opt_params.append(
-                    {
-                        "params": [viewpoint.exposure_b],
-                        "lr": 0.01,
-                        "name": "exposure_b_{}".format(viewpoint.uid),
-                    }
-                )
-
-        self.keyframe_optimizers = torch.optim.Adam(opt_params) if len(opt_params) > 0 else None
-
-    def _save_final_refine_context(self, context_path):
-        context_dir = os.path.dirname(context_path)
-        if context_dir:
-            os.makedirs(context_dir, exist_ok=True)
-
-        gaussian_state = {
-            "xyz": self.gaussians._xyz.detach().cpu(),
-            "features_dc": self.gaussians._features_dc.detach().cpu(),
-            "features_rest": self.gaussians._features_rest.detach().cpu(),
-            "opacity": self.gaussians._opacity.detach().cpu(),
-            "scaling": self.gaussians._scaling.detach().cpu(),
-            "rotation": self.gaussians._rotation.detach().cpu(),
-            "max_radii2D": self.gaussians.max_radii2D.detach().cpu(),
-            "unique_kfIDs": self.gaussians.unique_kfIDs.detach().cpu(),
-            "n_obs": self.gaussians.n_obs.detach().cpu(),
-            "dygs": self.gaussians.dygs.detach().cpu(),
-            "active_sh_degree": int(self.gaussians.active_sh_degree),
-            "deform_init": bool(self.gaussians.deform_init),
-        }
-
-        if torch.is_tensor(self.gaussians.xyz_gradient_accum):
-            gaussian_state["xyz_gradient_accum"] = self.gaussians.xyz_gradient_accum.detach().cpu()
-        if torch.is_tensor(getattr(self.gaussians, "denom", None)):
-            gaussian_state["denom"] = self.gaussians.denom.detach().cpu()
-
-        payload = {
-            "version": 1,
-            "iteration_count": int(self.iteration_count),
-            "last_sent": int(self.last_sent),
-            "keyframe_idxs": [int(v) for v in self.keyframe_idxs],
-            "video_idxs": [int(v) for v in self.video_idxs],
-            "current_window": [int(v) for v in self.current_window],
-            "mapped_video_idxs": [int(v) for v in getattr(self, "mapped_video_idxs", [])],
-            "mapped_kf_idxs": [int(v) for v in getattr(self, "mapped_kf_idxs", [])],
-            "st_predicted": self.st_predicted,
-            "new_scale_alignFrame0": self.new_scale_alignFrame0,
-            "gaussians": gaussian_state,
-            "cameras": {
-                int(uid): self._serialize_camera_state(cam)
-                for uid, cam in self.cameras.items()
-            },
-            "viewpoints": {
-                int(uid): self._serialize_camera_state(cam)
-                for uid, cam in self.viewpoints.items()
-            },
-        }
-
-        if self.dynamic_model and self.gaussians.deform_init:
-            payload["deform_state"] = {
-                k: v.detach().cpu() for k, v in self.gaussians.deform.deform.state_dict().items()
-            }
-
-        torch.save(payload, context_path)
-        self.printer.print(f"Saved final refine context to {context_path}", FontColor.MAPPER)
-
-    def _load_final_refine_context(self, context_path):
-        if not os.path.exists(context_path):
-            self.printer.print(f"Refine context not found: {context_path}", FontColor.INFO)
-            return False
-
-        payload = torch.load(context_path, map_location="cpu")
-        if not isinstance(payload, dict) or "gaussians" not in payload:
-            self.printer.print(f"Invalid refine context file: {context_path}", FontColor.ERROR)
-            return False
-
-        self.iteration_count = int(payload.get("iteration_count", self.iteration_count))
-        self.last_sent = int(payload.get("last_sent", self.last_sent))
-        self.keyframe_idxs = [int(v) for v in payload.get("keyframe_idxs", self.keyframe_idxs)]
-        self.video_idxs = [int(v) for v in payload.get("video_idxs", self.video_idxs)]
-        self.current_window = [int(v) for v in payload.get("current_window", self.current_window)]
-        self.mapped_video_idxs = [int(v) for v in payload.get("mapped_video_idxs", getattr(self, "mapped_video_idxs", []))]
-        self.mapped_kf_idxs = [int(v) for v in payload.get("mapped_kf_idxs", getattr(self, "mapped_kf_idxs", []))]
-        self.st_predicted = payload.get("st_predicted", self.st_predicted)
-        self.new_scale_alignFrame0 = payload.get("new_scale_alignFrame0", self.new_scale_alignFrame0)
-
-        gs = payload["gaussians"]
-        device = self.device
-
-        self.gaussians._xyz = nn.Parameter(gs["xyz"].to(device=device, dtype=torch.float32).requires_grad_(True))
-        self.gaussians._features_dc = nn.Parameter(gs["features_dc"].to(device=device, dtype=torch.float32).requires_grad_(True))
-        self.gaussians._features_rest = nn.Parameter(gs["features_rest"].to(device=device, dtype=torch.float32).requires_grad_(True))
-        self.gaussians._opacity = nn.Parameter(gs["opacity"].to(device=device, dtype=torch.float32).requires_grad_(True))
-        self.gaussians._scaling = nn.Parameter(gs["scaling"].to(device=device, dtype=torch.float32).requires_grad_(True))
-        self.gaussians._rotation = nn.Parameter(gs["rotation"].to(device=device, dtype=torch.float32).requires_grad_(True))
-        self.gaussians.max_radii2D = gs["max_radii2D"].to(device=device, dtype=torch.float32)
-        self.gaussians.unique_kfIDs = gs["unique_kfIDs"].to(dtype=torch.int32, device="cpu")
-        self.gaussians.n_obs = gs["n_obs"].to(dtype=torch.int32, device="cpu")
-        self.gaussians.dygs = gs["dygs"].to(dtype=torch.bool, device=device)
-        self.gaussians.active_sh_degree = int(gs.get("active_sh_degree", self.gaussians.active_sh_degree))
-        self.gaussians.deform_init = bool(gs.get("deform_init", self.gaussians.deform_init))
-
-        if "xyz_gradient_accum" in gs:
-            self.gaussians.xyz_gradient_accum = gs["xyz_gradient_accum"].to(device=device, dtype=torch.float32)
-        if "denom" in gs:
-            self.gaussians.denom = gs["denom"].to(device=device, dtype=torch.float32)
-
-        self.gaussians.training_setup(self.opt_params)
-
-        if self.dynamic_model and self.gaussians.deform_init:
-            self.gaussians.deform.train_setting(self.sc_params)
-            deform_state = payload.get("deform_state", None)
-            if deform_state is not None:
-                self.gaussians.deform.deform.load_state_dict(deform_state, strict=False)
-
-        for uid, state in payload.get("cameras", {}).items():
-            uid = int(uid)
-            if uid in self.cameras:
-                self._apply_camera_state(self.cameras[uid], state)
-
-        for uid, state in payload.get("viewpoints", {}).items():
-            uid = int(uid)
-            if uid in self.viewpoints:
-                self._apply_camera_state(self.viewpoints[uid], state)
-
-        self.printer.print(f"Loaded final refine context from {context_path}", FontColor.MAPPER)
-        return True
-
+        # 转换并保存为BGR（修复：补全字符串和变量名）
+        flow_img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        return flow_img
+        
     def final_refine(self, prune=False, iters=26000):
         self.printer.print("Starting final refinement", FontColor.MAPPER)
 
@@ -3417,7 +1783,7 @@ class Mapper(object):
             if not (len(psnr_history) == len(ssim_history) == len(lpips_history) == len(iteration_history)):
                 print(f"⚠️ Warning: Metrics history length mismatch!")
                 print(f"   psnr: {len(psnr_history)}, ssim: {len(ssim_history)}, "
-                    f"lpips: {len(lpips_history)}, iteration: {len(iteration_history)}")
+                      f"lpips: {len(lpips_history)}, iteration: {len(iteration_history)}")
                 # 截断到最短长度
                 min_len = min(len(psnr_history), len(ssim_history), len(lpips_history), len(iteration_history))
                 psnr_history = psnr_history[:min_len]
@@ -3466,7 +1832,7 @@ class Mapper(object):
                 # 创建包含三个子图的图表
                 fig, axes = plt.subplots(3, 1, figsize=(12, 14))
         
-                # ========== 保存单独的PSNR曲线图 ==========
+                 # ========== 保存单独的PSNR曲线图 ==========
                 plt.figure(figsize=(12, 6))
                 plt.plot(iteration_history, psnr_history, 'b-', linewidth=2, marker='o', markersize=4)
                 plt.xlabel('Iteration', fontsize=12)
@@ -3507,7 +1873,7 @@ class Mapper(object):
                 with open(metrics_data_path, 'w', encoding='utf-8') as f:
                     f.write("Iteration\tPSNR(dB)\tSSIM\tLPIPS\n")
                     for iter_num, psnr_val, ssim_val, lpips_val in zip(iteration_history, psnr_history, ssim_history,
-                                                                    lpips_history):
+                                                                       lpips_history):
                         f.write(f"{iter_num}\t{psnr_val:.4f}\t{ssim_val:.4f}\t{lpips_val:.4f}\n")
         
                 # 保存统计摘要（添加编码）
@@ -3567,53 +1933,51 @@ class Mapper(object):
             print(f"⚠️ Warning: Insufficient metrics data collected (only {len(psnr_history)} samples)")
             print(f"   Note: Metrics are collected every 100 iterations, total iterations: {iters}")
 
-        if (
-            self.node_traj_final_vis
-            and self.dynamic_model
-            and self.gaussians.deform_init
-            and len(self.viewpoints) >= 2
-        ):
-            view_ids = sorted(self.viewpoints.keys())
-            traj_tag = "final_refine_full_sequence"
-            self._plot_window_dynamic_trajectory_2d_grid(
-                view_ids, True, refine_output_dir, traj_tag, allow_without_online_vis=True
-            )
-            self._plot_window_dynamic_trajectory_3d(
-                view_ids, True, refine_output_dir, traj_tag, allow_without_online_vis=True
-            )
-            if self.node_traj_gif:
-                valid_indices = [int(k) for k in view_ids if int(k) in self.viewpoints]
-                valid_indices = sorted(valid_indices)
-                view_seq = [self.viewpoints[k] for k in valid_indices]
-                payload = self._compute_dynamic_tracks_for_views(view_seq)
-                if payload is not None:
-                    node_plot_dir = os.path.join(refine_output_dir, "node_trajectory")
-                    self._save_node_traj_gif_2d_grid(
-                        payload, node_plot_dir, traj_tag, self.node_traj_gif_fps
-                    )
-                    self._save_node_traj_gif_3d(
-                        payload, node_plot_dir, traj_tag, self.node_traj_gif_fps
-                    )
-
         self.printer.print("Final refinement done", FontColor.MAPPER)
 
-    def visualize_flow(self, flow):
-        flow_uv = flow[..., :2].copy() * 5.0  # 放大5倍使弱运动可见
+    def get_loss_normal(self,depth_mean, viewpoint):
+        prior_normal = viewpoint.normal.cuda()
+        prior_normal = prior_normal.reshape(3, *depth_mean.shape[-2:]).permute(1, 2, 0)
+        prior_normal_normalized = torch.nn.functional.normalize(prior_normal, dim=-1)
 
-        # --- 运动方向与速度的HSV编码 ---
-        magnitude = np.linalg.norm(flow_uv, axis=-1)  # 速度幅值
-        angle = np.arctan2(flow_uv[..., 1], flow_uv[..., 0])  # 运动方向 [-π, π]
+        normal_mean, _ = self.depth_to_normal(viewpoint, depth_mean, world_frame=False)
+        normal_error = 1 - (prior_normal_normalized * normal_mean).sum(dim=-1)
+        normal_error[prior_normal.norm(dim=-1) < 0.2] = 0
+        return normal_error.mean()
 
-        # 构建HSV图像
-        hsv = np.zeros((flow_uv.shape[0], flow_uv.shape[1], 3), dtype=np.uint8)
-        hsv[..., 0] = (angle + np.pi) / (2 * np.pi) * 180  # 色相：方向[0°, 180°]
-        hsv[..., 1] = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)  # 饱和度：速度
-        hsv[..., 2] = 255  # 亮度：固定最大值
+    def depth_to_normal(self,view, depth, world_frame=False):
+        """
+            view: view camera
+            depth: depthmap
+        """
 
-        # 转换并保存为BGR（修复：补全字符串和变量名）
-        flow_img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        return flow_img
+        points = self.depths_to_points(view, depth, world_frame).reshape(*depth.shape[1:], 3)
+        normal_map = torch.zeros_like(points)
+        dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
+        dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
+        normal_map[1:-1, 1:-1, :] = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
 
+
+        return normal_map, points
+
+    def depths_to_points(self,view, depthmap, world_frame):
+        import math
+        W, H = view.image_width, view.image_height
+        fx = W / (2 * math.tan(view.FoVx / 2.))
+        fy = H / (2 * math.tan(view.FoVy / 2.))
+        intrins = torch.tensor([[fx, 0., W / 2.], [0., fy, H / 2.], [0., 0., 1.0]]).float().cuda()
+        grid_x, grid_y = torch.meshgrid(torch.arange(W, device='cuda').float() + 0.5,
+                                        torch.arange(H, device='cuda').float() + 0.5, indexing='xy')
+        points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3)
+        if world_frame:
+            c2w = (view.world_view_transform.T).inverse()
+            rays_d = points @ intrins.inverse().T @ c2w[:3, :3].T
+            rays_o = c2w[:3, 3]
+            points = depthmap.reshape(-1, 1) * rays_d + rays_o
+        else:
+            rays_d = points @ intrins.inverse().T
+            points = depthmap.reshape(-1, 1) * rays_d
+        return points
     def initialize(self, cur_frame_idx, viewpoint):
 
         self.initialized = True
@@ -3785,10 +2149,6 @@ class Mapper(object):
 
         return window, removed_frame
 
-    # ---------------------------------------------------------------------
-    # Section H: End-to-End Runtime Pipeline
-    # ---------------------------------------------------------------------
-
     def run(self,stream:BaseDataset):
         """
         Trigger mapping process, get estimated pose and depth from tracking process,
@@ -3821,6 +2181,7 @@ class Mapper(object):
         self.gt_w2c_all_frames = []
 
         init = True
+        print("init")
         # Define first frame pose
         _, color, _, first_frame_c2w,_,normal,mono,static_msk = self.frame_reader[0]
         intrinsics = as_intrinsics_matrix(self.frame_reader.get_intrinsic()).to(self.device)
@@ -3839,17 +2200,15 @@ class Mapper(object):
             is_finished = frame_info['end']
 
             if self.verbose:
-                # self.printer.print(f"\nMapping Frame {idx} ...", FontColor.MAPPER)
-                pass
+                self.printer.print(f"\nMapping Frame {idx} ...", FontColor.MAPPER)
 
             if is_finished:
-                self._plot_node_trajectory_full_sequence()
                 print("Done with Mapping and Tracking")
                 break
 
             if self.verbose:
                 print(Fore.GREEN)
-                # print("Mapping Frame ", idx)
+                print("Mapping Frame ", idx)
                 print(Style.RESET_ALL)
 
             self.keyframe_idxs.append(idx)
@@ -3941,9 +2300,9 @@ class Mapper(object):
             # keyframe selection
             last_keyframe_idx = self.current_window[0]
             if len(self.keyframe_idxs) >= 4:
-                last_idx=self.keyframe_idxs[-2]
+                 last_idx=self.keyframe_idxs[-2]
             else:
-                last_idx = 0
+                 last_idx = 0
             curr_visibility = (render_pkg["n_touched"] > 0).long()
 
             create_kf = self.is_keyframe(
@@ -3993,7 +2352,7 @@ class Mapper(object):
                 depth_gtd= depth_gtd.to(mono_depth.device)
 
                 depth_temp, w2c_temp, invalid = self.get_w2c_and_depth(keyframe_idx, frame_idx, mono_depth, motion_mask,
-                                                                    depth_gt_numpy,normal,mono, static_msk,init=False)
+                                                                       depth_gt_numpy,normal,mono, static_msk,init=False)
                 if keyframe_idx not in self.depth_dict and self.is_kf[keyframe_idx]:
                     self.depth_dict[keyframe_idx] = depth_temp
 
@@ -4018,10 +2377,10 @@ class Mapper(object):
                         if invalid:
                             # if the frame was invalid, we don't update the depth old and just do a rigid correction for this frame
                             self.update_mapping_points(keyframe_idx, w2c_temp, w2c_old, depth_temp,
-                                                    self.depth_dict[keyframe_idx], intrinsics, method="rigid")
+                                                       self.depth_dict[keyframe_idx], intrinsics, method="rigid")
                         else:
                             self.update_mapping_points(keyframe_idx, w2c_temp, w2c_old, depth_temp,
-                                                    self.depth_dict[keyframe_idx], intrinsics)
+                                                       self.depth_dict[keyframe_idx], intrinsics)
                             self.depth_dict[
                                 keyframe_idx] = depth_temp  # line does not matter since it is the last deformation anyway
 
@@ -4037,18 +2396,19 @@ class Mapper(object):
             opt_params = []
             frames_to_optimize = self.config["mapping"]["Training"]["pose_window"]
             iter_per_kf = self.mapping_itr_num
+            print("current_window",len(self.current_window))
             for cam_idx in range(len(self.current_window)):
-                viewpoint = self.viewpoints[self.current_window[cam_idx]]
-                if self._is_reference_viewpoint(viewpoint):
-                    # Do not add anchor frame pose for optimization
+                if self.current_window[cam_idx] == 0:
+                    # Do not add GT frame pose for optimization
                     continue
+                viewpoint = self.viewpoints[self.current_window[cam_idx]]
                 #if not self.gt_camera and self.config["mapping"]["BA"]:
                 if cam_idx < frames_to_optimize:
                     opt_params.append(
                         {
                             "params": [viewpoint.cam_rot_delta],
                             "lr": self.config["mapping"]["Training"]["lr"]["cam_rot_delta"]
-                                * 0.5,
+                                  * 0.5,
                             "name": "rot_{}".format(viewpoint.uid),
                         }
                     )
@@ -4056,46 +2416,45 @@ class Mapper(object):
                         {
                             "params": [viewpoint.cam_trans_delta],
                             "lr": self.config["mapping"]["Training"]["lr"][
-                                    "cam_trans_delta"
-                                ]
-                                * 0.5,
+                                      "cam_trans_delta"
+                                  ]
+                                  * 0.5,
                             "name": "trans_{}".format(viewpoint.uid),
                         }
                     )
 
-                if not self._is_reference_viewpoint(viewpoint):
-                    opt_params.append(
-                        {
-                            "params": [viewpoint.exposure_a],
-                            "lr": 0.01,
-                            "name": "exposure_a_{}".format(viewpoint.uid),
-                        }
-                    )
-                    opt_params.append(
-                        {
-                            "params": [viewpoint.exposure_b],
-                            "lr": 0.01,
-                            "name": "exposure_b_{}".format(viewpoint.uid),
-                        }
-                    )
+                opt_params.append(
+                    {
+                        "params": [viewpoint.exposure_a],
+                        "lr": 0.01,
+                        "name": "exposure_a_{}".format(viewpoint.uid),
+                    }
+                )
+                opt_params.append(
+                    {
+                        "params": [viewpoint.exposure_b],
+                        "lr": 0.01,
+                        "name": "exposure_b_{}".format(viewpoint.uid),
+                    }
+                )
             self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
             dynamic_enabled = self.config["mapping"]["model_params"].get("dynamic_model", False)
 
             self.map(stream=stream,
-                    idx1=idx,
-                    current_window=self.current_window,
-                    iters=400,
-                    dynamic_network=dynamic_enabled,
-                    prune=False
-                    )
+                     idx1=idx,
+                     current_window=self.current_window,
+                     iters=400,
+                     dynamic_network=dynamic_enabled,
+                     prune=False
+                     )
             #self.map_static(current_window=self.current_window, iters=50,idx1=idx)  # 静态地图优化
             self.map(stream=stream,
-                    idx1=idx,
-                    current_window=self.current_window,
-                    prune=True,
-                    dynamic_network=dynamic_enabled
-                    )
+                     idx1=idx,
+                     current_window=self.current_window,
+                     prune=True,
+                     dynamic_network=dynamic_enabled
+                     )
 
             del render_pkg, depth, w2c, depth_temp, w2c_temp
 
@@ -4107,6 +2466,69 @@ class Mapper(object):
 
         if cur_frame_idx % 1 == 0:
             torch.cuda.empty_cache()
+    def initialize_network(self, cur_frame_idx, viewpoint, update_gaussians=False):
+        if cur_frame_idx == self.dystart:
+            inited = self.gaussians.create_node_from_depth(viewpoint, self.opt_params, self.sc_params)
+            if not inited:
+                return
+        # self.gaussians.deform.deform.init(opt=self.opt_params, init_pcl=self.gaussians.get_xyz, keep_all=True, force_init=True, reset_bbox=False)
+        # self.gaussians.deform.train_setting(self.sc_params)
+
+        time_input = self.gaussians.deform.deform.expand_time(viewpoint.fid)
+        for mapping_iteration in range(100):
+            d_values = self.gaussians.deform.step(self.gaussians.get_dygs_xyz.detach(), time_input,
+                                                  iteration=0, feature=None,
+                                                  motion_mask=self.gaussians.motion_mask,
+                                                  camera_center=viewpoint.camera_center,
+                                                  time_interval=self.gaussians.time_interval)  # , detach_node=False)
+            dxyz = d_values['d_xyz']
+            #print("dxyz",dxyz)
+            # d_rot, d_scale = 0., 0.
+            d_rot, d_scale = d_values['d_rotation'], d_values['d_scaling']
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background, dynamic=False, dx=dxyz, ds=d_scale,dr=d_rot
+
+            )
+            (
+                image,
+                viewspace_point_tensor,
+                visibility_filter,
+                radii,
+                depth,
+                opacity,
+                n_touched,
+            ) = (
+                render_pkg["render"],
+                render_pkg["viewspace_points"],
+                render_pkg["visibility_filter"],
+                render_pkg["radii"],
+                render_pkg["depth"],
+                render_pkg["opacity"],
+                render_pkg["n_touched"],
+            )
+
+            loss_init = get_loss_mapping(
+                self.config["mapping"], image, depth, viewpoint, opacity, initialization=True
+            )
+            # loss_init += self.gaussians.deform.reg_loss
+
+            # scaling = self.gaussians.get_scaling
+            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+            # loss_init += 10 * isotropic_loss.mean()
+
+            loss_init.backward()
+
+            with torch.no_grad():
+                self.gaussians.deform.optimizer.step()
+                self.gaussians.deform.optimizer.zero_grad(set_to_none=True)
+                if update_gaussians:
+                    self.gaussians.optimizer.step()
+                    self.gaussians.optimizer.zero_grad(set_to_none=True)
+                else:
+                    self.gaussians.optimizer.zero_grad(set_to_none=True)
+        vis_render_process(self.gaussians, self.pipeline_params, self.background, viewpoint,
+                           viewpoint.uid, self.save_dir, out_dir="init_network", mask=None, dynamic=True)
+                           
     def lncc(self,ref, nea):
         # ref_gray: [batch_size, total_patch_size]
         # nea_grays: [batch_size, total_patch_size]
@@ -4156,11 +2578,6 @@ class Mapper(object):
     def patch_offsets(self,h_patch_size, device):
         offsets = torch.arange(-h_patch_size, h_patch_size + 1, device=device)
         return torch.stack(torch.meshgrid(offsets, offsets, indexing='xy')[::-1], dim=-1).view(1, -1, 2)
-
-    # ---------------------------------------------------------------------
-    # Section I: Multi-View Geometric/NCC Consistency Loss
-    # ---------------------------------------------------------------------
-
     def compute_multi_view_loss(self, viewpoint_cam, render_pkg, gaussians, pipe, bg, dxyz, d_scale, d_rot, d_opac,
                                 d_color,
                                 nearest_cam):
@@ -4180,7 +2597,7 @@ class Mapper(object):
         gt_image, gt_image_gray = viewpoint_cam.get_image()
         # 初始化损失
         total_loss = 0.0
-    
+
         try:
             ## 计算几何一致性掩码和损失
             # 检查是否有动态掩码，如果两个视角都没有动态掩码，则跳过多视角损失计算
@@ -4216,7 +2633,7 @@ class Mapper(object):
             # 投影到图像平面
             pts_projections = torch.stack(
                 [pts_in_view_cam[:, 0] * viewpoint_cam.fx / pts_in_view_cam[:, 2] + viewpoint_cam.cx,
-                pts_in_view_cam[:, 1] * viewpoint_cam.fy / pts_in_view_cam[:, 2] + viewpoint_cam.cy], -1).float()
+                 pts_in_view_cam[:, 1] * viewpoint_cam.fy / pts_in_view_cam[:, 2] + viewpoint_cam.cy], -1).float()
 
             # 计算像素噪声和权重
             pixel_noise = torch.norm(pts_projections - pixels.reshape(*pts_projections.shape), dim=-1)
@@ -4489,8 +2906,8 @@ class Mapper(object):
 
     
     def _compute_ncc_loss(self, viewpoint_cam, nearest_cam, render_pkg, gt_image_gray,pixel_noise,
-                        d_mask, weights, pixels, patch_size, sample_num, total_patch_size,
-                        ncc_weight):
+                          d_mask, weights, pixels, patch_size, sample_num, total_patch_size,
+                          ncc_weight):
         """
         计算 NCC 损失（内部辅助函数）
         """
@@ -4499,6 +2916,7 @@ class Mapper(object):
             loss = 0.0
             geo_loss = 0.03 * ((weights * pixel_noise)[d_mask]).mean()
             loss += geo_loss
+            print("geo",geo_loss)
             with torch.no_grad():
                 ## 采样掩码（纯GPU操作，避免同步）
                 d_mask = d_mask.reshape(-1)
@@ -4522,28 +2940,26 @@ class Mapper(object):
                 pixels_patch[:, :, 0] = 2 * pixels_patch[:, :, 0] / (W - 1) - 1.0
                 pixels_patch[:, :, 1] = 2 * pixels_patch[:, :, 1] / (H - 1) - 1.0
                 ref_gray_val = F.grid_sample(gt_image_gray.unsqueeze(1), pixels_patch.view(1, -1, 1, 2),
-                                            align_corners=True)
+                                             align_corners=True)
                 ref_gray_val = ref_gray_val.reshape(-1, total_patch_size)
                 ref_to_neareast_r = nearest_cam.R_gt.transpose(-1, -2) @ viewpoint_cam.R_gt
                 ref_to_neareast_t = -ref_to_neareast_r @ viewpoint_cam.T_gt + nearest_cam.T_gt
             ## 计算单应性矩阵
-            # normal_mean, _ = self.depth_to_normal(viewpoint_cam, render_pkg['depth'], world_frame=False)
-            normal_mean = viewpoint_cam.normal.squeeze(0).permute(1, 2, 0)
-            # normal_mean, _ = self.depth_to_normal(viewpoint_cam, viewpoint_cam.depth.to("cuda").unsqueeze(0), world_frame=False)
+            normal_mean, _ = self.depth_to_normal(viewpoint_cam, render_pkg["depth"], world_frame=False)
             ref_local_n = normal_mean.permute(1, 2, 0)
             ref_local_n = ref_local_n.reshape(-1, 3)[valid_indices]
             ix, iy = torch.meshgrid(
                 torch.arange(W), torch.arange(H), indexing='xy')
             rays_d = torch.stack(
                 [(ix - viewpoint_cam.cx / 1) / viewpoint_cam.fx * 1,
-                (iy - viewpoint_cam.cy / 1) / viewpoint_cam.fy * 1,
-                torch.ones_like(ix)], -1).float().cuda()
+                 (iy - viewpoint_cam.cy / 1) / viewpoint_cam.fy * 1,
+                 torch.ones_like(ix)], -1).float().cuda()
             ref_local_d = render_pkg["depth"] / rays_d[..., 2]
             ref_local_d = ref_local_d.reshape(-1)[valid_indices]
 
             H_ref_to_neareast = ref_to_neareast_r[None] - \
                                 torch.matmul(ref_to_neareast_t[None, :, None].expand(ref_local_d.shape[0], 3, 1),
-                                            ref_local_n[:, :, None].expand(ref_local_d.shape[0], 3, 1).permute(0, 2,
+                                             ref_local_n[:, :, None].expand(ref_local_d.shape[0], 3, 1).permute(0, 2,
                                                                                                                 1)) / \
                                 ref_local_d[..., None, None]
             H_ref_to_neareast = torch.matmul(
@@ -4567,6 +2983,7 @@ class Mapper(object):
             # 使用 torch.any 避免同步
             if torch.any(mask):
                 ncc_loss = ncc_weight * ncc.mean()
+                print("ncc",ncc_loss)
                 loss += ncc_loss
                 return loss
             else:

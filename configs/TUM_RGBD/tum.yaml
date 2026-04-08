@@ -42,6 +42,6 @@ cam:  #NOTE: intrinsic is different per scene in TUM
 
 data:
   dataset_root: /mnt/data/dataset_archive/zhaoyong/BONN
-  output: output/TUM_RGBD
+  output: output/experiments
   # 设为 true 时使用 Depth Anything 预测深度替代真值深度（优先 output/scene/mono_priors/depths/*.npy，否则 depth_npy/*.npy）
   use_depth_anything: True

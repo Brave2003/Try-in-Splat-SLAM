@@ -79,7 +79,7 @@ class Tracker:
                 self.kf_timestamps.append(i)
                 self.kf_video_idxs.append(curr_kf_idx)
                 enable_mask = self.cfg.get("enable_dynamic_mask_detection", False)
-                if enable_mask and len(self.kf_timestamps) >= 2:
+                if enable_mask and len(self.kf_timestamps) >= 2 and self.only_tracking:
                     # 保证关键帧区间内帧数 >= min_frames，且不遗漏区间：取“最靠后的”start_i 使区间仍>=6 帧，即最小窗口覆盖
                     min_frames_in_interval = 10
                     last_ts = self.kf_timestamps[-1]

@@ -1,0 +1,351 @@
+
+    def get_w2c_and_depth(self, video_idx, idx, mono_depth,motion_mask, depth_gt,normal,mono, static_mask,print_info=False, init=False):
+
+
+        est_droid_depth, valid_depth_mask, c2w = self.video.get_depth_and_pose(video_idx, self.device)
+
+        c2w = c2w.to(self.device)
+        w2c = torch.linalg.inv(c2w)
+
+        if print_info:
+            print(f"valid depth number: {valid_depth_mask.sum().item()}, "
+                f"valid depth ratio: {(valid_depth_mask.sum() / (valid_depth_mask.shape[0] * valid_depth_mask.shape[1])).item()}")
+
+        mono_depth_wq = mono_depth
+
+        if valid_depth_mask.sum() < 100:
+            invalid = True
+            print(
+                f"Skip mapping frame {idx} at video idx {video_idx} because of not enough valid depth ({valid_depth_mask.sum()}).")
+        else:
+
+            invalid = False
+            est_droid_depth[~valid_depth_mask] = 0
+
+            mono_valid_mask = mono_depth < (mono_depth.mean() * 3)
+            mono_depth[mono_depth > 3 * mono_depth.mean()] = 0
+
+
+            from scipy.ndimage import binary_erosion
+            mono_depth = mono_depth.cpu().numpy()
+            binary_image = (mono_depth > 0).astype(int)
+            iterations=5
+            padded_binary_image = np.pad(binary_image, pad_width=iterations, mode='constant', constant_values=1)
+            structure = np.ones((3, 3), dtype=int) 
+
+    
+            eroded_padded_image = binary_erosion(padded_binary_image,
+                                                structure=structure,
+                                                iterations=iterations)
+            eroded_image = eroded_padded_image[iterations:-iterations, iterations:-iterations]
+
+
+            mono_depth[eroded_image == 0] = 0
+    
+            if (mono_depth == 0).sum() > 0:
+    
+                mono_depth = torch.from_numpy(
+                    cv2.inpaint(mono_depth,
+                                (mono_depth == 0).astype(np.uint8),
+                                inpaintRadius=3,  
+                                flags=cv2.INPAINT_NS) 
+                ).to(self.device)
+            else:
+                mono_depth = torch.from_numpy(mono_depth).to(self.device)
+            normal = normal.cpu().numpy()
+            depth_gt = torch.from_numpy(depth_gt).to(self.device)
+
+
+            if video_idx == self.dystart and len(self.first_d) == 0:
+                self.first_d.append(motion_mask)
+            if len(self.first_d) == 0:
+                print("[Warning] self.first_d is empty, fallback to motion_mask. This may indicate a logic bug.")
+                refer_mask = motion_mask
+            else:
+                refer_mask = self.first_d[0]
+
+            intrinsics = self.frame_reader.get_intrinsic()
+            if torch.is_tensor(intrinsics):
+                intrinsics = intrinsics.detach().cpu().tolist()
+            fx, fy = float(intrinsics[0]), float(intrinsics[1])
+
+            self.obtain_allimgs_st(mono_depth, normal, self.st_predicted, video_idx, fx, fy)
+            invalid = 0
+            # 与 before_modify 一致：覆盖 running mean，供 align_all_frames 在 s/t 异常时回退
+            self.st_predicted["mean_s"] = 0.8
+            self.st_predicted["mean_t"] = 0.15
+
+            self.static_msk = motion_mask*refer_mask
+            self.align_all_frames(mono_depth, video_idx, self.st_predicted, self.new_scale_alignFrame0, self.static_msk)
+            mono_depth = self.export_scaled_pcd(self.st_predicted, self.new_scale_alignFrame0, mono_depth, video_idx,
+                                                mean_st=False )
+            mono_depth_wq = mono_depth
+            torch.cuda.empty_cache()
+        return mono_depth_wq, w2c, invalid
+    
+     def obtain_allimgs_st(self,depth, normal, st_dict, video_idx,self_define_focal_x: float,self_define_focal_y: float):
+        depth_torch = depth.detach().to("cpu")
+        normal_torch = torch.from_numpy(normal) if isinstance(normal, np.ndarray) else normal.detach().to("cpu")
+        video_idx = int(video_idx)
+
+        if video_idx not in st_dict:
+            s, t = self.optimize_st(depth_torch, normal_torch, self_define_focal_x, self_define_focal_y)
+            st_dict[video_idx] = {"scale": float(s), "shift": float(t)}
+
+        self._update_st_running_mean()
+
+    def _update_st_running_mean(self):
+        scales = []
+        shifts = []
+        for k, v in self.st_predicted.items():
+            if not isinstance(k, int) or not isinstance(v, dict):
+                continue
+
+            s = v.get("scale", None)
+            t = v.get("shift", None)
+            if s is None or t is None:
+                continue
+
+            s = float(s)
+            t = float(t)
+            if np.isfinite(s) and np.isfinite(t):
+                scales.append(s)
+                shifts.append(t)
+
+        if len(scales) > 0:
+            self.st_predicted["mean_s"] = float(np.mean(scales))
+            self.st_predicted["mean_t"] = float(np.mean(shifts))
+
+    def align_all_frames(self,depth, video_id,st_predicted, new_scale_alignFrame0: dict, static_msk):
+        # depth_dirs = glob(os.path.join(base_dir,'GeoWizardOut/depth_npy/*.npy'))
+        ref_kf = self.dystart
+        if video_id == ref_kf and len(self.list) == 0:
+            self.list.append(depth.detach().clone())
+        if len(self.list) == 0:
+            new_scale_alignFrame0[video_id] = 1.0
+            return new_scale_alignFrame0
+        reference_depth = self.list[0] 
+        reference_depth = reference_depth.to(depth.device)
+        # masked_reference_depth = reference_depth
+        reference_s = float(st_predicted[ref_kf]["scale"])
+        if st_predicted[ref_kf]["shift"] < 0:
+            reference_t = -1.1 * float(st_predicted[ref_kf]["shift"])  # 0.9
+        else:
+            reference_t = float(st_predicted[ref_kf]["shift"])
+
+        scaled_refer_depth_nomsk = reference_s * reference_depth + reference_t
+        h, w = scaled_refer_depth_nomsk.shape
+        resized_static_msk = F.interpolate(
+            static_msk.to(depth.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0),
+            size=(h, w),
+            mode="nearest",
+        ).squeeze(0).squeeze(0) > 0.5
+
+        scaled_refer_depth = scaled_refer_depth_nomsk[resized_static_msk]
+        del reference_t,reference_s
+        Y = scaled_refer_depth
+
+        depth = depth
+        cur_s = float(st_predicted[video_id]["scale"])
+
+        if self.longer:
+            cur_t = max(float(st_predicted[video_id]["shift"]),0)
+        else:
+            if st_predicted[video_id]["shift"] < 0:
+                cur_t = -float(st_predicted[video_id]["shift"])
+            else:
+                cur_t = float(st_predicted[video_id]["shift"])
+        if np.isnan(cur_s) or np.isnan(cur_t):
+            cur_s = float(st_predicted["mean_s"])
+            cur_t = float(st_predicted["mean_t"])
+
+        cur_masked_depth = depth[resized_static_msk]
+        scaled_cur_depth = cur_masked_depth * cur_s + 0
+
+        if scaled_cur_depth.numel() == 0 or Y.numel() == 0:
+            new_scale_alignFrame0[video_id] = 1.0
+        else:
+            # Faster and equivalent to single-variable least squares: argmin_a ||a*A - Y||_2^2
+            denom = torch.dot(scaled_cur_depth, scaled_cur_depth)
+            if torch.abs(denom) < 1e-12:
+                solved_scale = 1.0
+            else:
+                solved_scale = (torch.dot(scaled_cur_depth, Y) / denom).item()
+
+            if solved_scale == 0:
+                new_scale_alignFrame0[video_id] = 1.0
+            else:
+                new_scale_alignFrame0[video_id] = solved_scale
+
+            previous_value = new_scale_alignFrame0.get(ref_kf, None)
+
+            if previous_value is not None and self.longer:
+
+                current_value = new_scale_alignFrame0[video_id]
+
+                if current_value is None or current_value > previous_value*self.s or current_value*self.s<previous_value :
+                    new_scale_alignFrame0[video_id] = previous_value
+        # print("S,T,align_scale:", cur_s, cur_t, new_scale_alignFrame0[video_id])
+        del cur_s,cur_t
+        return new_scale_alignFrame0
+
+    def export_scaled_pcd(self,st_predicted, new_scale_alignFrame0, depth, video_id,mean_st=False, ):
+
+        # import open3d as o3d
+
+        if mean_st:
+            s = st_predicted["mean_s"]
+            t = st_predicted["mean_t"]
+        else:
+            s = st_predicted[video_id]["scale"]
+
+            if st_predicted[video_id]["shift"] < 0:
+                t = -self.shift*st_predicted[video_id]["shift"]#0.6
+            else:
+                t = st_predicted[video_id]["shift"]
+            #t = max(st_predicted[video_id]["shift"], 0)
+        depth = depth * s+t
+        if video_id in new_scale_alignFrame0:
+            depth = depth * new_scale_alignFrame0[video_id]
+        return depth
+    
+    def init_image_coor(self,height, width):
+        cache_key = (height, width, str(self.device))
+        if cache_key in self._image_coord_cache:
+            return self._image_coord_cache[cache_key]
+
+        x_row = torch.arange(width, dtype=torch.float32, device=self.device)
+        y_col = torch.arange(height, dtype=torch.float32, device=self.device)
+        x = x_row.repeat(height, 1).unsqueeze(0)
+        y = y_col.view(height, 1).repeat(1, width).unsqueeze(0)
+        u_u0 = x - width / 2.0
+        v_v0 = y - height / 2.0
+        self._image_coord_cache[cache_key] = (u_u0, v_v0)
+        return u_u0, v_v0
+    
+    def depth_to_xyz(self,depth, focal_x,focal_y):
+        b, c, h, w = depth.shape
+        u_u0, v_v0 = self.init_image_coor(h, w)
+        x = u_u0 * depth / focal_x
+        y = v_v0 * depth / focal_y
+        z = depth
+        pw = torch.cat([x, y, z], 1).permute(0, 2, 3, 1)  # [b, h, w, c]
+        # print(pw.shape)
+        return pw
+    def optimize_st(
+        self,
+        depth_torch,
+        normal_torch,
+        self_defined_focal_x: float,
+        self_defined_focal_y: float,
+    ):
+        start_time = time.perf_counter()
+        input_depth = depth_torch.to(self.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        gt_normal = normal_torch.to(self.device, dtype=torch.float32)
+
+        if gt_normal.shape[-2:] != input_depth.shape[-2:]:
+            gt_normal = F.interpolate(gt_normal, size=input_depth.shape[-2:], mode="nearest")
+        gt_normal = F.normalize(gt_normal, dim=1)
+
+        focal_x = torch.tensor([self_defined_focal_x], dtype=torch.float32, device=self.device)
+        focal_y = torch.tensor([self_defined_focal_y], dtype=torch.float32, device=self.device)
+        
+        s = nn.Parameter(torch.tensor([float(1.0)], dtype=torch.float32, device=self.device))
+        t = nn.Parameter(torch.tensor([float(0.0)], dtype=torch.float32, device=self.device))
+
+        optimizer = torch.optim.Adam([
+            {'params': s, 'lr': 1e-3},
+            # {'params': t, 'lr': 1e-3},
+        ])
+        last_step_loss = 100000.
+        for step in range(500):
+            optimizer.zero_grad(set_to_none=True)
+            scaled_depth = s * input_depth + 1.0
+            # depth = s*input_depth+t
+            depth_filter = nn.functional.avg_pool2d(scaled_depth, kernel_size=3, stride=1, padding=1)
+            depth_filter = nn.functional.avg_pool2d(depth_filter, kernel_size=3, stride=1, padding=1)
+            xyz = self.depth_to_xyz(depth_filter, focal_x,focal_y)
+            xyz_i = xyz[0, :][None, :, :, :]
+            pre_normal = self.get_surface_normalv2(xyz_i).permute((3, 2, 0, 1))
+            
+            similarity = torch.nn.functional.cosine_similarity(pre_normal, gt_normal, dim=1)
+            loss_map = 1 - similarity
+      
+            loss_normal = torch.nanmean(loss_map)
+
+            # last_s_tensor = torch.tensor([float(self.last_s)], dtype=torch.float32, device=self.device)
+            # last_t_tensor = torch.tensor([float(self.last_t)], dtype=torch.float32, device=self.device)
+            # loss_temp = torch.dist(s, last_s_tensor) + torch.dist(t, last_t_tensor)
+            loss = loss_normal
+            # loss = loss_normal
+
+            loss.backward()
+            optimizer.step()
+            if step % 40 == 0:
+                if abs(loss.item() - last_step_loss) < 1e-5:
+                    break
+                last_step_loss = loss.item()
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        print(
+            "[optimize_st][Optimized] "
+            f"s={s.item():.6f}, t={1.0:.6f}, loss={loss.item():.6f}, step={step}, time={elapsed_ms:.2f}ms"
+        )
+        return s.item(), 1.0
+
+    def get_surface_normalv2(self, xyz, patch_size=3):
+        """
+        优化后的法向量计算：去除了所有阻碍 backward() 速度的操作
+        """
+        eps = 1e-8
+        b, h, w, c = xyz.shape
+        half_patch = patch_size // 2
+        
+        # 【核心优化 1】：用 F.pad 替代 torch.zeros 和切片赋值。
+        # 这是一个零拷贝（Zero-copy）级别的操作，大幅减少显存分配开销和建图时间。
+        # Pad 的顺序是从后向前：先 Pad 最后一维 C(不 pad)，再 pad W，再 pad H。
+        xyz_pad = F.pad(xyz, (0, 0, half_patch, half_patch, half_patch, half_patch), mode='constant', value=0.0)
+
+        xyz_left = xyz_pad[:, half_patch:half_patch + h, :w, :]  
+        xyz_right = xyz_pad[:, half_patch:half_patch + h, -w:, :]  
+        xyz_top = xyz_pad[:, :h, half_patch:half_patch + w, :]  
+        xyz_bottom = xyz_pad[:, -h:, half_patch:half_patch + w, :]  
+        xyz_horizon = xyz_left - xyz_right  
+        xyz_vertical = xyz_top - xyz_bottom  
+
+        xyz_left_in = xyz_pad[:, half_patch:half_patch + h, 1:w + 1, :]  
+        xyz_right_in = xyz_pad[:, half_patch:half_patch + h, patch_size - 1:patch_size - 1 + w, :]  
+        xyz_top_in = xyz_pad[:, 1:h + 1, half_patch:half_patch + w, :]  
+        xyz_bottom_in = xyz_pad[:, patch_size - 1:patch_size - 1 + h, half_patch:half_patch + w, :]  
+        xyz_horizon_in = xyz_left_in - xyz_right_in  
+        xyz_vertical_in = xyz_top_in - xyz_bottom_in  
+
+        n_img_1 = torch.cross(xyz_horizon_in, xyz_vertical_in, dim=3)
+        n_img_2 = torch.cross(xyz_horizon, xyz_vertical, dim=3)
+
+        # 【核心优化 2】：彻底消灭布尔掩码 (orient_mask = ... -> tensor[mask] *= -1)
+        # 利用数学符号函数 torch.sign() 实现纯张量乘法，绕过低效的掩码求导。
+        # 如果内积 > 0，sign=1，乘 -1 翻转；如果内积 < 0，sign=-1，乘 -1 保持原样不变。
+        dot_1 = torch.sum(n_img_1 * xyz, dim=3, keepdim=True)
+        n_img_1 = n_img_1 * -torch.sign(dot_1 + eps)
+        
+        dot_2 = torch.sum(n_img_2 * xyz, dim=3, keepdim=True)
+        n_img_2 = n_img_2 * -torch.sign(dot_2 + eps)
+
+        n_img1_L2 = torch.sqrt(torch.sum(n_img_1 ** 2, dim=3, keepdim=True) + eps)
+        n_img1_norm = n_img_1 / (n_img1_L2 + eps)
+
+        n_img2_L2 = torch.sqrt(torch.sum(n_img_2 ** 2, dim=3, keepdim=True) + eps)
+        n_img2_norm = n_img_2 / (n_img2_L2 + eps)
+
+        n_img_aver = n_img1_norm + n_img2_norm
+        n_img_aver_L2 = torch.sqrt(torch.sum(n_img_aver ** 2, dim=3, keepdim=True) + eps)
+        n_img_aver_norm = n_img_aver / (n_img_aver_L2 + eps)
+        
+        # 同样干掉最后一处掩码
+        dot_aver = torch.sum(n_img_aver_norm * xyz, dim=3, keepdim=True)
+        n_img_aver_norm = n_img_aver_norm * -torch.sign(dot_aver + eps)
+        
+        n_img_aver_norm_out = n_img_aver_norm.permute((1, 2, 3, 0))  
+
+        return n_img_aver_norm_out

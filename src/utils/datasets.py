@@ -636,63 +636,23 @@ class BaseDataset(Dataset):
         if normal_input is None and self.normal_paths:
             try:
                 normal_path = self.normal_paths[index]
-                if normal_path is not None and os.path.isfile(normal_path):
-                    normal_data = np.load(normal_path).astype(np.float32)
+                normal_data= np.load(normal_path)
+                normal_data = cv2.cvtColor(normal_data, cv2.COLOR_BGR2RGB)
+                normal_data = cv2.resize(normal_data, (self.W_out_with_edge, self.H_out_with_edge))
+                normal_data= torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
+                normal_data=normal_data.unsqueeze(dim=0)
+                if self.W_edge > 0:
+                    edge = self.W_edge
+                    normal_data = normal_data[:, :, :, edge:-edge]
 
-                    # Convert CHW to HWC when needed.
-                    if (
-                        normal_data.ndim == 3
-                        and normal_data.shape[0] == 3
-                        and normal_data.shape[-1] != 3
-                    ):
-                        normal_data = np.transpose(normal_data, (1, 2, 0))
-                    if normal_data.ndim != 3 or normal_data.shape[2] != 3:
-                        raise ValueError(f"Unexpected normal shape: {normal_data.shape}")
+                if self.H_edge > 0:
+                    edge = self.H_edge
+                    normal_data = normal_data[:,  :,edge:-edge, :]
+                #normal_input  = torch.from_numpy(normal_data).float().permute(2, 0, 1) / 255.0
 
-                    # Keep previous behavior of BGR->RGB channel order conversion.
-                    normal_data = normal_data[..., ::-1].copy()
-                    normal_data = cv2.resize(
-                        normal_data,
-                        (self.W_out_with_edge, self.H_out_with_edge),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-
-                    # Auto decode normal map range.
-                    normal_min = float(normal_data.min())
-                    normal_max = float(normal_data.max())
-                    if normal_min >= 0.0 and normal_max > 1.5:
-                        # [0, 255] -> [-1, 1]
-                        normal_data = normal_data / 127.5 - 1.0
-                    elif normal_min >= 0.0 and normal_max <= 1.5:
-                        # [0, 1] -> [-1, 1]
-                        normal_data = normal_data * 2.0 - 1.0
-                    # Else assume already in [-1, 1].
-
-                    # Re-normalize vectors after resize / decoding.
-                    normal_norm = np.linalg.norm(normal_data, axis=2, keepdims=True)
-                    normal_data = np.where(
-                        normal_norm > 1e-6,
-                        normal_data / np.clip(normal_norm, 1e-6, None),
-                        0.0,
-                    )
-
-                    normal_data = (
-                        torch.from_numpy(normal_data)
-                        .float()
-                        .permute(2, 0, 1)
-                        .unsqueeze(dim=0)
-                    )
-                    # 对齐深度计算的法向量
-                    normal_data = -normal_data[:, [2, 1, 0], :, :]
-                    if self.W_edge > 0:
-                        edge = self.W_edge
-                        normal_data = normal_data[:, :, :, edge:-edge]
-
-                    if self.H_edge > 0:
-                        edge = self.H_edge
-                        normal_data = normal_data[:, :, edge:-edge, :]
-
-                    normal_input = normal_data
+                # 将normal值从[0,1]映射到[-1,1]
+                normal_input  = normal_data * 2.0 - 1.0
+                print("norm",normal_input.shape)
             except Exception as e:
                 print(f"Failed to load normal map: {e}")
 

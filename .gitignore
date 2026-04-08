@@ -63,3 +63,5 @@ datasets/
 *.png
 *.mp4
 plot_flow_motion.py
+
+SC-SLAM/

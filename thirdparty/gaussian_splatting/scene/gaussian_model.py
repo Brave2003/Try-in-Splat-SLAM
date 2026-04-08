@@ -288,7 +288,7 @@ class GaussianModel:
         rots[:, 0] = 1
         # 小改动：若 viewpoint 有预计算的法向图，将世界点投影到图像采样法向，仅用其初始化旋转以加速法向收敛
         normal_map = getattr(cam, "normal", None)
-        if normal_map is not None:
+        if normal_map is not None and self.config["mapping"].get("use_normal", False):
             normal_map = normal_map.squeeze(0)
             R_w2c = (
                 cam.R
@@ -414,14 +414,19 @@ class GaussianModel:
                 reset_bbox=False,
             )
 
-            fused_point_cloud[:, 2] += 0.2
             self.deform.train_setting(sc_params)
-            self.deform.extend_node_from_point(
-                init_pcl=fused_point_cloud,
-                keep_all=True,
-                force_init=True,
-                reset_bbox=False,
+            node_init_world_z_offset = float(
+                self.config.get("mapping", {}).get("node_init_world_z_offset", 0.2)
             )
+            if abs(node_init_world_z_offset) > 1e-8:
+                shifted_point_cloud = fused_point_cloud.clone()
+                shifted_point_cloud[:, 2] += node_init_world_z_offset
+                self.deform.extend_node_from_point(
+                    init_pcl=shifted_point_cloud,
+                    keep_all=True,
+                    force_init=True,
+                    reset_bbox=False,
+                )
             self.deform_init = True
             # print("deform_init: ", self.deform_init)
             return True
@@ -1068,6 +1073,7 @@ class GaussianModel:
             prune_mask = torch.logical_or(
                 torch.logical_or(prune_mask, big_points_vs), big_points_ws
             )
+
         self.prune_points(prune_mask)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):

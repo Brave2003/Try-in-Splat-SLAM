@@ -151,6 +151,7 @@ python -c "import torch; import lietorch; import simple_knn; import diff_gaussia
 ```bash
 python -m pip install -e .
 pip install "torch-scatter==2.0.9" --no-build-isolation
+pip install git+https://github.com/KinglittleQ/torch-batch-svd.git --no-build-isolation
 python -m pip install -r requirements.txt
 python -m pip install pytorch-lightning==1.9 --no-deps
 pip install lightning-utilities==0.4.2
@@ -163,6 +164,7 @@ pip install "git+https://github.com/facebookresearch/pytorch3d.git"  --no-build-
 # 在项目根目录执行，将下载 droid / depth_anything_v2_vitl / yolo11l-seg / sam2.1_hiera_base_plus / raft-things（光流）
 bash scripts/download_pretrained.sh
 ```
+> DSINE 法向模型请手动下载后放到 `pretrained/dsine.pt`（下载来源见 `thirdparty/DSINE/README.md` 中 checkpoints 链接）。
 <details>
   <summary>[Directory structure of pretrained (click to expand)]</summary>
   
@@ -174,13 +176,14 @@ bash scripts/download_pretrained.sh
         ├── depth_anything_v2_vitl.pth
         ├── yolo11l-seg.pt
         ├── sam2.1_hiera_base_plus.pt
-        └── raft-things.pth
+        ├── raft-things.pth
+        └── dsine.pt
 ```
 </details>
 
 ## Data Download
 ### 预训练模型（已由上面脚本覆盖）
-若需手动下载：depth_anything_v2_vitl、yolo11l-seg、sam2.1_hiera_base_plus、droid、raft-things 均放入 `pretrained/`，参见 `scripts/download_pretrained.sh` 中的 URL。
+若需手动下载：depth_anything_v2_vitl、yolo11l-seg、sam2.1_hiera_base_plus、droid、raft-things、dsine 均放入 `pretrained/`。其中前五者参见 `scripts/download_pretrained.sh`，DSINE 请按 `thirdparty/DSINE/README.md` 下载并重命名为 `pretrained/dsine.pt`。
 If it is not in the class segmented by the YOLO model, then optical flow can be cloned below to generate a mask.
 ```bash
 git clone https://github.com/zhengqili/Neural-Scene-Flow-Fields.git

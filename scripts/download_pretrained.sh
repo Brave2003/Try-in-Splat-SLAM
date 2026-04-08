@@ -22,6 +22,19 @@ download() {
     fi
 }
 
+download_gdrive_file() {
+    local out="$1"
+    local file_id="$2"
+    if ! command -v gdown &> /dev/null; then
+        echo "未检测到 gdown，尝试自动安装..."
+        python -m pip install -U gdown || {
+            echo "自动安装 gdown 失败，请手动执行: python -m pip install -U gdown"
+            return 1
+        }
+    fi
+    gdown "https://drive.google.com/uc?id=${file_id}" -O "$out"
+}
+
 echo "========== 下载到 $PRETRAINED =========="
 
 # 1. yolo11l-seg.pt
@@ -72,6 +85,19 @@ fi
 echo "[下载] raft-things.pth (RAFT 光流) ..."
 download raft-things.pth "https://huggingface.co/ddrfan/RAFT/resolve/main/raft-things.pth" || {
     echo "失败: raft-things.pth (可尝试: https://drive.google.com/drive/folders/1sWDsfuZ3Up38EUQt7-JDTT1HcGHuJgvT)"; exit 1;
+}
+
+# 6. dsine.pt (法向 DSINE)
+if [ -f "dsine.pt" ]; then
+    echo "[删除] 旧的 dsine.pt"
+    rm -f "dsine.pt"
+fi
+echo "[下载] dsine.pt (DSINE normal model from Google Drive) ..."
+download_gdrive_file dsine.pt "1Wyiei4a-lVM6izjTNoBLIC5-Rcy4jnaC" || {
+    echo "失败: dsine.pt"
+    echo "可尝试手动下载目录: https://drive.google.com/drive/folders/1Wn83BXVXcErZZblUNgsT0k5IKR39dECe"
+    echo "然后将 dsine.pt 放到 pretrained/"
+    exit 1
 }
 
 echo "========== 全部下载完成 =========="

@@ -26,12 +26,20 @@ enable_dynamic_mask_detection: True
 # 预训练模型统一放在 pretrained/，可用 scripts/download_pretrained.sh 下载
 data:
   yolo_pretrained: pretrained/yolo11l-seg.pt
+  use_dsine_normal: True
+  dsine_pretrained: pretrained/dsine.pt
+  dsine_architecture: v02
+  dsine_num_iter_test: 5
 
 mapping:
   sensor_type: 'depth'
-  online_plotting: False # render and save images online
+  online_plotting: True # render and save images online
+  use_normal: False
   every_keyframe: 1 # do mapping every X keyframes 
   final_refine_iters: 26000 # iterations of final refinement
+  final_refine_save_context: True  # 进入 final_refine 前保存上下文
+  final_refine_load_context: True  # 从已保存上下文恢复并直接进入 final_refine
+  final_refine_context_path: ""  # 为空则默认 <output>/<scene>/final_refine_context.pt
   eval_before_final_ba: True
   move_points: True # apply transformation on Gaussians to account for loop closure and BA
   BA: False # Bundle Adjustment during 3DGS mapping - not fully implemented, but kept for reference
@@ -40,6 +48,14 @@ mapping:
   adaptive_pointsize: True
   point_size: 0.01 #0.01
   long: True
+  node_traj_vis: True        # 在线逐帧轨迹图（较慢），一般关闭
+  node_traj_vis_every: 1      # 每隔多少个 keyframe 可视化一次
+  node_traj_t_samples: 12     # 每条轨迹的时间采样点数
+  node_traj_max_nodes: 96     # 每次最多绘制多少个节点，避免过慢
+  node_traj_final_vis: True   # mapping 全部结束后，导出从头到尾的动态高斯中心轨迹
+  node_traj_final_t_samples: 0  # 0=自动用全序列帧数；>0 时用固定采样数
+  node_traj_video_fps: 12     # 结束后轨迹视频帧率
+  node_traj_video_tail: 16    # 每帧显示多少历史轨迹长度
   Calibration:
     distorted: False
   Training:
@@ -50,12 +66,14 @@ mapping:
     init_gaussian_update: 100
     init_gaussian_reset: 500
     init_gaussian_th: 0.005
+    dynamic_init_gaussian_th: 0.0025  # 动态高斯初始删点阈值（更低=更不容易删）
     init_gaussian_extent: 30
     mapping_itr_num: 50
     map_iters_per_kf: 400  # 每关键帧 mapping 迭代数，显存不足时可减小（如 200）
     gaussian_update_every: 150 # we prune and densify once every 150 iterations.
     gaussian_update_offset: 50
     gaussian_th: 0.7 # used in densify and prune - minimum opacity to be kept
+    dynamic_gaussian_th: 0.35 # 动态高斯删点阈值（更低=更不容易删）
     gaussian_extent: 1.0 # used in densify and prune. We prune points with larger 3d scale than 0.1 * gaussian_extent
     gaussian_reset: 2001
     size_threshold: 20 # used in densify and prune. We prune points that have a larger radius than 20 in screen space
@@ -70,14 +88,25 @@ mapping:
     kf_min_translation: 0.02
     kf_overlap: 0.9
     prune_mode: 'slam'
+    prune_coviz: 3                 # 静态高斯删点阈值：n_obs <= prune_coviz 会被删
+    dynamic_prune_coviz: 1         # 动态高斯删点阈值（更小=更不容易删）
+    keep_dynamic_gaussians: False  # 设为 False 才会按 dynamic_*_gaussian_th 对动态高斯执行较宽松删点
     spherical_harmonics: False # kept for reference, but not tested when True
     flow_loss: 3
     flow_loss_fine: 3
     depth_order_loss_weight: 0.1  # depth order consistency term coefficient
-    normal_loss_weight: 0      # normal consistency term coefficient
-    flattening_loss_weight: 0  # 高斯扁平化损失权重（渲染最短轴法向量 vs 真实深度法向量）
-    scale_loss_weight: 0
-    flat_loss_weight: 0.1  # L_flat = (1/N)*sum_i min(s_x,s_y,s_z)，使最短轴趋近更短
+    normal_loss_weight: 0.01      # normal consistency term coefficient
+    tensorboard: True         # True 时写入 TensorBoard
+    tb_log_every: 1           # 每多少个 mapping 迭代写一次标量
+    tb_hist_every: 1         # 每多少个 mapping 迭代写一次直方图
+    tb_log_dir: null           # null 则使用 <output>/<scene>/tensorboard
+    tb_new_run_subdir: True    # 每次运行写入独立子目录，避免多次运行数据混在一起
+    tb_run_name: null          # 可手动指定 run 名称；null 则自动生成时间戳
+    render_normal_loss_weight: 0.01  # 高斯扁平化损失权重（渲染最短轴法向量 vs 真实深度法向量）
+    # scale_loss_weight: 0
+    flat_loss_weight: 100  # L_flat = (1/N)*sum_i min(s_x,s_y,s_z)，使最短轴趋近更短
+    multi_loss_weight: 0
+    final_multi_loss_weight: 1
     lr:
       cam_rot_delta: 0.003
       cam_trans_delta: 0.001

@@ -21,6 +21,26 @@ import torch
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import font_manager as _fm
+
+
+def _ensure_matplotlib_fonts():
+    """Headless/minimal images: register mpl-bundled DejaVu and allow font fallback."""
+    if "font.fallback" in matplotlib.rcParams:
+        matplotlib.rcParams["font.fallback"] = True
+    ttf_dir = os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+    if not os.path.isdir(ttf_dir):
+        return
+    for name in ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf", "DejaVuSerif.ttf"):
+        path = os.path.join(ttf_dir, name)
+        if os.path.isfile(path):
+            try:
+                _fm.fontManager.addfont(path)
+            except Exception:
+                pass
+
+
+_ensure_matplotlib_fonts()
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import open3d as o3d
 import trimesh
@@ -74,8 +94,8 @@ def eval_rendering(
 
 
     for k, (kf_idx, video_idx) in enumerate(zip(keyframe_idxs, video_idxs)):
-        print("kf",kf_idx)
-        print("video_idx",video_idx)
+        # print("kf",kf_idx)
+        # print("video_idx",video_idx)
         saved_frame_idx.append(video_idx)
         frame = frames[video_idx]
        

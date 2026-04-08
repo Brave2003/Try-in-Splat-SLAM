@@ -651,7 +651,7 @@ def dynamic_segmentation_pipeline(
     if len(p_single) < 2:
         p_fused = p_single
     else:
-        p_fused = temporal_fuse_p_dyn(p_single, flows_fwd, flows_bwd, cons_fwd, cons_bwd)
+        p_fused = temporal_fuse_p_dyn_refined(p_single, flows_fwd, flows_bwd, cons_fwd, cons_bwd)
     # # ----- 4. 全局先验 -----
     # ref_t = len(p_fused) // 2
     # p_ref, static_ref, dyn_ref = compute_global_prior(
@@ -872,7 +872,7 @@ def run_frontend_motion_mask_and_save(
         if i >= len(frame_stream_indices):
             break
         save_idx = frame_stream_indices[i]
-        motion_mask = (p_single[i] < static_thr).to(torch.bool)
+        motion_mask = (p_fused[i] < static_thr).to(torch.bool)
         _save_motion_mask_by_idx(motion_mask, save_idx, cfg_merged)
     return True
 
@@ -945,6 +945,39 @@ def temporal_fuse_p_dyn(
             den = den + w_next
         p_fused = (num / (den + 1e-6)).clamp(0.0, 1.0)
         fused.append(p_fused)
+    return fused
+
+def temporal_fuse_p_dyn_refined(p_dyn_list, flows_fwd, flows_bwd, cons_fwd, cons_bwd):
+    T = len(p_dyn_list)
+    fused = []
+    
+    # 超参数
+    curr_weight = 2.0  # 增加当前帧的权重话语权
+    diff_thresh = 0.5  # 差异门控
+    
+    for t in range(T):
+        p_curr = p_dyn_list[t]
+        num = p_curr * curr_weight
+        den = torch.ones_like(p_curr) * curr_weight
+        
+        # 处理前一帧
+        if t > 0:
+            warped_prev = warp_with_flow(p_dyn_list[t-1], flows_fwd[t-1])
+            # 门控：如果 warped 值与当前观测值偏差太大，降低其权重
+            gate_prev = (torch.abs(warped_prev - p_curr) < diff_thresh).float()
+            w = cons_fwd[t-1] * gate_prev
+            num += w * warped_prev
+            den += w
+            
+        # 处理后一帧（逻辑同上）
+        if t < T - 1:
+            warped_next = warp_with_flow(p_dyn_list[t+1], flows_bwd[t])
+            gate_next = (torch.abs(warped_next - p_curr) < diff_thresh).float()
+            w = cons_bwd[t] * gate_next
+            num += w * warped_next
+            den += w
+            
+        fused.append((num / (den + 1e-6)).clamp(0.0, 1.0))
     return fused
 
 

@@ -45,6 +45,22 @@ def parse_args():
                         help="cuda or cpu")
     parser.add_argument("--no_prompt", action="store_true",
                         help="if set, ignore seeds and run SAM2 with full-image box only")
+    parser.add_argument(
+        "--no_box",
+        action="store_true",
+        help="if set, do not pass bbox from pos mask (points only; usually worse)",
+    )
+    parser.add_argument(
+        "--debug_prompt",
+        action="store_true",
+        help="if set, save *_prompt_debug.png with points/box overlay",
+    )
+    parser.add_argument(
+        "--max_points",
+        type=int,
+        default=96,
+        help="max positive/negative points sampled from each seed mask (default 96)",
+    )
     return parser.parse_args()
 
 
@@ -219,7 +235,7 @@ def main():
         if ys.size > 0:
             x0, x1 = xs.min(), xs.max()
             y0, y1 = ys.min(), ys.max()
-            pad = 5
+            pad = 12
             x0 = max(0, x0 - pad)
             y0 = max(0, y0 - pad)
             x1 = min(W - 1, x1 + pad)
@@ -232,13 +248,13 @@ def main():
         neg_mask = np.zeros((H, W), dtype=bool)
         box_np = np.array([[0, 0, W - 1, H - 1]], dtype=np.float32)
         print("[SAM2] no_prompt mode: using full-image box, ignoring pos/neg seeds")
-    
-    USE_BOX_FOR_SAM = False   # <<< 加这一行开关
+
+    use_box = not args.no_box
 
     # 3. 采样提示点
     if not args.no_prompt:
-        pos_pts = sample_points_from_mask(pos_mask, max_points=64)
-        neg_pts = sample_points_from_mask(neg_mask, max_points=64)
+        pos_pts = sample_points_from_mask(pos_mask, max_points=args.max_points)
+        neg_pts = sample_points_from_mask(neg_mask, max_points=args.max_points)
 
         if pos_pts.shape[0] == 0 and box_np is None:
             dyn_mask = np.zeros((H, W), dtype=bool)
@@ -275,24 +291,20 @@ def main():
     pts_torch = torch.from_numpy(pts).to(device)
     labels_torch = torch.from_numpy(labels).to(device)
 
-    if box_np is not None and USE_BOX_FOR_SAM:
-        debug_vis_path = args.out.replace(".npy", "_prompt_debug.png")
-        vis = image_rgb.copy()
-
-        ys, xs = np.where(pos_mask)
-        for x, y in zip(xs[::20], ys[::20]):
-            cv2.circle(vis, (int(x), int(y)), 3, (255, 255, 255), -1)
-
-        ys, xs = np.where(neg_mask)
-        for x, y in zip(xs[::20], ys[::20]):
-            cv2.circle(vis, (int(x), int(y)), 3, (0, 0, 255), -1)
-
-        x0, y0, x1, y1 = box_np[0].astype(int)
-        cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 0), 2)
-
-        cv2.imwrite(debug_vis_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-        print(f"[DEBUG] Saved SAM2 prompt visualization → {debug_vis_path}")
-
+    if box_np is not None and use_box:
+        if args.debug_prompt:
+            debug_vis_path = args.out.replace(".npy", "_prompt_debug.png")
+            vis = image_rgb.copy()
+            ys, xs = np.where(pos_mask)
+            for x, y in zip(xs[::20], ys[::20]):
+                cv2.circle(vis, (int(x), int(y)), 3, (255, 255, 255), -1)
+            ys, xs = np.where(neg_mask)
+            for x, y in zip(xs[::20], ys[::20]):
+                cv2.circle(vis, (int(x), int(y)), 3, (0, 0, 255), -1)
+            x0, y0, x1, y1 = box_np[0].astype(int)
+            cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 255, 0), 2)
+            cv2.imwrite(debug_vis_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+            print(f"[DEBUG] Saved SAM2 prompt visualization → {debug_vis_path}")
         box_torch = torch.from_numpy(box_np).to(device)
     else:
         box_torch = None
@@ -349,8 +361,8 @@ def main():
     dyn_mask = np.zeros((H, W), dtype=bool)
 
     sel_indices = []
-    cov_thr = 0.3   # 覆盖 seeds 的比例阈值
-    neg_thr = 0.5   # 与 neg 重叠比例阈值
+    cov_thr = 0.22
+    neg_thr = 0.55
 
     for i in range(M):
         m = to_numpy(masks_np[i])
@@ -432,7 +444,7 @@ def main():
 
     # (3) 小连通块过滤：干掉零碎噪声块
     num, lab, stats, _ = cv2.connectedComponentsWithStats(dyn_u8)
-    area_thr = H * W * 0.005  # 占图像面积 0.5% 以下的块丢掉，可调
+    area_thr = H * W * 0.0025
 
     clean = np.zeros_like(dyn_u8)
     for L in range(1, num):  # 0 是背景
@@ -454,23 +466,6 @@ def main():
         # print(f"[SAM2] Saved selected-mask visualization to: {sel_vis_path}")
     except Exception as e:
         print(f"[SAM2] Failed to visualize selected mask: {e}")
-    # ===================================================
-
-    # print(f"[SAM2] Saved dynamic mask to: {args.out}, "
-    #       f"shape={dyn_mask.shape}, dtype={dyn_mask.dtype}")
-
-    # ========= 可视化“最终选中的 mask” =========
-    try:
-        vis_sel = visualize_selected_mask(image_rgb, dyn_mask)
-        sel_vis_path = args.out.replace(".npy", "_selected.png")
-        cv2.imwrite(sel_vis_path, cv2.cvtColor(vis_sel, cv2.COLOR_RGB2BGR))
-        # print(f"[SAM2] Saved selected-mask visualization to: {sel_vis_path}")
-    except Exception as e:
-        print(f"[SAM2] Failed to visualize selected mask: {e}")
-    # ===================================================
-
-    # print(f"[SAM2] Saved dynamic mask to: {args.out}, "
-    #       f"shape={dyn_mask.shape}, dtype={dyn_mask.dtype}")
 
 
 if __name__ == "__main__":
