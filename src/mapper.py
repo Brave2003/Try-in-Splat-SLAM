@@ -36,6 +36,10 @@ from thirdparty.glorie_slam.depth_video import DepthVideo
 from thirdparty.gaussian_splatting.gaussian_renderer import render,render_flow
 from thirdparty.gaussian_splatting.utils.general_utils import rotation_matrix_to_quaternion, quaternion_multiply
 from thirdparty.gaussian_splatting.utils.loss_utils import l1_loss, ssim
+try:
+    from fused_ssim import fused_ssim as fast_ssim
+except Exception:
+    fast_ssim = None
 from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
 from thirdparty.gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 from thirdparty.lietorch.examples.rgbdslam.rgbd_benchmark.evaluate_rpe import find_closest_index
@@ -257,6 +261,22 @@ class Mapper(object):
         self.dynamic_transition_ratio = float(training_config.get("dynamic_transition_ratio", 0.2))
         self.flow_loss_start = float(training_config.get("flow_loss", 0.0))
         self.flow_loss_end = float(training_config.get("flow_loss_fine", self.flow_loss_start))
+        # FastGS path is always enabled by default (no runtime switch needed).
+        self.fastgs_enable = True
+        self.fastgs_sparse_update = True
+        self.fastgs_metric_enable = True
+        self.fastgs_metric_threshold = float(training_config.get("fastgs_metric_threshold", 0.6))
+        self.fastgs_metric_pixel_threshold = float(training_config.get("fastgs_metric_pixel_threshold", 0.05))
+        self.fastgs_metric_boost = float(training_config.get("fastgs_metric_boost", 2.0))
+        self.fastgs_prune_protect_quantile = float(
+            training_config.get("fastgs_prune_protect_quantile", 0.8)
+        )
+        self.fastgs_random_flow_views = int(training_config.get("fastgs_random_flow_views", 1))
+        self.fastgs_optimizer_schedule = True
+        self.fastgs_schedule_mid_iter = int(training_config.get("fastgs_schedule_mid_iter", 15000))
+        self.fastgs_schedule_late_iter = int(training_config.get("fastgs_schedule_late_iter", 20000))
+        self.fastgs_schedule_mid_stride = int(training_config.get("fastgs_schedule_mid_stride", 16))
+        self.fastgs_schedule_late_stride = int(training_config.get("fastgs_schedule_late_stride", 32))
 
         self.save_dir = self.config['data']['output'] + '/' + self.config['scene']
 
@@ -307,6 +327,7 @@ class Mapper(object):
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.viewpoints = {}
+        self.fastgs_metric_map_cache = {}
         self.current_window = []
         self.initialized = True
         self.keyframe_optimizers = None
@@ -962,6 +983,94 @@ class Mapper(object):
             )
 
         return 0, None, 0, None, None
+
+    def _view_photometric_scalar(self, viewpoint, image):
+        gt = viewpoint.original_image.cuda()
+        image_ab = (torch.exp(viewpoint.exposure_a.detach())) * image + viewpoint.exposure_b.detach()
+        return torch.abs(image_ab - gt).mean().detach()
+
+    def _build_fastgs_metric_map(self, viewpoint, image):
+        gt = viewpoint.original_image.cuda()
+        image_ab = (torch.exp(viewpoint.exposure_a.detach())) * image + viewpoint.exposure_b.detach()
+        l1_pixel = torch.abs(image_ab - gt).mean(dim=0)
+        return (l1_pixel > self.fastgs_metric_pixel_threshold).to(dtype=torch.int32).reshape(-1).detach()
+
+    def _apply_sparse_visible_grad_mask(self, visible_union):
+        if visible_union is None or visible_union.numel() == 0:
+            return
+        mask = visible_union.to(device=self.gaussians.get_xyz.device, dtype=torch.float32).view(-1, 1)
+        candidate = [
+            self.gaussians._xyz,
+            self.gaussians._features_dc,
+            self.gaussians._features_rest,
+            self.gaussians._opacity,
+            self.gaussians._scaling,
+            self.gaussians._rotation,
+        ]
+        for p in candidate:
+            if p is None or p.grad is None:
+                continue
+            if p.grad.shape[0] != mask.shape[0]:
+                continue
+            expand_shape = [mask.shape[0]] + [1] * (p.grad.dim() - 1)
+            p.grad.mul_(mask.view(*expand_shape))
+
+    def _ssim_term(self, image, gt_image, mask=None):
+        """Prefer fused-ssim for speed; fallback to legacy SSIM."""
+        if fast_ssim is not None and mask is None:
+            return fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        return ssim(image, gt_image, mask=mask)
+
+    def _should_step_gaussians(self):
+        """FastGS-style sparse update schedule for late iterations."""
+        if not self.fastgs_optimizer_schedule:
+            return True
+        it = int(self.iteration_count)
+        if it <= self.fastgs_schedule_mid_iter:
+            return True
+        if it <= self.fastgs_schedule_late_iter:
+            return (it % max(1, self.fastgs_schedule_mid_stride)) == 0
+        return (it % max(1, self.fastgs_schedule_late_stride)) == 0
+
+    def _apply_fastgs_sh_update_schedule(self):
+        """Update SH-rest less frequently, similar to FastGS split optimizers."""
+        if self.gaussians is None or self.gaussians.optimizer is None:
+            return
+        # If SH is optimized together with dense Adam, do not sparsify it.
+        if getattr(self.gaussians, "shoptimizer", None) is None:
+            return
+        it = int(self.iteration_count)
+        if it <= self.fastgs_schedule_mid_iter:
+            sh_stride = 16
+        elif it <= self.fastgs_schedule_late_iter:
+            sh_stride = 16
+        else:
+            sh_stride = 32
+        if (it % sh_stride) == 0:
+            return
+        for group in self.gaussians.optimizer.param_groups:
+            if group.get("name", "") != "f_rest":
+                continue
+            p = group["params"][0]
+            if p is not None and p.grad is not None:
+                p.grad.zero_()
+
+    def _gaussian_optimizer_step(self, visibility=None):
+        opt = self.gaussians.optimizer
+        if hasattr(self.gaussians, "optimizer_step_fastgs"):
+            self.gaussians.optimizer_step_fastgs(self.iteration_count, visibility=visibility)
+        elif hasattr(opt, "_is_sparse_gaussian_adam"):
+            if visibility is None:
+                visibility = torch.ones(
+                    self.gaussians.get_xyz.shape[0],
+                    device=self.gaussians.get_xyz.device,
+                    dtype=torch.bool,
+                )
+            else:
+                visibility = visibility.to(device=self.gaussians.get_xyz.device, dtype=torch.bool).view(-1)
+            opt.step(visibility, int(self.gaussians.get_xyz.shape[0]))
+        else:
+            opt.step()
 
     def _render_with_deform(self, viewpoint, dxyz=0, d_rot=None, d_scale=0, d_opac=None, d_color=None, return_normal=False):
         return render(
@@ -2111,8 +2220,11 @@ class Mapper(object):
                 ):
                     self.gaussians.reset_opacity()
 
-                self.gaussians.optimizer.step()
+                self._apply_fastgs_sh_update_schedule()
+                self._gaussian_optimizer_step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                if getattr(self.gaussians, "shoptimizer", None) is not None:
+                    self.gaussians.shoptimizer.zero_grad(set_to_none=True)
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         vis_render_process(self.gaussians, self.pipeline_params, self.background, viewpoint,
@@ -2210,10 +2322,15 @@ class Mapper(object):
                 self.gaussians.deform.optimizer.step()
                 self.gaussians.deform.optimizer.zero_grad(set_to_none=True)
                 if update_gaussians:
-                    self.gaussians.optimizer.step()
+                    self._apply_fastgs_sh_update_schedule()
+                    self._gaussian_optimizer_step()
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
+                    if getattr(self.gaussians, "shoptimizer", None) is not None:
+                        self.gaussians.shoptimizer.zero_grad(set_to_none=True)
                 else:
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
+                    if getattr(self.gaussians, "shoptimizer", None) is not None:
+                        self.gaussians.shoptimizer.zero_grad(set_to_none=True)
         vis_render_process(self.gaussians, self.pipeline_params, self.background, viewpoint,
                         viewpoint.uid, self.save_dir, out_dir="init_network", mask=None, dynamic=True)
         stats_window = self.current_window if len(self.current_window) > 0 else [int(cur_frame_idx)]
@@ -2283,6 +2400,11 @@ class Mapper(object):
             n_touched_acm = []
             loss_network = 0
             keyframes_opt = []
+            fastgs_metric_counts = None
+            fastgs_metric_score = None
+            fastgs_visible_union = None
+            closest_kf_cache = {}
+            flow_pair_cache = {}
             progress = 0.0 if iters <= 1 else float(i) / float(iters - 1)
             # Dynamic:Static expected ratio annealing:
             # start 2:1 (p=2/3) -> middle 1:1 (p=1/2) -> end 1:2 (p=1/3)
@@ -2347,6 +2469,9 @@ class Mapper(object):
                     dxyz = 0
                     d_rot, d_scale, d_opac, d_color = None, 0, None, None
                 dygs_scaling += d_scale
+                metric_map = None
+                if self.fastgs_metric_enable:
+                    metric_map = self.fastgs_metric_map_cache.get(int(viewpoint.uid), None)
                 render_pkg = render(
                     viewpoint,
                     self.gaussians,
@@ -2358,6 +2483,8 @@ class Mapper(object):
                     dr=d_rot,
                     do=d_opac,
                     dc=d_color,
+                    get_flag=self.fastgs_metric_enable,
+                    metric_map=metric_map,
                 )
 
                 (image, viewspace_point_tensor, visibility_filter,
@@ -2370,6 +2497,24 @@ class Mapper(object):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
+                if self.fastgs_metric_enable:
+                    self.fastgs_metric_map_cache[int(viewpoint.uid)] = self._build_fastgs_metric_map(viewpoint, image)
+                accum_metric_counts = render_pkg.get("accum_metric_counts", None)
+                if accum_metric_counts is not None and accum_metric_counts.numel() > 0:
+                    visible_mask = (accum_metric_counts > 0).float().detach()
+                    score_add = accum_metric_counts.float().detach()
+                else:
+                    visible_mask = (n_touched > 0).float().detach()
+                    photo_scalar = self._view_photometric_scalar(viewpoint, image)
+                    score_add = visible_mask * photo_scalar
+                if fastgs_metric_counts is None:
+                    fastgs_metric_counts = visible_mask.clone()
+                    fastgs_metric_score = score_add
+                    fastgs_visible_union = visible_mask > 0
+                else:
+                    fastgs_metric_counts += visible_mask
+                    fastgs_metric_score += score_add
+                    fastgs_visible_union = torch.logical_or(fastgs_visible_union, visible_mask > 0)
                 if rm_initdy:
                     with torch.no_grad():
                         mask = viewpoint.reproject_mask(stream, self.viewpoints[0])
@@ -2377,12 +2522,21 @@ class Mapper(object):
                     mask = None
 
                 if dynamic_network and self.gaussians.deform_init:
-                    closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
+                    if int(viewpoint.uid) in closest_kf_cache:
+                        closest_keyframe = closest_kf_cache[int(viewpoint.uid)]
+                    else:
+                        closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
+                        closest_kf_cache[int(viewpoint.uid)] = closest_keyframe
                     if closest_keyframe is not None:
-                        flow, flow_back, mask_fwd, mask_bwd,_ = viewpoint.generate_flow(
-                            viewpoint.original_image.cuda(),idx1,
-                            self.viewpoints[closest_keyframe].original_image.cuda()
-                        )
+                        flow_key = (int(viewpoint.uid), int(closest_keyframe))
+                        if flow_key in flow_pair_cache:
+                            flow, flow_back, mask_fwd, mask_bwd, _ = flow_pair_cache[flow_key]
+                        else:
+                            flow, flow_back, mask_fwd, mask_bwd, _ = viewpoint.generate_flow(
+                                viewpoint.original_image.cuda(), idx1,
+                                self.viewpoints[closest_keyframe].original_image.cuda()
+                            )
+                            flow_pair_cache[flow_key] = (flow, flow_back, mask_fwd, mask_bwd, _)
 
                         time_input = self.gaussians.deform.deform.expand_time(
                             self.viewpoints[closest_keyframe].fid)
@@ -2469,7 +2623,8 @@ class Mapper(object):
                 radii_acm.append(radii)
                 n_touched_acm.append(n_touched)
 
-            for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
+            rand_flow_views = max(0, min(len(random_viewpoint_stack), int(self.fastgs_random_flow_views)))
+            for cam_idx in torch.randperm(len(random_viewpoint_stack))[:rand_flow_views]:
                 viewpoint = random_viewpoint_stack[cam_idx]
                 if dynamic_network and self.gaussians.deform_init:
                     time_input = self.gaussians.deform.deform.expand_time(viewpoint.fid)
@@ -2511,9 +2666,13 @@ class Mapper(object):
 
                 dygs_scaling += d_scale
 
+                metric_map = None
+                if self.fastgs_metric_enable:
+                    metric_map = self.fastgs_metric_map_cache.get(int(viewpoint.uid), None)
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background,
                     dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot, do=d_opac, dc=d_color,
+                    get_flag=self.fastgs_metric_enable, metric_map=metric_map,
                 )
                 (image, viewspace_point_tensor, visibility_filter,
                 radii, depth, opacity, n_touched) = (
@@ -2525,6 +2684,24 @@ class Mapper(object):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
+                if self.fastgs_metric_enable:
+                    self.fastgs_metric_map_cache[int(viewpoint.uid)] = self._build_fastgs_metric_map(viewpoint, image)
+                accum_metric_counts = render_pkg.get("accum_metric_counts", None)
+                if accum_metric_counts is not None and accum_metric_counts.numel() > 0:
+                    visible_mask = (accum_metric_counts > 0).float().detach()
+                    score_add = accum_metric_counts.float().detach()
+                else:
+                    visible_mask = (n_touched > 0).float().detach()
+                    photo_scalar = self._view_photometric_scalar(viewpoint, image)
+                    score_add = visible_mask * photo_scalar
+                if fastgs_metric_counts is None:
+                    fastgs_metric_counts = visible_mask.clone()
+                    fastgs_metric_score = score_add
+                    fastgs_visible_union = visible_mask > 0
+                else:
+                    fastgs_metric_counts += visible_mask
+                    fastgs_metric_score += score_add
+                    fastgs_visible_union = torch.logical_or(fastgs_visible_union, visible_mask > 0)
 
                 if rm_initdy:
                     with torch.no_grad():
@@ -2534,12 +2711,21 @@ class Mapper(object):
 
                 if dynamic_network and self.gaussians.deform_init:
                     if dynamic or True:
-                        closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
+                        if int(viewpoint.uid) in closest_kf_cache:
+                            closest_keyframe = closest_kf_cache[int(viewpoint.uid)]
+                        else:
+                            closest_keyframe = self.find_closest_keyframe(viewpoint.uid)
+                            closest_kf_cache[int(viewpoint.uid)] = closest_keyframe
                         if closest_keyframe is not None:
-                            flow, flow_back, mask_fwd, mask_bwd,_ = viewpoint.generate_flow(
-                                viewpoint.original_image.cuda(),idx1,
-                                self.viewpoints[closest_keyframe].original_image.cuda(),
-                            )
+                            flow_key = (int(viewpoint.uid), int(closest_keyframe))
+                            if flow_key in flow_pair_cache:
+                                flow, flow_back, mask_fwd, mask_bwd, _ = flow_pair_cache[flow_key]
+                            else:
+                                flow, flow_back, mask_fwd, mask_bwd, _ = viewpoint.generate_flow(
+                                    viewpoint.original_image.cuda(), idx1,
+                                    self.viewpoints[closest_keyframe].original_image.cuda(),
+                                )
+                                flow_pair_cache[flow_key] = (flow, flow_back, mask_fwd, mask_bwd, _)
 
                             time_input = self.gaussians.deform.deform.expand_time(
                                 self.viewpoints[closest_keyframe].fid)
@@ -2602,7 +2788,7 @@ class Mapper(object):
                         l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
                         Ll1 = l1_loss(image, gt_image)
                         loss_mapping += (1.0 - self.opt_params.lambda_dssim) * Ll1 + \
-                                        self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
+                                        self.opt_params.lambda_dssim * (1.0 - self._ssim_term(image, gt_image))
                         loss_mapping += 0.1 * l1_depth.mean()
                 else:
                     loss_mapping += get_loss_mapping(
@@ -2662,6 +2848,13 @@ class Mapper(object):
                                 self.gaussians.n_obs <= prune_coviz,
                                 mask,
                             )
+                        if to_prune is not None and fastgs_metric_score is not None:
+                            score = fastgs_metric_score
+                            score = (score - score.min()) / (score.max() - score.min() + 1e-8)
+                            q = float(min(max(self.fastgs_prune_protect_quantile, 0.0), 1.0))
+                            keep_th = torch.quantile(score, q)
+                            hard_keep = score >= keep_th
+                            to_prune = torch.logical_and(to_prune, ~hard_keep.cpu())
                         if to_prune is not None and self.monocular:
                             self.gaussians.prune_points(to_prune.cuda())
 
@@ -2690,6 +2883,13 @@ class Mapper(object):
                 if rm_initdy:
                     update_gaussian = (iters - i - 10 == 0)
                 if update_gaussian:
+                    if fastgs_metric_score is not None:
+                        score = fastgs_metric_score
+                        score = (score - score.min()) / (score.max() - score.min() + 1e-8)
+                        boost_mask = score > self.fastgs_metric_threshold
+                        if boost_mask.any():
+                            boost_val = float(max(1.0, self.fastgs_metric_boost))
+                            self.gaussians.xyz_gradient_accum[boost_mask, 0] *= boost_val
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
                         self.gaussian_th,
@@ -2718,11 +2918,19 @@ class Mapper(object):
                     self.gaussians.deform.optimizer.zero_grad(set_to_none=True)
 
                 if i > 100:
-                    self.gaussians.optimizer.step()
+                    if fastgs_visible_union is not None:
+                        self._apply_sparse_visible_grad_mask(fastgs_visible_union)
+                    if self._should_step_gaussians():
+                        self._apply_fastgs_sh_update_schedule()
+                        self._gaussian_optimizer_step(fastgs_visible_union)
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
+                    if getattr(self.gaussians, "shoptimizer", None) is not None:
+                        self.gaussians.shoptimizer.zero_grad(set_to_none=True)
                     self.gaussians.update_learning_rate(self.iteration_count)
                 else:
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
+                    if getattr(self.gaussians, "shoptimizer", None) is not None:
+                        self.gaussians.shoptimizer.zero_grad(set_to_none=True)
 
         if self.online_plotting:
             from thirdparty.gaussian_splatting.utils.image_utils import psnr
@@ -3132,7 +3340,7 @@ class Mapper(object):
                     Ll1 = l1_loss(image, gt_image)
                     loss += (1.0 - self.opt_params.lambda_dssim) * (
                         Ll1
-                    ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
+                    ) + self.opt_params.lambda_dssim * (1.0 - self._ssim_term(image, gt_image))
                     loss += 1e-4 * self.gaussians.deform.deform.arap_loss(t=viewpoint.fid,
                                                                           delta_t=5 * self.gaussians.time_interval,
                                                                           t_samp_num=8)
@@ -3140,7 +3348,7 @@ class Mapper(object):
                     Ll1 = l1_loss(image, gt_image, mask=viewpoint.motion_mask)
                     loss += (1.0 - self.opt_params.lambda_dssim) * (
                         Ll1
-                    ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image, mask=viewpoint.motion_mask))
+                    ) + self.opt_params.lambda_dssim * (1.0 - self._ssim_term(image, gt_image, mask=viewpoint.motion_mask))
                     depth_pixel_mask = viewpoint.motion_mask.view(*gt_depth.shape) * depth_pixel_mask
 
                 l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
@@ -3181,9 +3389,12 @@ class Mapper(object):
                     radii[visibility_filter],
                 )
 
-                self.gaussians.optimizer.step()
+                self._apply_fastgs_sh_update_schedule()
+                self._gaussian_optimizer_step()
 
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                if getattr(self.gaussians, "shoptimizer", None) is not None:
+                    self.gaussians.shoptimizer.zero_grad(set_to_none=True)
 
                 self.gaussians.update_learning_rate(self.iteration_count)
 

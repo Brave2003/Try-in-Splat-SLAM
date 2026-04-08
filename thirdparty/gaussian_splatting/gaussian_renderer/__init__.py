@@ -3,17 +3,27 @@ Modified renderer: Supports separate rendering of static and dynamic Gaussians
 Added render_mode parameter to control rendering mode
 """
 import math
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+# Ensure we import the in-repo rasterizer extension first, not a stale site-packages build.
+_LOCAL_RASTER_PATH = (
+    Path(__file__).resolve().parents[2] / "diff-gaussian-rasterization-w-pose"
+)
+if str(_LOCAL_RASTER_PATH) not in sys.path:
+    sys.path.insert(0, str(_LOCAL_RASTER_PATH))
+
 from diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
     GaussianRasterizer,
     compute_shortest_axis_view,
-)
+ )  # noqa: E402
 
-from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel
-from thirdparty.gaussian_splatting.utils.sh_utils import eval_sh
+from thirdparty.gaussian_splatting.scene.gaussian_model import GaussianModel  # noqa: E402
+from thirdparty.gaussian_splatting.utils.sh_utils import eval_sh  # noqa: E402
 
 
 def render(
@@ -32,6 +42,9 @@ def render(
     dc=None,
     render_mode='all',  # New parameter: 'all', 'static_only', 'dynamic_only'
     return_normal=False,  # When True, also render normal map (shortest axis weighted by opacity)
+    mult=0.35,
+    get_flag=False,
+    metric_map=None,
 ):
     """
     Render the scene with support for separate static/dynamic rendering.
@@ -96,6 +109,7 @@ def render(
         projmatrix_raw=viewpoint_camera.projection_matrix,
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
+        mult=mult,
         prefiltered=False,
         debug=False,
     )
@@ -169,17 +183,11 @@ def render(
                 static_mask = torch.ones(means3D.shape[0], dtype=torch.bool, device=means3D.device)
                 static_mask[pc.dygs] = False  # Exclude dynamic Gaussians
             
-            print(f"[DEBUG] Static Gaussians (True): {static_mask.sum().item()}, Percentage: {100.0 * static_mask.sum().item() / means3D.shape[0]:.2f}%")
-            
             if mask is not None:
                 # If there's an existing mask, take the intersection
                 mask = mask & static_mask
             else:
                 mask = static_mask
-            
-            print(f"Rendering static Gaussians: {mask.sum().item()}/{means3D.shape[0]} Gaussians")
-        else:
-            print("Warning: pc.dygs does not exist or is empty, will render all Gaussians")
     
     elif render_mode == 'dynamic_only':
         # Render only dynamic Gaussians
@@ -191,20 +199,13 @@ def render(
             if not (isinstance(pc.dygs, torch.Tensor) and pc.dygs.dtype == torch.bool):
                 dynamic_mask[pc.dygs] = True
             
-            # Debug: Print pc.dygs info
-            print(f"[DEBUG] pc.dygs type: {type(pc.dygs)}, dtype: {pc.dygs.dtype if isinstance(pc.dygs, torch.Tensor) else 'N/A'}")
-            print(f"[DEBUG] Total Gaussians: {means3D.shape[0]}, Dynamic Gaussians (True): {dynamic_mask.sum().item()}, Percentage: {100.0 * dynamic_mask.sum().item() / means3D.shape[0]:.2f}%")
-            
             if mask is not None:
                 mask = mask & dynamic_mask
             else:
                 mask = dynamic_mask
-            
-            print(f"Rendering dynamic Gaussians: {mask.sum().item()}/{means3D.shape[0]} Gaussians")
-            
+
             # If there are no dynamic Gaussians, return empty image
             if mask.sum() == 0:
-                print("Warning: No dynamic Gaussians to render, returning empty image")
                 H = int(viewpoint_camera.image_height)
                 W = int(viewpoint_camera.image_width)
                 empty_image = torch.zeros((3, H, W), device=means3D.device, requires_grad=True)
@@ -225,7 +226,6 @@ def render(
                     "n_touched": torch.zeros(1, dtype=torch.int32, device=means3D.device),
                 }
         else:
-            print("Warning: pc.dygs does not exist or is empty, cannot render dynamic Gaussians, returning empty image")
             H = int(viewpoint_camera.image_height)
             W = int(viewpoint_camera.image_width)
             empty_image = torch.zeros((3, H, W), device=means3D.device, requires_grad=True)
@@ -270,7 +270,7 @@ def render(
             rotations = pc.get_rotation + drot
             del drot
         else:
-            print("⚠️  Warning: dx/ds/dr provided but pc.dygs does not exist, skipping dynamic deformation")
+            pass
     
     # PGSR-style: when return_normal=True, compute normal_precomp in caller so grad flows through scales/rotation automatically.
     normal_precomp = None
@@ -282,25 +282,48 @@ def render(
             campos = campos.unsqueeze(0).expand(3)
         viewmatrix = viewpoint_camera.world_view_transform
         normal_precomp = compute_shortest_axis_view(_scales, _rotations, means3D, campos, viewmatrix)
-        if mask is not None:
-            normal_precomp = normal_precomp[mask]
     
+    # Keep only user-level/static-dynamic mask here. Frustum culling is already handled in CUDA preprocess.
+    render_mask = mask
+    if render_mask is not None and render_mask.sum() == 0:
+        H = int(viewpoint_camera.image_height)
+        W = int(viewpoint_camera.image_width)
+        empty_image = torch.zeros((3, H, W), device=means3D.device, requires_grad=True)
+        empty_depth = torch.zeros((1, H, W), device=means3D.device, requires_grad=True)
+        empty_opacity = torch.zeros((1, H, W), device=means3D.device, requires_grad=True)
+        empty_radii = torch.zeros(means3D.shape[0], dtype=torch.int32, device=means3D.device)
+        screenspace_points = screenspace_points + 0
+        out = {
+            "render": empty_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter": torch.zeros_like(empty_radii, dtype=torch.bool),
+            "radii": empty_radii,
+            "depth": empty_depth,
+            "opacity": empty_opacity,
+            "n_touched": torch.zeros(1, dtype=torch.int32, device=means3D.device),
+        }
+        if return_normal:
+            out["normal"] = torch.zeros((3, H, W), device=means3D.device, requires_grad=True)
+        return out
+
     # ========== Rasterize visible Gaussians to image (单 pass 可同时输出 color + normal) ==========
-    if mask is not None:
+    if render_mask is not None:
         # Use mask for selective rendering
         res = rasterizer(
-            means3D=means3D[mask],
-            means2D=means2D[mask],
-            shs=shs[mask] if shs is not None else None,
-            colors_precomp=colors_precomp[mask] if colors_precomp is not None else None,
-            opacities=opacity[mask],
-            scales=scales[mask],
-            rotations=rotations[mask],
-            cov3D_precomp=cov3D_precomp[mask] if cov3D_precomp is not None else None,
+            means3D=means3D[render_mask],
+            means2D=means2D[render_mask],
+            shs=shs[render_mask] if shs is not None else None,
+            colors_precomp=colors_precomp[render_mask] if colors_precomp is not None else None,
+            opacities=opacity[render_mask],
+            scales=scales[render_mask],
+            rotations=rotations[render_mask],
+            cov3D_precomp=cov3D_precomp[render_mask] if cov3D_precomp is not None else None,
             theta=viewpoint_camera.cam_rot_delta,
             rho=viewpoint_camera.cam_trans_delta,
             return_normal=return_normal,
-            normal_precomp=normal_precomp,
+            normal_precomp=normal_precomp[render_mask] if normal_precomp is not None else None,
+            get_flag=get_flag,
+            metric_map=metric_map,
         )
     else:
         # Render all Gaussians
@@ -317,9 +340,19 @@ def render(
             rho=viewpoint_camera.cam_trans_delta,
             return_normal=return_normal,
             normal_precomp=normal_precomp,
+            get_flag=get_flag,
+            metric_map=metric_map,
         )
-    if len(res) == 6:
-        rendered_image, radii, depth, opacity, n_touched, normal_blend = res
+    accum_metric_counts = None
+    if len(res) == 7:
+        rendered_image, radii, depth, opacity, n_touched, normal_blend, accum_metric_counts = res
+    elif len(res) == 6:
+        rendered_image, radii, depth, opacity, n_touched, tail = res
+        if return_normal:
+            normal_blend = tail
+        else:
+            accum_metric_counts = tail
+            normal_blend = None
     else:
         rendered_image, radii, depth, opacity, n_touched = res
         normal_blend = None
@@ -333,6 +366,8 @@ def render(
         "opacity": opacity,
         "n_touched": n_touched,
     }
+    if accum_metric_counts is not None:
+        out["accum_metric_counts"] = accum_metric_counts
     if normal_blend is not None:
         # 光栅器输出为 PGSR 风格：sum(n_i * alpha * T)，此处归一化为单位法向；输出 [-1,1]，可视化用 (N+1)/2
         # 低不透明度像素的 normal 模长接近 0，归一化后不稳定，损失中需用 opacity 掩码（见 get_loss_flattening）
@@ -415,6 +450,7 @@ def render_flow(
         projmatrix_raw=viewpoint_camera1.projection_matrix,
         sh_degree=0,
         campos=viewpoint_camera1.camera_center,
+        mult=0.35,
         prefiltered=False,
         debug=False,
     )
@@ -461,7 +497,7 @@ def render_flow(
                                                                                                    pc.get_rotation)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
-    rendered_image, radii, rendered_depth, rendered_alpha, n_touched= rasterizer(
+    flow_res = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=None,
@@ -471,6 +507,10 @@ def render_flow(
         rotations=rotations,
         cov3D_precomp=cov3D_precomp,
     )
+    if len(flow_res) >= 5:
+        rendered_image, radii, rendered_depth, rendered_alpha, n_touched = flow_res[:5]
+    else:
+        raise RuntimeError("Unexpected rasterizer output shape in render_flow")
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
@@ -539,8 +579,6 @@ def get_dynamic_mask(
         else:
             _, _, _, dx, ds, dr = pc._deformation(means3D, pc._scaling,
                                                   pc._rotation, pc._opacity, shs, time)
-        print(torch.norm(dx, dim=1).mean(), torch.norm(ds, dim=1).mean(), torch.norm(dr, dim=1).mean())
-        print(torch.norm(dx, dim=1).max(), torch.norm(ds, dim=1).max(), torch.norm(dr, dim=1).max())
         position_mask = (torch.norm(dx, dim=1) < 1)
         scale_mask = (torch.norm(ds, dim=1) < 2)
         direction_mask = (torch.norm(dr, dim=1) < 1)

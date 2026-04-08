@@ -10,6 +10,8 @@
 #
 
 import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import open3d as o3d
@@ -42,6 +44,12 @@ from thirdparty.gaussian_splatting.utils.system_utils import mkdir_p
 from thirdparty.gaussian_splatting.scene.deform_model import DeformModel
 from utils.deformation import deform_network
 
+_LOCAL_RASTER_PATH = (
+    Path(__file__).resolve().parents[2] / "diff-gaussian-rasterization-w-pose"
+)
+if str(_LOCAL_RASTER_PATH) not in sys.path:
+    sys.path.insert(0, str(_LOCAL_RASTER_PATH))
+
 
 class GaussianModel:
     def __init__(
@@ -64,6 +72,7 @@ class GaussianModel:
         self.n_obs = torch.empty(0).int()
         self.depth_remove_outliers = True
         self.optimizer = None
+        self.shoptimizer = None
         self.pcs = []
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -611,11 +620,6 @@ class GaussianModel:
                 "name": "f_dc",
             },
             {
-                "params": [self._features_rest],
-                "lr": training_args.feature_lr / 20.0,
-                "name": "f_rest",
-            },
-            {
                 "params": [self._opacity],
                 "lr": training_args.opacity_lr,
                 "name": "opacity",
@@ -631,8 +635,17 @@ class GaussianModel:
                 "name": "rotation",
             },
         ]
+        sh_l = [
+            {
+                "params": [self._features_rest],
+                "lr": training_args.feature_lr / 20.0,
+                "name": "f_rest",
+            },
+        ]
 
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # Precision-first default: keep dense Adam for stable convergence.
+        self.optimizer = torch.optim.Adam(l + sh_l, lr=0.0, eps=1e-15)
+        self.shoptimizer = None
         self.xyz_scheduler_args = get_expon_lr_func(
             lr_init=training_args.position_lr_init * self.spatial_lr_scale,
             lr_final=training_args.position_lr_final * self.spatial_lr_scale,
@@ -820,15 +833,20 @@ class GaussianModel:
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            if group["name"] == name:
-                stored_state = self.optimizer.state.get(group["params"][0], None)
+        optimizers = [self.optimizer]
+        if self.shoptimizer is not None:
+            optimizers.append(self.shoptimizer)
+        for opt in optimizers:
+            for group in opt.param_groups:
+                if group["name"] != name:
+                    continue
+                stored_state = opt.state.get(group["params"][0], None)
                 stored_state["exp_avg"] = torch.zeros_like(tensor)
                 stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
-                del self.optimizer.state[group["params"][0]]
+                del opt.state[group["params"][0]]
                 group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group["params"][0]] = stored_state
+                opt.state[group["params"][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
@@ -850,24 +868,28 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            stored_state = self.optimizer.state.get(group["params"][0], None)
-            if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+        optimizers = [self.optimizer]
+        if self.shoptimizer is not None:
+            optimizers.append(self.shoptimizer)
+        for opt in optimizers:
+            for group in opt.param_groups:
+                stored_state = opt.state.get(group["params"][0], None)
+                if stored_state is not None:
+                    stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                    stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(
-                    (group["params"][0][mask].requires_grad_(True))
-                )
-                self.optimizer.state[group["params"][0]] = stored_state
+                    del opt.state[group["params"][0]]
+                    group["params"][0] = nn.Parameter(
+                        (group["params"][0][mask].requires_grad_(True))
+                    )
+                    opt.state[group["params"][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(
-                    group["params"][0][mask].requires_grad_(True)
-                )
-                optimizable_tensors[group["name"]] = group["params"][0]
+                    optimizable_tensors[group["name"]] = group["params"][0]
+                else:
+                    group["params"][0] = nn.Parameter(
+                        group["params"][0][mask].requires_grad_(True)
+                    )
+                    optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
     def prune_points(self, mask):
@@ -891,39 +913,62 @@ class GaussianModel:
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups:
-            assert len(group["params"]) == 1
-            extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(group["params"][0], None)
-            if stored_state is not None:
-                # Add to the optimizer internal variables like the exponential averaging
-                # for each variable that we want to add. Initialize to zero.
-                stored_state["exp_avg"] = torch.cat(
-                    (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
-                )
-                stored_state["exp_avg_sq"] = torch.cat(
-                    (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
-                    dim=0,
-                )
+        optimizers = [self.optimizer]
+        if self.shoptimizer is not None:
+            optimizers.append(self.shoptimizer)
+        for opt in optimizers:
+            for group in opt.param_groups:
+                assert len(group["params"]) == 1
+                extension_tensor = tensors_dict[group["name"]]
+                stored_state = opt.state.get(group["params"][0], None)
+                if stored_state is not None:
+                    stored_state["exp_avg"] = torch.cat(
+                        (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
+                    )
+                    stored_state["exp_avg_sq"] = torch.cat(
+                        (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
+                        dim=0,
+                    )
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(
-                    torch.cat(
-                        (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
-                )
-                self.optimizer.state[group["params"][0]] = stored_state
+                    del opt.state[group["params"][0]]
+                    group["params"][0] = nn.Parameter(
+                        torch.cat(
+                            (group["params"][0], extension_tensor), dim=0
+                        ).requires_grad_(True)
+                    )
+                    opt.state[group["params"][0]] = stored_state
 
-                optimizable_tensors[group["name"]] = group["params"][0]
-            else:
-                group["params"][0] = nn.Parameter(
-                    torch.cat(
-                        (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
-                )
-                optimizable_tensors[group["name"]] = group["params"][0]
+                    optimizable_tensors[group["name"]] = group["params"][0]
+                else:
+                    group["params"][0] = nn.Parameter(
+                        torch.cat(
+                            (group["params"][0], extension_tensor), dim=0
+                        ).requires_grad_(True)
+                    )
+                    optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
+
+    def optimizer_step_fastgs(self, iteration, visibility=None):
+        """FastGS-like optimizer stepping: sparse main params + staged SH updates."""
+        if hasattr(self.optimizer, "_is_sparse_gaussian_adam"):
+            if visibility is None:
+                visibility = torch.ones(self.get_xyz.shape[0], dtype=torch.bool, device=self.get_xyz.device)
+            visibility = visibility.to(device=self.get_xyz.device, dtype=torch.bool).view(-1)
+            self.optimizer.step(visibility, int(self.get_xyz.shape[0]))
+        else:
+            self.optimizer.step()
+
+        if self.shoptimizer is None:
+            return
+        if iteration <= 15000:
+            sh_stride = 16
+        elif iteration <= 20000:
+            sh_stride = 16
+        else:
+            sh_stride = 32
+        if (int(iteration) % sh_stride) == 0:
+            self.shoptimizer.step()
 
     def densification_postfix(
         self,

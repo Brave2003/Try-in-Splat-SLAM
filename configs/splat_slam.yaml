@@ -94,6 +94,15 @@ mapping:
     spherical_harmonics: False # kept for reference, but not tested when True
     flow_loss: 3
     flow_loss_fine: 3
+    fastgs_metric_threshold: 0.6          # 误差评分阈值（越低越激进）
+    fastgs_metric_pixel_threshold: 0.05   # 像素级 photometric 误差阈值，用于 metric_map
+    fastgs_metric_boost: 2.0              # 高误差高斯增密梯度放大倍数
+    fastgs_prune_protect_quantile: 0.8    # prune 保护分位数（保留 top-q 一致性高斯）
+    fastgs_random_flow_views: 2           # 每轮随机光流监督视角数（精度优先建议 >=2）
+    fastgs_schedule_mid_iter: 15000
+    fastgs_schedule_late_iter: 20000
+    fastgs_schedule_mid_stride: 16
+    fastgs_schedule_late_stride: 32
     depth_order_loss_weight: 0.1  # depth order consistency term coefficient
     normal_loss_weight: 0.01      # normal consistency term coefficient
     tensorboard: True         # True 时写入 TensorBoard
