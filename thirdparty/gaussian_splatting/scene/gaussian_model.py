@@ -10,6 +10,7 @@
 #
 
 import os
+import gc
 
 import numpy as np
 import open3d as o3d
@@ -718,12 +719,15 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
     def reset_opacity_nonvisible(
-        self, visibility_filters
+        self, visibility_filters, preserve_dynamic_nonvisible=False
     ):  ##Reset opacity for only non-visible gaussians
         opacities_new = inverse_sigmoid(torch.ones_like(self.get_opacity) * 0.4)
 
         for filter in visibility_filters:
             opacities_new[filter] = self.get_opacity[filter]
+        if preserve_dynamic_nonvisible and hasattr(self, "dygs"):
+            dynamic_mask = self.dygs.to(opacities_new.device).bool()
+            opacities_new[dynamic_mask] = self.get_opacity[dynamic_mask]
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -1058,7 +1062,15 @@ class GaussianModel:
             new_n_obs=new_n_obs,
         )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(
+        self,
+        max_grad,
+        min_opacity,
+        extent,
+        max_screen_size,
+        visible_mask=None,
+    ):
+        n_points_before = self.get_xyz.shape[0]
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -1073,6 +1085,21 @@ class GaussianModel:
             prune_mask = torch.logical_or(
                 torch.logical_or(prune_mask, big_points_vs), big_points_ws
             )
+
+        if visible_mask is not None:
+            visible_mask = visible_mask.to(prune_mask.device).bool().flatten()
+            if visible_mask.shape[0] == prune_mask.shape[0]:
+                effective_visible_mask = visible_mask
+            elif visible_mask.shape[0] == n_points_before and prune_mask.shape[0] >= n_points_before:
+                # visible_mask is computed before densification; keep old invisible points
+                # protected while allowing newly created points to follow normal pruning.
+                effective_visible_mask = torch.ones_like(prune_mask, dtype=torch.bool)
+                effective_visible_mask[:n_points_before] = visible_mask
+            else:
+                # Fallback for unexpected size mismatch: do not apply visibility gating.
+                effective_visible_mask = torch.ones_like(prune_mask, dtype=torch.bool)
+
+            prune_mask = torch.logical_and(prune_mask, effective_visible_mask)
 
         self.prune_points(prune_mask)
 
