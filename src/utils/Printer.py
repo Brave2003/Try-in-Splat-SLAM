@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+
 from colorama import Fore, Style
 import torch.multiprocessing as mp
 
@@ -80,7 +82,8 @@ class Printer(TrivialPrinter):
                 break
             else:
                 print(message)
-        with tqdm(total=total_img_num) as pbar:
+        # tqdm defaults to sys.stderr; use stdout so lines match print() and survive `> log` (no 2>&1).
+        with tqdm(total=total_img_num, file=sys.stdout) as pbar:
             while self.progress_counter.value < total_img_num:
                 message = self.msg_queue.get()
                 if message == "DONE":
@@ -92,7 +95,7 @@ class Printer(TrivialPrinter):
                     pbar.n = completed
                     pbar.refresh()
                 else:
-                    pbar.write(message)
+                    pbar.write(message, file=sys.stdout)
         while True:
             message = self.msg_queue.get()
             if message == "DONE":

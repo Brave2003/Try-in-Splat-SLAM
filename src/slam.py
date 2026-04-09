@@ -175,11 +175,8 @@ class SLAM:
         if not self.only_tracking:
             if self.cfg["tracking"]["backend"]["final_ba"]:
                 self.mapper.final_refine(
-                    iters=self.cfg["mapping"]["final_refine_iters"],
-                    save_context=self.cfg["mapping"].get("final_refine_save_context", False),
-                    load_context=self.cfg["mapping"].get("final_refine_load_context", False),
-                    context_path=self.cfg["mapping"].get("final_refine_context_path", ""),
-                )
+                    iters=self.cfg["mapping"]["final_refine_iters"],)
+
 
             # Always persist final gaussian model for reproducible result inspection.
             save_gaussians(self.mapper.gaussians, self.save_dir, iteration="after_refine", final=True)
