@@ -90,6 +90,10 @@ mapping:
     prune_mode: 'slam'
     prune_coviz: 3                 # 静态高斯删点阈值：n_obs <= prune_coviz 会被删
     dynamic_prune_coviz: 1         # 动态高斯删点阈值（更小=更不容易删）
+    dynamic_prune_grace: 16        # 动态高斯出视锥保护帧数（按 keyframe id 差值）
+    protect_dynamic_out_of_view: True  # 非可见透明度重置/共视剪枝时保护动态高斯
+    preserve_invisible_gaussians: True # 当前窗口不可见(n_obs=0)的高斯尽量不改动
+    freeze_dynamic_when_invisible: True # 动态高斯在当前窗口不可见时冻结 deform 更新
     keep_dynamic_gaussians: False  # 设为 False 才会按 dynamic_*_gaussian_th 对动态高斯执行较宽松删点
     spherical_harmonics: False # kept for reference, but not tested when True
     flow_loss: 3

@@ -246,8 +246,20 @@ class Mapper(object):
         self.window_size = training_config["window_size"]
         self.prune_coviz = int(training_config.get("prune_coviz", 3))
         self.dynamic_prune_coviz = int(training_config.get("dynamic_prune_coviz", 1))
+        self.dynamic_prune_grace = int(
+            training_config.get("dynamic_prune_grace", 2 * self.window_size)
+        )
         self.keep_dynamic_gaussians = bool(
             training_config.get("keep_dynamic_gaussians", True)
+        )
+        self.protect_dynamic_out_of_view = bool(
+            training_config.get("protect_dynamic_out_of_view", True)
+        )
+        self.preserve_invisible_gaussians = bool(
+            training_config.get("preserve_invisible_gaussians", True)
+        )
+        self.freeze_dynamic_when_invisible = bool(
+            training_config.get("freeze_dynamic_when_invisible", True)
         )
 
         # Loss weights
@@ -488,7 +500,7 @@ class Mapper(object):
             xyz_i = xyz[0, :][None, :, :, :]
             pre_normal = self.get_surface_normalv2(xyz_i).permute((3, 2, 0, 1))
             # 与单目深度先验法向约定对齐（同 before_modify）
-            similarity = torch.nn.functional.cosine_similarity(pre_normal, -gt_normal, dim=1)
+            similarity = torch.nn.functional.cosine_similarity(pre_normal, gt_normal, dim=1)
             loss_map = 1.0 - similarity
             loss_normal = torch.nanmean(loss_map)
             loss = loss_normal
@@ -2099,11 +2111,25 @@ class Mapper(object):
                     viewspace_point_tensor, visibility_filter
                 )
                 if mapping_iteration % self.init_gaussian_update == 0:
+                    init_dynamic_prune_gate = None
+                    if (
+                        self.preserve_invisible_gaussians
+                        and hasattr(self.gaussians, "dygs")
+                        and torch.is_tensor(self.gaussians.dygs)
+                        and self.gaussians.dygs.numel() == visibility_filter.numel()
+                    ):
+                        dynamic_mask = self.gaussians.dygs.bool().to(visibility_filter.device)
+                        init_dynamic_prune_gate = torch.where(
+                            dynamic_mask,
+                            visibility_filter,
+                            torch.ones_like(visibility_filter, dtype=torch.bool),
+                        )
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
                         self.init_gaussian_th,
                         self.init_gaussian_extent,
                         None,
+                        visible_mask=init_dynamic_prune_gate,
                     )
 
                 if self.iteration_count == self.init_gaussian_reset or (
@@ -2631,9 +2657,46 @@ class Mapper(object):
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
 
+            visible_any = torch.zeros_like(visibility_filter_acm[0], dtype=torch.bool)
+            for vf in visibility_filter_acm:
+                visible_any = torch.logical_or(visible_any, vf)
+
+            dynamic_prune_gate = None
+            dynamic_mask_cuda = None
+            if (
+                self.preserve_invisible_gaussians
+                and hasattr(self.gaussians, "dygs")
+                and torch.is_tensor(self.gaussians.dygs)
+                and self.gaussians.dygs.numel() == visible_any.numel()
+            ):
+                dynamic_mask_cuda = self.gaussians.dygs.bool().to(visible_any.device)
+                dynamic_prune_gate = torch.where(
+                    dynamic_mask_cuda,
+                    visible_any,
+                    torch.ones_like(visible_any, dtype=torch.bool),
+                )
+
             scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            loss_mapping += 10 * isotropic_loss.mean()
+            if self.freeze_dynamic_when_invisible and dynamic_prune_gate is not None:
+                visible_scaling = scaling[dynamic_prune_gate]
+            else:
+                visible_scaling = scaling
+            if visible_scaling.numel() > 0:
+                isotropic_loss = torch.abs(
+                    visible_scaling - visible_scaling.mean(dim=1).view(-1, 1)
+                )
+                loss_mapping += 10 * isotropic_loss.mean()
+
+            dynamic_visible_any = True
+            if (
+                self.freeze_dynamic_when_invisible
+                and dynamic_mask_cuda is not None
+            ):
+                dynamic_visible_any = bool(
+                    torch.logical_and(visible_any, dynamic_mask_cuda)
+                    .any()
+                    .item()
+                )
             loss_mapping.backward(retain_graph=True)
             gaussian_split = False
             with torch.no_grad():
@@ -2646,7 +2709,7 @@ class Mapper(object):
                 if prune:
                     if len(current_window) == self.window_size:
                         prune_mode = self.config["mapping"]["Training"]["prune_mode"]
-                        prune_coviz = 3
+                        prune_coviz = self.prune_coviz
                         self.gaussians.n_obs.fill_(0)
                         for window_idx, visibility in self.occ_aware_visibility.items():
                             self.gaussians.n_obs += visibility.cpu()
@@ -2658,10 +2721,33 @@ class Mapper(object):
                             mask = self.gaussians.unique_kfIDs >= sorted_window[2]
                             if not self.initialized:
                                 mask = self.gaussians.unique_kfIDs >= 0
-                            to_prune = torch.logical_and(
-                                self.gaussians.n_obs <= prune_coviz,
-                                mask,
-                            )
+                            obs_prune = self.gaussians.n_obs <= prune_coviz
+                            to_prune = torch.logical_and(obs_prune, mask)
+
+                            # Dynamic Gaussians can temporarily leave FoV.
+                            # Keep a grace period and require low opacity before pruning.
+                            if (
+                                to_prune is not None
+                                and hasattr(self.gaussians, "dygs")
+                                and torch.is_tensor(self.gaussians.dygs)
+                                and self.gaussians.dygs.numel() == to_prune.numel()
+                            ):
+                                dynamic_mask = self.gaussians.dygs.bool().cpu()
+                                newest_kf = int(sorted_window[0])
+                                ages = newest_kf - self.gaussians.unique_kfIDs.long().cpu()
+                                grace_mask = ages <= self.dynamic_prune_grace
+
+                                dynamic_obs_prune = self.gaussians.n_obs <= self.dynamic_prune_coviz
+                                if self.preserve_invisible_gaussians:
+                                    dynamic_obs_prune = torch.logical_and(dynamic_obs_prune, self.gaussians.n_obs > 0)
+
+                                dynamic_to_prune = dynamic_obs_prune
+                                dynamic_to_prune = torch.logical_and(dynamic_to_prune, ~grace_mask)
+                                dynamic_to_prune = torch.logical_and(dynamic_to_prune, dynamic_mask)
+
+                                if self.protect_dynamic_out_of_view:
+                                    static_to_prune = torch.logical_and(to_prune, ~dynamic_mask)
+                                    to_prune = torch.logical_or(static_to_prune, dynamic_to_prune)
                         if to_prune is not None and self.monocular:
                             self.gaussians.prune_points(to_prune.cuda())
 
@@ -2695,6 +2781,7 @@ class Mapper(object):
                         self.gaussian_th,
                         self.gaussian_extent,
                         self.size_threshold,
+                        visible_mask=dynamic_prune_gate,
                     )
                     gaussian_split = True
 
@@ -2702,7 +2789,12 @@ class Mapper(object):
                         not update_gaussian
                 ) and i > 100:
                     self.printer.print("Resetting the opacity of non-visible Gaussians", FontColor.MAPPER)
-                    self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
+                    self.gaussians.reset_opacity_nonvisible(
+                        visibility_filter_acm,
+                        preserve_dynamic_nonvisible=(
+                            self.protect_dynamic_out_of_view and self.preserve_invisible_gaussians
+                        ),
+                    )
                     gaussian_split = True
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
@@ -2712,9 +2804,9 @@ class Mapper(object):
                         continue
                     update_pose(viewpoint)
                 if dynamic_network and self.gaussians.deform_init:
-
-                    loss_network.backward()
-                    self.gaussians.deform.optimizer.step()
+                    if (not self.freeze_dynamic_when_invisible) or dynamic_visible_any:
+                        loss_network.backward()
+                        self.gaussians.deform.optimizer.step()
                     self.gaussians.deform.optimizer.zero_grad(set_to_none=True)
 
                 if i > 100:
